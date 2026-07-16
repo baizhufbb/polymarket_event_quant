@@ -1,0 +1,23 @@
+[project]
+name = "polymarket-btc-bot"
+version = "0.1.0"
+description = "A single-purpose BTC 5-minute dual-low Polymarket trading bot"
+requires-python = ">=3.11"
+dependencies = [
+    "eth-account==0.13.7",
+    "httpcore @ git+https://github.com/baizhufbb/httpcore.git@35ddb373e13be5940e5137798d5a63d67e10f3e2",
+    "httpx==0.28.1",
+    "polymarket-client==0.1.0b17",
+    "py-clob-client-v2==1.0.2",
+    "python-dotenv==1.1.1",
+    "requests==2.32.4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==8.4.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
