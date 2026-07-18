@@ -3,6 +3,11 @@ from decimal import Decimal
 
 from polymarket_bot.database import BotDatabase
 from polymarket_bot.models import ExitTarget, Market, PlacedOrder, TradePlan
+from polymarket_bot.reconciliation import (
+    ReconciledOrder,
+    ReconciliationUpdate,
+    TrackedOrderSnapshot,
+)
 from polymarket_bot.service import BotService
 
 
@@ -46,6 +51,25 @@ class FakeExchange:
     def cancel_orders(self, order_ids):
         self.cancel_calls.append(order_ids)
         return self.cancel_result or {"canceled": order_ids, "not_canceled": {}}
+
+
+class PendingBookExchange(FakeExchange):
+    def __init__(self):
+        super().__init__()
+        self.readiness_calls = []
+
+    def order_books_ready(self, market):
+        self.readiness_calls.append(market.slug)
+        return False
+
+
+class FakeReconciliationWorker:
+    def __init__(self, updates):
+        self.updates = updates
+
+    def drain(self):
+        updates, self.updates = self.updates, []
+        return updates
 
 
 class ExitExchange(FakeExchange):
@@ -147,6 +171,78 @@ def test_reconcile_batches_open_orders_and_queries_only_missing(tmp_path) -> Non
         assert rows["up-order"]["status"] == "live"
         assert rows["up-order"]["matched_size"] == "4"
         assert rows["down-order"]["status"] == "cancelled"
+
+
+def test_gamma_discovery_retries_market_until_order_books_exist(tmp_path) -> None:
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        run_id = database.start_run("live")
+        exchange = PendingBookExchange()
+        service = BotService.__new__(BotService)
+        service.database = database
+        service.exchange = exchange
+        service.run_id = run_id
+        service.run_started_ts = MARKET.start_ts
+        service.plan = TradePlan(Decimal("0.01"), (), Decimal("1"))
+        service.max_daily_filled_cost = None
+        service.max_reserved_usd = None
+        service.logger = logging.getLogger("test")
+
+        should_continue = service._consider_market(
+            MARKET,
+            now_ts=MARKET.start_ts,
+            trigger="gamma",
+            orderbook_ready=False,
+        )
+
+        assert should_continue
+        assert exchange.readiness_calls == [MARKET.slug]
+        assert database.has_market(MARKET.slug) is False
+
+
+def test_background_reconciliation_cannot_regress_streamed_fill(tmp_path) -> None:
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        run_id = database.start_run("live")
+        database.add_market(run_id, MARKET)
+        database.add_order(
+            run_id,
+            MARKET.slug,
+            PlacedOrder(
+                order_id="filled-order",
+                outcome="up",
+                token_id=MARKET.up_token_id,
+                price=Decimal("0.01"),
+                size=Decimal("100"),
+                status="filled",
+                raw={},
+            ),
+        )
+        update = ReconciliationUpdate(
+            (
+                ReconciledOrder(
+                    snapshot=TrackedOrderSnapshot(
+                        "filled-order", MARKET.slug, "100"
+                    ),
+                    raw={
+                        "id": "filled-order",
+                        "status": "live",
+                        "size_matched": "0",
+                    },
+                ),
+            )
+        )
+        service = BotService.__new__(BotService)
+        service.database = database
+        service.reconciliation_worker = FakeReconciliationWorker([update])
+        service.run_id = run_id
+        service.last_discovery = 1.0
+        service.exchange = object()
+        service.plan = TradePlan(Decimal("0.01"), (), Decimal("1"))
+
+        service._drain_reconciliation_updates()
+
+        row = database.order("filled-order")
+        assert row["status"] == "filled"
+        assert row["matched_size"] == "100"
 
 
 def test_reconcile_places_fixed_exit_for_newly_matched_shares(tmp_path) -> None:

@@ -9,7 +9,13 @@ from .database import BotDatabase
 from .discovery import MarketDiscovery, is_eligible
 from .exchange import Exchange, normalize_order
 from .heartbeat import HeartbeatWorker
+from .market_stream import (
+    MarketReadyUpdate,
+    MarketStreamState,
+    MarketStreamWorker,
+)
 from .models import Market, PlacedOrder, TradePlan
+from .reconciliation import ReconciliationWorker
 from .redemption import RedemptionWorker
 from .user_stream import UserStreamState, UserStreamWorker, UserTradeUpdate
 
@@ -84,6 +90,15 @@ class BotService:
         self.user_stream_worker = (
             UserStreamWorker(config, logger=logger) if live else None
         )
+        self.market_stream_worker = (
+            MarketStreamWorker(queue_price=plan.buy_price, logger=logger)
+            if live and placement_order == "farthest-first"
+            else None
+        )
+        self.reconciliation_worker = (
+            ReconciliationWorker(self.exchange) if self.exchange else None
+        )
+        self.ready_market_updates: list[MarketReadyUpdate] = []
         self.run_id = 0
         self.run_started_ts = int(time.time())
         self.last_discovery = 0.0
@@ -108,6 +123,7 @@ class BotService:
             "placement_order": self.placement_order,
             "cancel_before_end_seconds": self.cancel_before_end_seconds,
             "redemption_seconds": self.config.redemption_seconds,
+            "fast_market_stream": self.market_stream_worker is not None,
         }
         self.run_id = self.database.start_run(mode, run_config)
         deadline = (
@@ -120,6 +136,10 @@ class BotService:
             self.heartbeat_worker.start()
         if self.user_stream_worker:
             self.user_stream_worker.start()
+        if self.market_stream_worker:
+            self.market_stream_worker.start()
+        if self.reconciliation_worker:
+            self.reconciliation_worker.start()
         if self.redemption_worker:
             self.redemption_worker.start()
         try:
@@ -145,6 +165,12 @@ class BotService:
             if self.redemption_worker:
                 self.redemption_worker.stop()
                 self._drain_redemption_updates()
+            if self.market_stream_worker:
+                self.market_stream_worker.stop()
+                self._drain_market_stream_updates()
+            if self.reconciliation_worker:
+                self.reconciliation_worker.stop()
+                self._drain_reconciliation_updates()
             if self.user_stream_worker:
                 self.user_stream_worker.stop()
                 self._drain_user_stream_updates()
@@ -160,6 +186,8 @@ class BotService:
     def _tick(self) -> None:
         now = time.monotonic()
         self._drain_redemption_updates()
+        self._drain_market_stream_updates()
+        self._drain_reconciliation_updates()
         stream_recovered = self._drain_user_stream_updates()
         recovered = self._drain_heartbeat_updates()
         self._cancel_due_orders(time.time())
@@ -171,16 +199,152 @@ class BotService:
             or stream_recovered
             or now - self.last_reconcile >= self.config.order_poll_seconds
         ):
-            self._reconcile()
-            self.last_reconcile = now
+            if self.reconciliation_worker:
+                if self.reconciliation_worker.submit(
+                    self.database.tracked_open_orders()
+                ):
+                    self.last_reconcile = now
+            else:
+                self._reconcile()
+                self.last_reconcile = now
         healthy = not self.live or bool(
             self.heartbeat_worker and self.heartbeat_worker.healthy
             and self.user_stream_worker
             and self.user_stream_worker.healthy
         )
-        if healthy and now - self.last_discovery >= self.config.discovery_seconds:
+        if healthy:
+            self._place_ready_markets()
+        gamma_needed = (
+            self.market_stream_worker is None
+            or not self.market_stream_worker.healthy
+            or self.last_discovery == 0.0
+        )
+        if (
+            healthy
+            and gamma_needed
+            and now - self.last_discovery >= self.config.discovery_seconds
+        ):
             self._discover_and_place()
             self.last_discovery = now
+
+    def _drain_market_stream_updates(self) -> None:
+        if not self.market_stream_worker:
+            return
+        for update in self.market_stream_worker.drain():
+            if isinstance(update, MarketStreamState):
+                if update.healthy:
+                    self.database.event(
+                        self.run_id,
+                        "INFO",
+                        "market_stream_connected",
+                        details={"recovered": update.recovered},
+                    )
+                    self.logger.info("market WebSocket connected")
+                else:
+                    self.database.event(
+                        self.run_id,
+                        "ERROR",
+                        "market_stream_disconnected",
+                        details={"error": update.error},
+                    )
+                    self.logger.error("market WebSocket unavailable: %s", update.error)
+                continue
+
+            self.ready_market_updates.append(update)
+            self.database.event(
+                self.run_id,
+                "INFO",
+                "market_books_ready",
+                slug=update.market.slug,
+                details=self._market_stream_details(update),
+            )
+
+    def _drain_reconciliation_updates(self) -> None:
+        if not self.reconciliation_worker:
+            return
+        rearm_discovery = False
+        order_changed = False
+        for update in self.reconciliation_worker.drain():
+            if update.batch_error:
+                self.database.event(
+                    self.run_id,
+                    "WARNING",
+                    "order_batch_reconcile_failed",
+                    details={"error": update.batch_error},
+                )
+                continue
+            for result in update.orders:
+                row = self.database.order(result.snapshot.order_id)
+                if row is None:
+                    continue
+                if result.error or result.raw is None:
+                    self.database.event(
+                        self.run_id,
+                        "WARNING",
+                        "order_reconcile_failed",
+                        slug=result.snapshot.slug,
+                        details={
+                            "order_id": result.snapshot.order_id,
+                            "error": result.error,
+                        },
+                    )
+                    continue
+                previous_status = str(row["status"])
+                previous_matched = Decimal(row["matched_size"])
+                status, matched = normalize_order(result.raw)
+                matched = max(matched, previous_matched)
+                if status == "matched" and matched >= Decimal(result.snapshot.size):
+                    status = "filled"
+                if (
+                    previous_status in TERMINAL_ORDER_STATES
+                    and status not in TERMINAL_ORDER_STATES
+                ):
+                    status = previous_status
+                self.database.update_order(
+                    result.snapshot.order_id,
+                    status=status,
+                    matched_size=matched,
+                    raw=result.raw,
+                )
+                if row["role"] == "entry" and matched > previous_matched:
+                    order_changed = True
+                if (
+                    previous_status not in TERMINAL_ORDER_STATES
+                    and status in TERMINAL_ORDER_STATES
+                    and matched == 0
+                ):
+                    rearm_discovery = True
+
+        if rearm_discovery:
+            self.last_discovery = 0.0
+        if order_changed and self.exchange and not self.plan.buy_only:
+            self._place_missing_exits(int(time.time()))
+
+    def _place_ready_markets(self) -> None:
+        updates, self.ready_market_updates = self.ready_market_updates, []
+        now_ts = int(time.time())
+        for update in updates:
+            if not self._consider_market(
+                update.market,
+                now_ts=now_ts,
+                trigger="market_ws",
+                orderbook_ready=True,
+                trigger_details=self._market_stream_details(update),
+            ):
+                return
+
+    def _market_stream_details(self, update: MarketReadyUpdate) -> dict:
+        return {
+            "event_ts_ms": update.event_ts_ms,
+            "received_ts_ms": update.received_ts_ms,
+            "ready_ts_ms": update.ready_ts_ms,
+            "transport_ms": update.received_ts_ms - update.event_ts_ms,
+            "subscribe_to_ready_ms": update.ready_ts_ms - update.received_ts_ms,
+            "event_to_ready_ms": update.ready_ts_ms - update.event_ts_ms,
+            "queue_price": str(self.plan.buy_price),
+            "queue_ahead_up": str(update.queue_ahead_up),
+            "queue_ahead_down": str(update.queue_ahead_down),
+        }
 
     def _drain_user_stream_updates(self) -> bool:
         if not self.user_stream_worker:
@@ -382,38 +546,66 @@ class BotService:
             return
         now_ts = int(time.time())
         for market in markets:
-            if not is_eligible(
-                market, run_started_ts=self.run_started_ts, now_ts=now_ts
+            if not self._consider_market(
+                market,
+                now_ts=now_ts,
+                trigger="gamma",
+                orderbook_ready=False,
             ):
-                continue
-            if not self.database.can_start_entry_plan(market.slug, self.run_id):
-                continue
-            if self.plan.buy_price % market.tick_size:
-                self._skip_market(market, "buy price does not match market tick size")
-                continue
-            if any(
-                target.price % market.tick_size
-                for target in self.plan.exit_targets
-            ):
-                self._skip_market(
-                    market, "take-profit price does not match market tick size"
+                return
+
+    def _consider_market(
+        self,
+        market: Market,
+        *,
+        now_ts: int,
+        trigger: str,
+        orderbook_ready: bool,
+        trigger_details: dict | None = None,
+    ) -> bool:
+        if not is_eligible(
+            market, run_started_ts=self.run_started_ts, now_ts=now_ts
+        ):
+            return True
+        if not self.database.can_start_entry_plan(market.slug, self.run_id):
+            return True
+        if self.plan.buy_price % market.tick_size:
+            self._skip_market(market, "buy price does not match market tick size")
+            return True
+        if any(target.price % market.tick_size for target in self.plan.exit_targets):
+            self._skip_market(
+                market, "take-profit price does not match market tick size"
+            )
+            return True
+        if market.min_size > self.plan.order_size:
+            self._skip_market(market, "configured order is below market minimum")
+            return True
+        if (
+            self.max_daily_filled_cost is not None
+            and self.database.daily_filled_cost() >= self.max_daily_filled_cost
+        ):
+            return False
+        if (
+            self.max_reserved_usd is not None
+            and self.database.active_reserved_usd() + self.plan.market_reserve
+            > self.max_reserved_usd
+        ):
+            return False
+        if self.exchange and not orderbook_ready:
+            try:
+                if not self.exchange.order_books_ready(market):
+                    return True
+            except Exception as exc:
+                self.database.event(
+                    self.run_id,
+                    "ERROR",
+                    "orderbook_check_failed",
+                    slug=market.slug,
+                    details={"error": f"{type(exc).__name__}: {exc}"},
                 )
-                continue
-            if market.min_size > self.plan.order_size:
-                self._skip_market(market, "configured order is below market minimum")
-                continue
-            if (
-                self.max_daily_filled_cost is not None
-                and self.database.daily_filled_cost() >= self.max_daily_filled_cost
-            ):
-                return
-            if (
-                self.max_reserved_usd is not None
-                and self.database.active_reserved_usd() + self.plan.market_reserve
-                > self.max_reserved_usd
-            ):
-                return
-            self._place(market)
+                return True
+        self._place(market, trigger=trigger, trigger_details=trigger_details)
+        return True
 
     def _skip_market(self, market: Market, reason: str) -> None:
         self.database.prepare_market(self.run_id, market, state="skipped")
@@ -426,7 +618,13 @@ class BotService:
             details={"reason": reason},
         )
 
-    def _place(self, market: Market) -> None:
+    def _place(
+        self,
+        market: Market,
+        *,
+        trigger: str,
+        trigger_details: dict | None = None,
+    ) -> None:
         self.database.prepare_market(self.run_id, market)
         if not self.live:
             for outcome, token_id in (
@@ -452,6 +650,7 @@ class BotService:
             self.logger.info("DRY-RUN %s: Up/Down bids prepared", market.slug)
             return
 
+        placement_started_ts_ms = int(time.time() * 1000)
         try:
             result = self.exchange.place_dual(
                 market,
@@ -477,10 +676,15 @@ class BotService:
                     "ERROR",
                     "placement_ambiguous",
                     slug=market.slug,
-                    details={"error": error},
+                    details={
+                        "error": error,
+                        "trigger": trigger,
+                        **(trigger_details or {}),
+                    },
                 )
                 return
 
+        placement_finished_ts_ms = int(time.time() * 1000)
         for order in result.orders:
             self.database.add_order(self.run_id, market.slug, order)
         if result.complete:
@@ -490,7 +694,16 @@ class BotService:
                 "INFO",
                 "dual_orders_placed",
                 slug=market.slug,
-                details={"order_ids": [order.order_id for order in result.orders]},
+                details={
+                    "order_ids": [order.order_id for order in result.orders],
+                    "trigger": trigger,
+                    "placement_started_ts_ms": placement_started_ts_ms,
+                    "placement_finished_ts_ms": placement_finished_ts_ms,
+                    "placement_ms": (
+                        placement_finished_ts_ms - placement_started_ts_ms
+                    ),
+                    **(trigger_details or {}),
+                },
             )
             self.logger.info("LIVE %s: both orders accepted", market.slug)
         else:
@@ -500,7 +713,13 @@ class BotService:
                 "ERROR",
                 "placement_failed",
                 slug=market.slug,
-                details={"error": result.error},
+                details={
+                    "error": result.error,
+                    "trigger": trigger,
+                    "placement_started_ts_ms": placement_started_ts_ms,
+                    "placement_finished_ts_ms": placement_finished_ts_ms,
+                    **(trigger_details or {}),
+                },
             )
 
     def _reconcile(self) -> None:

@@ -35,7 +35,10 @@ Authenticated CLOB traffic uses `py-clob-client-v2 -> httpx -> httpcore`.
 `httpcore` is pinned to commit
 `35ddb373e13be5940e5137798d5a63d67e10f3e2` from
 `baizhufbb/httpcore`, which contains the proxy TLS zombie-connection fix.
-Public Gamma discovery continues to use `requests`.
+Public Gamma discovery continues to use `requests`. In live farthest-first mode,
+the public market WebSocket detects each new BTC five-minute market and waits
+for both CLOB books before submitting. Gamma fills the startup window and
+recovers any event missed during a socket reconnect.
 
 ## Configuration
 
@@ -80,13 +83,17 @@ worker.
   be identified exactly, it is recorded as failed and is not blindly repeated.
 - A dedicated heartbeat thread sends every five seconds, independently of
   discovery and order reconciliation. A failed heartbeat pauses new orders.
+- Farthest-first live runs record the new-market timestamp, both-book readiness,
+  order-submission duration, and the aggregate queue already resting at the
+  configured entry price.
 - A separate redemption thread scans every 30 minutes. It redeems only resolved
   positions with positive current value, waits for relayer confirmation, and
   never blindly retries an ambiguous or failed redemption in the same process.
 - An expired heartbeat ID is replaced from the protocol's `400` response and
   retried once. Recovery triggers an immediate open-order reconciliation.
 - Open orders are synchronized in one batch; only orders missing from that
-  response require an individual terminal-status lookup.
+  response require an individual terminal-status lookup. Exchange reads run in
+  a background worker so reconciliation cannot delay a new-market placement.
 - Ctrl+C cancels all open orders recorded by this bot.
 - After a restart, cancellation requests are reconciled first. Future markets
   whose previous entry pair is confirmed terminal and completely unfilled are

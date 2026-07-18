@@ -708,6 +708,7 @@ dependencies = [
     { name = "py-clob-client-v2" },
     { name = "python-dotenv" },
     { name = "requests" },
+    { name = "websockets" },
 ]
 
 [package.dev-dependencies]
@@ -724,6 +725,7 @@ requires-dist = [
     { name = "py-clob-client-v2", specifier = "==1.0.2" },
     { name = "python-dotenv", specifier = "==1.1.1" },
     { name = "requests", specifier = "==2.32.4" },
+    { name = "websockets", specifier = "==15.0.1" },
 ]
 
 [package.metadata.requires-dev]

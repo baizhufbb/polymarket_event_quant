@@ -326,6 +326,16 @@ class Exchange:
     def get_order(self, order_id: str) -> dict:
         return self.client.get_order(order_id)
 
+    def order_books_ready(self, market: Market) -> bool:
+        for token_id in (market.up_token_id, market.down_token_id):
+            try:
+                self.client.get_order_book(token_id)
+            except PolyApiException as exc:
+                if "does not exist" in str(exc).lower():
+                    return False
+                raise
+        return True
+
     def conditional_balance(self, token_id: str) -> Decimal:
         response = self.client.get_balance_allowance(
             BalanceAllowanceParams(
