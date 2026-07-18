@@ -368,7 +368,10 @@ class BotService:
 
     def _discover_and_place(self) -> None:
         try:
-            markets = self.discovery.discover(self.lookahead_minutes)
+            markets = self.discovery.discover(
+                self.lookahead_minutes,
+                farthest_first=self.placement_order == "farthest-first",
+            )
         except Exception as exc:
             self.database.event(
                 self.run_id,
@@ -377,8 +380,6 @@ class BotService:
                 details={"error": f"{type(exc).__name__}: {exc}"},
             )
             return
-        if self.placement_order == "farthest-first":
-            markets.reverse()
         now_ts = int(time.time())
         for market in markets:
             if not is_eligible(

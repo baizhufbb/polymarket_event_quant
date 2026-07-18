@@ -124,6 +124,34 @@ def test_parse_market() -> None:
     assert market.end_ts == 2_000_000_300
 
 
+def test_farthest_discovery_requests_only_the_far_edge_window() -> None:
+    class Response:
+        @staticmethod
+        def raise_for_status() -> None:
+            return None
+
+        @staticmethod
+        def json() -> list:
+            return []
+
+    class Session:
+        def __init__(self) -> None:
+            self.params = None
+
+        def get(self, _url, *, params, timeout):
+            self.params = params
+            assert timeout == 20
+            return Response()
+
+    discovery = MarketDiscovery()
+    discovery.session = Session()
+
+    assert discovery.discover(40, farthest_first=True) == []
+    assert discovery.session.params["ascending"] == "false"
+    assert discovery.session.params["limit"] == 8
+    assert "end_date_max" not in discovery.session.params
+
+
 def test_rejects_current_market_from_new_run() -> None:
     event = {
         "slug": "btc-updown-5m-2000000000",

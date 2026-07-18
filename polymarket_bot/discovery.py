@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -22,26 +23,41 @@ class MarketDiscovery:
         self.session = requests.Session()
         self.session.headers["User-Agent"] = "polymarket-btc-bot/0.1"
 
-    def discover(self, lookahead_minutes: int = 40) -> list[Market]:
+    def discover(
+        self,
+        window_minutes: int = 40,
+        *,
+        farthest_first: bool = False,
+    ) -> list[Market]:
         now = datetime.now(timezone.utc)
+        params = {
+            "series_id": BTC_FIVE_MINUTE_SERIES_ID,
+            "active": "true",
+            "closed": "false",
+            "limit": (
+                math.ceil(window_minutes / 5)
+                if farthest_first
+                else 100
+            ),
+            "order": "endDate",
+            "ascending": "false" if farthest_first else "true",
+            "end_date_min": _iso(now - timedelta(minutes=5)),
+        }
+        if not farthest_first:
+            params["end_date_max"] = _iso(
+                now + timedelta(minutes=window_minutes)
+            )
         response = self.session.get(
             GAMMA_EVENTS,
-            params={
-                "series_id": BTC_FIVE_MINUTE_SERIES_ID,
-                "active": "true",
-                "closed": "false",
-                "limit": 100,
-                "order": "endDate",
-                "ascending": "true",
-                "end_date_min": _iso(now - timedelta(minutes=5)),
-                "end_date_max": _iso(now + timedelta(minutes=lookahead_minutes)),
-            },
+            params=params,
             timeout=20,
         )
         response.raise_for_status()
         markets = [self._parse(event) for event in response.json()]
         return sorted(
-            (market for market in markets if market), key=lambda item: item.start_ts
+            (market for market in markets if market),
+            key=lambda item: item.start_ts,
+            reverse=farthest_first,
         )
 
     @staticmethod

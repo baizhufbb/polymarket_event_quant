@@ -144,13 +144,13 @@ uv run --env-file .env.trading bot.py run --live `
   --take-profit 0.10:0.10 `
   --take-profit 0.30:0.10
 
-# Scan 120 minutes ahead and place the farthest markets first.
+# Select 40 minutes from the currently farthest market and place backward.
 uv run --env-file .env.trading bot.py run --live `
   --buy-price 0.01 --usd-per-side 1 `
   --take-profit 0.02:0.50 `
   --take-profit 0.10:0.10 `
   --take-profit 0.30:0.10 `
-  --lookahead-minutes 120 --placement-order farthest-first `
+  --lookahead-minutes 40 --placement-order farthest-first `
   --cancel-before-end-seconds 2
 
 # Run with explicit optional limits.
