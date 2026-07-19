@@ -71,6 +71,7 @@ def test_run_limits_are_optional_cli_parameters() -> None:
     assert args.lookahead_minutes == 40
     assert args.placement_order == "nearest-first"
     assert args.cancel_before_end_seconds == 2
+    assert args.heartbeat_seconds is None
 
     buy_only = _parser().parse_args(
         [
@@ -96,10 +97,13 @@ def test_run_limits_are_optional_cli_parameters() -> None:
             "120",
             "--placement-order",
             "farthest-first",
+            "--heartbeat-seconds",
+            "5",
         ]
     )
     assert reverse.lookahead_minutes == 120
     assert reverse.placement_order == "farthest-first"
+    assert reverse.heartbeat_seconds == Decimal("5")
 
 
 def test_parse_market() -> None:
@@ -282,7 +286,7 @@ def test_immediately_matched_order_is_terminal_and_records_full_size(tmp_path) -
         assert database.tracked_open_orders() == []
 
 
-def test_restart_rearms_only_unfilled_terminal_entry_plans(tmp_path) -> None:
+def test_existing_market_is_never_rearmed(tmp_path) -> None:
     market = Market(
         slug="btc-updown-5m-2000000000",
         condition_id="0xcondition",
@@ -312,16 +316,16 @@ def test_restart_rearms_only_unfilled_terminal_entry_plans(tmp_path) -> None:
             )
 
         second_run = database.start_run("live")
-        assert not database.can_start_entry_plan(market.slug, second_run)
+        assert not database.can_start_entry_plan(market.slug)
         assert len(database.tracked_open_orders()) == 2
 
         database.mark_orders(["up-order", "down-order"], "cancelled")
-        assert database.can_start_entry_plan(market.slug, second_run)
+        assert not database.can_start_entry_plan(market.slug)
 
         database.update_order(
             "up-order", status="cancelled", matched_size=Decimal("1"), raw={}
         )
-        assert not database.can_start_entry_plan(market.slug, second_run)
+        assert not database.can_start_entry_plan(market.slug)
 
         database.update_order(
             "up-order", status="cancelled", matched_size=Decimal("0"), raw={}
@@ -332,4 +336,4 @@ def test_restart_rearms_only_unfilled_terminal_entry_plans(tmp_path) -> None:
         ).fetchone()
         assert market_row["run_id"] == second_run
         assert market_row["state"] == "placing"
-        assert not database.can_start_entry_plan(market.slug, second_run)
+        assert not database.can_start_entry_plan(market.slug)

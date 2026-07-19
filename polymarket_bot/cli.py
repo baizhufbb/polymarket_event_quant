@@ -71,6 +71,15 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--lookahead-minutes", type=int, default=40)
     run.add_argument("--cancel-before-end-seconds", type=int, default=2)
     run.add_argument(
+        "--heartbeat-seconds",
+        type=_decimal_arg,
+        metavar="SECONDS",
+        help=(
+            "enable Polymarket's disconnect-cancels-orders heartbeat and send "
+            "every SECONDS; omitted disables it"
+        ),
+    )
+    run.add_argument(
         "--placement-order",
         choices=("nearest-first", "farthest-first"),
         default="nearest-first",
@@ -132,6 +141,10 @@ def main() -> None:
             raise SystemExit("--lookahead-minutes must be positive")
         if args.cancel_before_end_seconds < 0:
             raise SystemExit("--cancel-before-end-seconds cannot be negative")
+        if args.heartbeat_seconds is not None and not (
+            Decimal("0") < args.heartbeat_seconds < Decimal("10")
+        ):
+            raise SystemExit("--heartbeat-seconds must be above 0 and below 10")
         if (
             args.max_reserved_usd is not None
             and args.max_reserved_usd < plan.market_reserve
@@ -150,6 +163,7 @@ def main() -> None:
                 lookahead_minutes=args.lookahead_minutes,
                 placement_order=args.placement_order,
                 cancel_before_end_seconds=args.cancel_before_end_seconds,
+                heartbeat_seconds=args.heartbeat_seconds,
                 live=args.live,
                 logger=_logger(config),
             )

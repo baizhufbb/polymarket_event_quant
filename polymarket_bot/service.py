@@ -63,6 +63,7 @@ class BotService:
         lookahead_minutes: int,
         placement_order: str,
         cancel_before_end_seconds: int,
+        heartbeat_seconds: Decimal | None,
         live: bool,
         logger: logging.Logger,
     ):
@@ -75,13 +76,14 @@ class BotService:
         self.lookahead_minutes = lookahead_minutes
         self.placement_order = placement_order
         self.cancel_before_end_seconds = cancel_before_end_seconds
+        self.heartbeat_seconds = heartbeat_seconds
         self.live = live
         self.logger = logger
         self.discovery = MarketDiscovery()
         self.exchange = Exchange(config) if live else None
         self.heartbeat_worker = (
-            HeartbeatWorker(self.exchange, config.heartbeat_seconds)
-            if self.exchange
+            HeartbeatWorker(self.exchange, float(heartbeat_seconds))
+            if self.exchange and heartbeat_seconds is not None
             else None
         )
         self.redemption_worker = (
@@ -122,6 +124,11 @@ class BotService:
             "lookahead_minutes": self.lookahead_minutes,
             "placement_order": self.placement_order,
             "cancel_before_end_seconds": self.cancel_before_end_seconds,
+            "heartbeat_seconds": (
+                str(self.heartbeat_seconds)
+                if self.heartbeat_seconds is not None
+                else None
+            ),
             "redemption_seconds": self.config.redemption_seconds,
             "fast_market_stream": self.market_stream_worker is not None,
         }
@@ -207,8 +214,11 @@ class BotService:
             else:
                 self._reconcile()
                 self.last_reconcile = now
+        heartbeat_healthy = (
+            self.heartbeat_worker is None or self.heartbeat_worker.healthy
+        )
         healthy = not self.live or bool(
-            self.heartbeat_worker and self.heartbeat_worker.healthy
+            heartbeat_healthy
             and self.user_stream_worker
             and self.user_stream_worker.healthy
         )
@@ -567,7 +577,7 @@ class BotService:
             market, run_started_ts=self.run_started_ts, now_ts=now_ts
         ):
             return True
-        if not self.database.can_start_entry_plan(market.slug, self.run_id):
+        if not self.database.can_start_entry_plan(market.slug):
             return True
         if self.plan.buy_price % market.tick_size:
             self._skip_market(market, "buy price does not match market tick size")

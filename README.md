@@ -24,6 +24,8 @@ until stopped.
 - An omitted limit is unlimited.
 - Cancel remaining entry and exit orders before the market cutoff; the lead time
   is controlled by `--cancel-before-end-seconds` and defaults to two seconds.
+- Polymarket's disconnect-cancels-orders heartbeat is disabled unless
+  `--heartbeat-seconds SECONDS` is supplied.
 - Every 30 minutes, redeem resolved winning positions back into available pUSD.
 
 This is an experimental tail-event strategy. It has not been proven to have a
@@ -63,6 +65,11 @@ Omitting `--take-profit` selects buy-only mode. Matched shares are not offered
 for sale; resolved winning positions are collected by the 30-minute redemption
 worker.
 
+Omitting `--heartbeat-seconds` leaves GTC orders on the exchange during a
+network or process outage. Supplying a value above zero and below ten enables
+Polymarket's dead-man switch and controls how often this client sends a
+heartbeat. It does not change Polymarket's server-side cancellation deadline.
+
 ## Safety
 
 - `run` is a dry-run unless `--live` is supplied.
@@ -81,24 +88,25 @@ worker.
   balance, so off-chain matches are never treated as already settled inventory.
 - An ambiguous exit submission is reconciled against the exchange. If it cannot
   be identified exactly, it is recorded as failed and is not blindly repeated.
-- A dedicated heartbeat thread sends every five seconds, independently of
-  discovery and order reconciliation. A failed heartbeat pauses new orders.
+- When `--heartbeat-seconds` is enabled, a dedicated thread sends independently
+  of discovery and reconciliation. A failed heartbeat pauses new orders and
+  Polymarket may cancel every open order for the account.
 - Farthest-first live runs record the new-market timestamp, both-book readiness,
   order-submission duration, and the aggregate queue already resting at the
   configured entry price.
 - A separate redemption thread scans every 30 minutes. It redeems only resolved
   positions with positive current value, waits for relayer confirmation, and
   never blindly retries an ambiguous or failed redemption in the same process.
-- An expired heartbeat ID is replaced from the protocol's `400` response and
-  retried once. Recovery triggers an immediate open-order reconciliation.
+- When enabled, an expired heartbeat ID is replaced from the protocol's `400`
+  response and retried once. Recovery triggers an immediate open-order
+  reconciliation.
 - Open orders are synchronized in one batch; only orders missing from that
   response require an individual terminal-status lookup. Exchange reads run in
   a background worker so reconciliation cannot delay a new-market placement.
 - Ctrl+C cancels all open orders recorded by this bot.
-- After a restart, cancellation requests are reconciled first. Future markets
-  whose previous entry pair is confirmed terminal and completely unfilled are
-  rearmed with the new run parameters; any market with a fill is never bought
-  twice and only receives missing take-profit orders.
+- Entry placement is attempted only once per market across all runs. A cancelled,
+  rejected, failed, or ambiguous entry pair is never submitted again because a
+  later order would lose the original queue position.
 - The bot checks Polymarket geoblocking before and during live operation.
 - A local process lock prevents two bot instances from placing duplicate orders.
 
@@ -106,8 +114,8 @@ worker.
 
 The only database is `data/bot.sqlite`:
 
-- `runs`: every start and stop, mode, fixed trading parameters, heartbeat, and
-  terminal error.
+- `runs`: every start and stop, mode, fixed trading parameters, optional
+  heartbeat status, and terminal error.
 - `markets`: each market considered by the bot and its state.
 - `orders`: entry and exit order IDs, side, price, size, matched size, and status.
 - `events`: operational audit log.
@@ -150,6 +158,11 @@ uv run --env-file .env.trading bot.py run --live `
   --take-profit 0.02:0.50 `
   --take-profit 0.10:0.10 `
   --take-profit 0.30:0.10
+
+# Opt into disconnect-triggered order cancellation with a five-second heartbeat.
+uv run --env-file .env.trading bot.py run --live `
+  --buy-price 0.01 --usd-per-side 1 `
+  --heartbeat-seconds 5
 
 # Select 40 minutes from the currently farthest market and place backward.
 uv run --env-file .env.trading bot.py run --live `

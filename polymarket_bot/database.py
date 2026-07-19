@@ -180,36 +180,8 @@ class BotDatabase:
             is not None
         )
 
-    def can_start_entry_plan(self, slug: str, run_id: int) -> bool:
-        market = self.connection.execute(
-            "SELECT run_id FROM markets WHERE slug=?", (slug,)
-        ).fetchone()
-        if market is None:
-            return True
-        if market["run_id"] == run_id:
-            return False
-
-        terminal_without_fill = {
-            "cancelled",
-            "canceled",
-            "closed",
-            "expired",
-            "rejected",
-            "failed",
-            "simulated_closed",
-        }
-        entries = self.connection.execute(
-            """
-            SELECT status, matched_size FROM orders
-            WHERE slug=? AND role='entry'
-            """,
-            (slug,),
-        ).fetchall()
-        return all(
-            Decimal(row["matched_size"]) == 0
-            and row["status"] in terminal_without_fill
-            for row in entries
-        )
+    def can_start_entry_plan(self, slug: str) -> bool:
+        return not self.has_market(slug)
 
     def add_market(self, run_id: int, market: Market, state: str = "placing") -> None:
         self.connection.execute(
