@@ -140,10 +140,10 @@ def test_farthest_discovery_requests_only_the_far_edge_window() -> None:
 
     class Session:
         def __init__(self) -> None:
-            self.params = None
+            self.calls = []
 
         def get(self, _url, *, params, timeout):
-            self.params = params
+            self.calls.append(params)
             assert timeout == 20
             return Response()
 
@@ -151,9 +151,41 @@ def test_farthest_discovery_requests_only_the_far_edge_window() -> None:
     discovery.session = Session()
 
     assert discovery.discover(40, farthest_first=True) == []
-    assert discovery.session.params["ascending"] == "false"
-    assert discovery.session.params["limit"] == 8
-    assert "end_date_max" not in discovery.session.params
+    assert len(discovery.session.calls) == 1
+    params = discovery.session.calls[0]
+    assert params["ascending"] == "false"
+    assert params["limit"] == 8
+    assert params["offset"] == 0
+    assert "end_date_max" not in params
+
+
+def test_farthest_discovery_pages_across_a_23_hour_window() -> None:
+    class Response:
+        def __init__(self, count) -> None:
+            self.count = count
+
+        @staticmethod
+        def raise_for_status() -> None:
+            return None
+
+        def json(self) -> list:
+            return [{} for _ in range(self.count)]
+
+    class Session:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def get(self, _url, *, params, timeout):
+            self.calls.append(params)
+            assert timeout == 20
+            return Response(params["limit"])
+
+    discovery = MarketDiscovery()
+    discovery.session = Session()
+
+    assert discovery.discover(1380, farthest_first=True) == []
+    assert [call["limit"] for call in discovery.session.calls] == [100, 100, 76]
+    assert [call["offset"] for call in discovery.session.calls] == [0, 100, 200]
 
 
 def test_rejects_current_market_from_new_run() -> None:

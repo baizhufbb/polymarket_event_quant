@@ -149,11 +149,13 @@ class BotService:
             self.reconciliation_worker.start()
         if self.redemption_worker:
             self.redemption_worker.start()
+        cancel_on_shutdown = False
         try:
             while deadline is None or time.monotonic() < deadline:
                 self._tick()
                 time.sleep(0.2)
         except KeyboardInterrupt:
+            cancel_on_shutdown = True
             self.logger.info("Ctrl+C received; stopping")
         except Exception as exc:
             self.database.stop_run(
@@ -183,7 +185,8 @@ class BotService:
                 self._drain_user_stream_updates()
             if self.heartbeat_worker:
                 self.heartbeat_worker.stop()
-            self._cancel_tracked_orders()
+            if cancel_on_shutdown:
+                self._cancel_tracked_orders()
             row = self.database.connection.execute(
                 "SELECT status FROM runs WHERE id=?", (self.run_id,)
             ).fetchone()

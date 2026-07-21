@@ -12,6 +12,7 @@ from .models import Market
 
 GAMMA_EVENTS = "https://gamma-api.polymarket.com/events"
 BTC_FIVE_MINUTE_SERIES_ID = 10684
+GAMMA_PAGE_SIZE = 100
 
 
 def _iso(value: datetime) -> str:
@@ -30,15 +31,11 @@ class MarketDiscovery:
         farthest_first: bool = False,
     ) -> list[Market]:
         now = datetime.now(timezone.utc)
+        requested = math.ceil(window_minutes / 5) if farthest_first else 100
         params = {
             "series_id": BTC_FIVE_MINUTE_SERIES_ID,
             "active": "true",
             "closed": "false",
-            "limit": (
-                math.ceil(window_minutes / 5)
-                if farthest_first
-                else 100
-            ),
             "order": "endDate",
             "ascending": "false" if farthest_first else "true",
             "end_date_min": _iso(now - timedelta(minutes=5)),
@@ -47,13 +44,22 @@ class MarketDiscovery:
             params["end_date_max"] = _iso(
                 now + timedelta(minutes=window_minutes)
             )
-        response = self.session.get(
-            GAMMA_EVENTS,
-            params=params,
-            timeout=20,
-        )
-        response.raise_for_status()
-        markets = [self._parse(event) for event in response.json()]
+
+        events = []
+        while len(events) < requested:
+            page_size = min(GAMMA_PAGE_SIZE, requested - len(events))
+            response = self.session.get(
+                GAMMA_EVENTS,
+                params=params | {"limit": page_size, "offset": len(events)},
+                timeout=20,
+            )
+            response.raise_for_status()
+            page = response.json()
+            events.extend(page)
+            if len(page) < page_size:
+                break
+
+        markets = [self._parse(event) for event in events]
         return sorted(
             (market for market in markets if market),
             key=lambda item: item.start_ts,

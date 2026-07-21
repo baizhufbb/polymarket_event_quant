@@ -1,5 +1,8 @@
 import logging
 from decimal import Decimal
+from types import SimpleNamespace
+
+import pytest
 
 from polymarket_bot.database import BotDatabase
 from polymarket_bot.models import ExitTarget, Market, PlacedOrder, TradePlan
@@ -126,6 +129,86 @@ class LadderExitExchange(ExitExchange):
             side="sell",
             role="exit",
         )
+
+
+def _service_for_run(database, tick, *, hours=None):
+    service = BotService.__new__(BotService)
+    service.config = SimpleNamespace(redemption_seconds=1800)
+    service.database = database
+    service.plan = TradePlan(Decimal("0.01"), (), Decimal("1"))
+    service.hours = hours
+    service.max_reserved_usd = None
+    service.max_daily_filled_cost = None
+    service.lookahead_minutes = 40
+    service.placement_order = "farthest-first"
+    service.cancel_before_end_seconds = 2
+    service.heartbeat_seconds = None
+    service.live = True
+    service.logger = logging.getLogger("test")
+    service.run_id = 0
+    service.heartbeat_worker = None
+    service.user_stream_worker = None
+    service.market_stream_worker = None
+    service.reconciliation_worker = None
+    service.redemption_worker = None
+    service._tick = tick
+    return service
+
+
+def test_run_cancels_tracked_orders_on_ctrl_c(tmp_path) -> None:
+    def interrupt_tick() -> None:
+        raise KeyboardInterrupt
+
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        service = _service_for_run(database, interrupt_tick)
+        cancel_calls = []
+        service._cancel_tracked_orders = lambda: cancel_calls.append(True)
+
+        service.run()
+
+        assert cancel_calls == [True]
+        status = database.connection.execute(
+            "SELECT status FROM runs WHERE id=?", (service.run_id,)
+        ).fetchone()["status"]
+        assert status == "stopped"
+
+
+def test_run_leaves_orders_open_on_failure(tmp_path) -> None:
+    def failed_tick() -> None:
+        raise RuntimeError("network failed")
+
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        service = _service_for_run(database, failed_tick)
+        cancel_calls = []
+        service._cancel_tracked_orders = lambda: cancel_calls.append(True)
+
+        with pytest.raises(RuntimeError, match="network failed"):
+            service.run()
+
+        assert cancel_calls == []
+        status = database.connection.execute(
+            "SELECT status FROM runs WHERE id=?", (service.run_id,)
+        ).fetchone()["status"]
+        assert status == "failed"
+
+
+def test_run_leaves_orders_open_when_duration_elapses(tmp_path) -> None:
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        service = _service_for_run(
+            database,
+            lambda: pytest.fail("expired run must not tick"),
+            hours=Decimal("0"),
+        )
+        cancel_calls = []
+        service._cancel_tracked_orders = lambda: cancel_calls.append(True)
+
+        service.run()
+
+        assert cancel_calls == []
+        status = database.connection.execute(
+            "SELECT status FROM runs WHERE id=?", (service.run_id,)
+        ).fetchone()["status"]
+        assert status == "completed"
 
 
 def test_reconcile_batches_open_orders_and_queries_only_missing(tmp_path) -> None:

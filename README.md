@@ -103,7 +103,9 @@ heartbeat. It does not change Polymarket's server-side cancellation deadline.
 - Open orders are synchronized in one batch; only orders missing from that
   response require an individual terminal-status lookup. Exchange reads run in
   a background worker so reconciliation cannot delay a new-market placement.
-- Ctrl+C cancels all open orders recorded by this bot.
+- Ctrl+C cancels all open orders recorded by this bot. Every other shutdown path,
+  including runtime failures and a completed `--hours` duration, leaves exchange
+  orders open for the next run to reconcile.
 - Entry placement is attempted only once per market across all runs. A cancelled,
   rejected, failed, or ambiguous entry pair is never submitted again because a
   later order would lose the original queue position.
