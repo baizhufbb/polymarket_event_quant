@@ -160,12 +160,13 @@ def _service_for_run(database, tick, *, hours=None):
     return service
 
 
-def test_clob_activation_is_the_primary_placement_trigger() -> None:
+def test_market_stream_activation_is_the_primary_placement_trigger() -> None:
     service = BotService.__new__(BotService)
     service.plan = TradePlan(Decimal("0.01"), (), Decimal("1"))
     service.activation_market_updates = [
         MarketActivationUpdate(
             market=MARKET,
+            market_announced_ts_ms=1_999_999_000_000,
             books_detected_ts_ms=1_999_999_000_125,
             queue_ahead_up=Decimal("12.5"),
             queue_ahead_down=Decimal("8.25"),
@@ -182,9 +183,10 @@ def test_clob_activation_is_the_primary_placement_trigger() -> None:
 
     assert service.activation_market_updates == []
     assert calls[0][0] == MARKET
-    assert calls[0][1]["trigger"] == "clob_activation"
+    assert calls[0][1]["trigger"] == "market_stream_activation"
     assert calls[0][1]["orderbook_ready"] is True
     assert calls[0][1]["trigger_details"] == {
+        "market_announced_ts_ms": 1_999_999_000_000,
         "books_detected_ts_ms": 1_999_999_000_125,
         "queue_price": "0.01",
         "queue_ahead_up": "12.5",
@@ -192,7 +194,7 @@ def test_clob_activation_is_the_primary_placement_trigger() -> None:
     }
 
 
-def test_activation_probe_allows_only_initial_gamma_discovery() -> None:
+def test_activation_worker_owns_continuous_gamma_discovery() -> None:
     service = BotService.__new__(BotService)
     service.config = SimpleNamespace(
         order_poll_seconds=60,
@@ -218,7 +220,7 @@ def test_activation_probe_allows_only_initial_gamma_discovery() -> None:
     service._tick()
     service._tick()
 
-    assert discoveries == [True]
+    assert discoveries == []
 
 
 def test_geoblock_network_failure_pauses_without_raising(tmp_path) -> None:

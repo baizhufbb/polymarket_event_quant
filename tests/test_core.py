@@ -131,6 +131,44 @@ def test_parse_market() -> None:
     assert market.end_ts == 2_000_000_300
 
 
+def test_parse_market_before_accepting_orders() -> None:
+    event = {
+        "slug": "btc-updown-5m-1784857200",
+        "markets": [
+            {
+                "conditionId": "0xcondition",
+                "acceptingOrders": False,
+                "enableOrderBook": True,
+                "clobTokenIds": '["up-token", "down-token"]',
+                "outcomes": '["Up", "Down"]',
+                "orderMinSize": 5,
+                "orderPriceMinTickSize": 0.01,
+            }
+        ],
+    }
+
+    market = MarketDiscovery._parse(event)
+
+    assert market is not None
+    assert market.up_token_id == "up-token"
+    assert market.down_token_id == "down-token"
+
+
+def test_parse_stream_market() -> None:
+    market = MarketDiscovery.parse_stream_market(
+        {
+            "slug": "btc-updown-5m-1784857200",
+            "market": "0xcondition",
+            "assets_ids": ["up-token", "down-token"],
+            "outcomes": ["Up", "Down"],
+            "order_price_min_tick_size": "0.01",
+        }
+    )
+    assert market is not None
+    assert market.up_token_id == "up-token"
+    assert market.down_token_id == "down-token"
+
+
 def test_farthest_discovery_requests_only_the_far_edge_window() -> None:
     class Response:
         @staticmethod

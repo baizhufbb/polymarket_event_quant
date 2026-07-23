@@ -1,44 +1,30 @@
+import time
 from decimal import Decimal
 
-from polymarket_bot.conditional_tokens import binary_token_ids
-from polymarket_bot.market_activation import (
-    MarketActivationWorker,
-    _catalog_market,
-)
+from polymarket_bot.market_activation import MarketActivationWorker
+from polymarket_bot.models import Market
 
 
-ACTIVE_CONDITION = (
-    "0xbc2143c70ad2af9481e8dd46eb538f267d7c23ad781ddf5380e9a00d46e9e9cd"
-)
-FUTURE_CONDITION = (
-    "0xc46ba93f4d9553e8b4c4c1c9d6cbde68426896a40713f98605c753316e66a706"
-)
-FUTURE_UP = (
-    "40734400368422567759951081235288351135874433660498746514087358797347039269519"
-)
-FUTURE_DOWN = (
-    "12816584899393367254956664538948649976215330480366631889555978899000587885894"
-)
-ACTIVE_UP = (
-    "79690064268849976430077014249758289461450439393597627695915949752735045024504"
-)
-ACTIVE_DOWN = (
-    "62179804371407207770226633627836131020602362404226320415203031505393883439742"
-)
-NEWER_CONDITION = "0x" + "11" * 32
-NEWER_UP, NEWER_DOWN = binary_token_ids(NEWER_CONDITION)
+BASE_TS = int(time.time()) + 3600
 
 
-def catalog_row(start_ts: int, condition_id: str, *, accepting: bool) -> dict:
-    return {
-        "market_slug": f"btc-updown-5m-{start_ts}",
-        "condition_id": condition_id,
-        "minimum_order_size": 5,
-        "minimum_tick_size": 0.01,
-        "accepting_orders": accepting,
-        "closed": False,
-        "archived": False,
-    }
+def market(offset: int, name: str) -> Market:
+    start_ts = BASE_TS + offset
+    return Market(
+        slug=f"btc-updown-5m-{start_ts}",
+        condition_id=f"condition-{name}",
+        start_ts=start_ts,
+        end_ts=start_ts + 300,
+        up_token_id=f"up-{name}",
+        down_token_id=f"down-{name}",
+        min_size=Decimal("5"),
+        tick_size=Decimal("0.01"),
+    )
+
+
+ACTIVE = market(0, "active")
+FUTURE = market(300, "future")
+NEWER = market(600, "newer")
 
 
 class Response:
@@ -62,215 +48,152 @@ class BooksSession:
         return Response(self.responses.pop(0))
 
 
-def test_catalog_market_derives_tokens_before_activation() -> None:
-    market = _catalog_market(
-        catalog_row(1_784_857_200, FUTURE_CONDITION, accepting=False)
+def worker() -> MarketActivationWorker:
+    return MarketActivationWorker(
+        queue_price=Decimal("0.01"),
+        window_minutes=30,
+        farthest_first=True,
     )
 
-    assert market is not None
-    assert market.up_token_id == FUTURE_UP
-    assert market.down_token_id == FUTURE_DOWN
-    assert market.tick_size == Decimal("0.01")
+
+def test_gamma_registration_tracks_each_unexpired_market() -> None:
+    activation = worker()
+
+    activation._register_candidates([ACTIVE, FUTURE])
+
+    assert tuple(activation._candidates) == (ACTIVE.slug, FUTURE.slug)
+    assert activation._handled_slugs == set()
 
 
-def test_initial_catalog_tracks_every_unexpired_market_for_book_baseline() -> None:
-    worker = MarketActivationWorker(queue_price=Decimal("0.01"))
-    worker._register_candidates(
+def test_book_poll_without_candidates_is_idle() -> None:
+    activation = worker()
+
+    assert activation._poll_books() is False
+    assert activation.drain() == []
+
+
+def test_existing_books_emit_immediately_without_startup_baseline() -> None:
+    activation = worker()
+    activation._register_candidates([ACTIVE])
+    activation.books_session.close()
+    activation.books_session = BooksSession(
         [
-            catalog_row(1_784_856_600, ACTIVE_CONDITION, accepting=False),
-            catalog_row(1_784_856_900, ACTIVE_CONDITION, accepting=True),
-            catalog_row(1_784_857_200, FUTURE_CONDITION, accepting=False),
+            [
+                {"asset_id": ACTIVE.up_token_id, "bids": []},
+                {"asset_id": ACTIVE.down_token_id, "bids": []},
+            ]
         ]
     )
 
-    assert worker._catalog_initialized is True
-    assert tuple(worker._candidates) == (
-        "btc-updown-5m-1784856600",
-        "btc-updown-5m-1784856900",
-        "btc-updown-5m-1784857200",
-    )
-    assert worker._handled_slugs == set()
+    assert activation._poll_books() is True
+    update = activation.drain()[0]
+    assert update.market == ACTIVE
+    assert activation._candidates == {}
+    assert activation._handled_slugs == {ACTIVE.slug}
 
 
-def test_book_poll_before_catalog_does_not_complete_startup_baseline() -> None:
-    worker = MarketActivationWorker(queue_price=Decimal("0.01"))
-
-    assert worker._poll_books() is False
-    assert worker._books_baselined is False
-
-    worker._register_candidates(
-        [catalog_row(1_784_856_900, ACTIVE_CONDITION, accepting=False)]
-    )
-    worker.books_session.close()
-    worker.books_session = BooksSession(
-        [[{"asset_id": ACTIVE_UP}, {"asset_id": ACTIVE_DOWN}]]
-    )
-
-    assert worker._poll_books() is True
-    assert worker._books_baselined is True
-    assert worker.drain() == []
-    assert worker._candidates == {}
-
-
-def test_later_catalog_refresh_tracks_a_new_already_active_market() -> None:
-    worker = MarketActivationWorker(queue_price=Decimal("0.01"))
-    worker._register_candidates(
-        [catalog_row(1_784_856_900, ACTIVE_CONDITION, accepting=True)]
-    )
-    worker.books_session.close()
-    worker.books_session = BooksSession(
-        [[{"asset_id": ACTIVE_UP}, {"asset_id": ACTIVE_DOWN}]]
-    )
-    worker._poll_books()
-
-    worker._register_candidates(
+def test_later_gamma_refresh_tracks_only_new_market() -> None:
+    activation = worker()
+    activation._register_candidates([ACTIVE])
+    activation.books_session.close()
+    activation.books_session = BooksSession(
         [
-            catalog_row(1_784_856_900, ACTIVE_CONDITION, accepting=True),
-            catalog_row(1_784_857_200, FUTURE_CONDITION, accepting=True),
+            [
+                {"asset_id": ACTIVE.up_token_id, "bids": []},
+                {"asset_id": ACTIVE.down_token_id, "bids": []},
+            ],
+            [
+                {"asset_id": FUTURE.up_token_id, "bids": []},
+                {"asset_id": FUTURE.down_token_id, "bids": []},
+            ],
         ]
     )
+    activation._poll_books()
+    activation.drain()
 
-    assert tuple(worker._candidates) == ("btc-updown-5m-1784857200",)
+    activation._register_candidates([ACTIVE, FUTURE])
 
-
-def test_initial_baseline_uses_books_not_accepting_orders_flag() -> None:
-    worker = MarketActivationWorker(queue_price=Decimal("0.01"))
-    worker._register_candidates(
-        [
-            catalog_row(1_784_856_900, ACTIVE_CONDITION, accepting=False),
-            catalog_row(1_784_857_200, FUTURE_CONDITION, accepting=True),
-        ]
-    )
-    worker.books_session.close()
-    worker.books_session = BooksSession(
-        [[{"asset_id": ACTIVE_UP}, {"asset_id": ACTIVE_DOWN}]]
-    )
-
-    worker._poll_books()
-
-    assert worker.drain() == []
-    assert tuple(worker._candidates) == ("btc-updown-5m-1784857200",)
-    assert worker._handled_slugs == {"btc-updown-5m-1784856900"}
+    assert tuple(activation._candidates) == (FUTURE.slug,)
+    activation._poll_books()
+    assert activation.drain()[0].market == FUTURE
 
 
 def test_batch_books_emits_only_after_both_books_exist() -> None:
-    worker = MarketActivationWorker(queue_price=Decimal("0.01"))
-    worker._register_candidates(
-        [
-            catalog_row(1_784_856_900, ACTIVE_CONDITION, accepting=True),
-            catalog_row(1_784_857_200, FUTURE_CONDITION, accepting=False),
-        ]
-    )
-    worker.books_session.close()
-    worker.books_session = BooksSession(
+    activation = worker()
+    activation._register_candidates([ACTIVE, FUTURE])
+    activation.books_session.close()
+    activation.books_session = BooksSession(
         [
             [
-                {"asset_id": ACTIVE_UP, "bids": []},
-                {"asset_id": ACTIVE_DOWN, "bids": []},
+                {"asset_id": ACTIVE.up_token_id, "bids": []},
+                {"asset_id": ACTIVE.down_token_id, "bids": []},
+                {"asset_id": FUTURE.up_token_id, "bids": []},
             ],
             [
                 {
-                    "asset_id": FUTURE_UP,
+                    "asset_id": FUTURE.up_token_id,
                     "bids": [{"price": "0.01", "size": "12.5"}],
                 },
                 {
-                    "asset_id": FUTURE_DOWN,
+                    "asset_id": FUTURE.down_token_id,
                     "bids": [{"price": "0.01", "size": "8.25"}],
                 },
             ],
         ]
     )
 
-    assert worker._poll_books() is True
-    assert worker.drain() == []
-    assert tuple(worker._candidates) == ("btc-updown-5m-1784857200",)
+    assert activation._poll_books() is True
+    first_update = activation.drain()[0]
+    assert first_update.market == ACTIVE
+    assert tuple(activation._candidates) == (FUTURE.slug,)
 
-    assert worker._poll_books() is True
-    update = worker.drain()[0]
-    assert update.market.slug == "btc-updown-5m-1784857200"
+    assert activation._poll_books() is True
+    update = activation.drain()[0]
+    assert update.market == FUTURE
     assert update.queue_ahead_up == Decimal("12.5")
     assert update.queue_ahead_down == Decimal("8.25")
-    assert worker._candidates == {}
+    assert activation._candidates == {}
 
-    baseline_request_tokens = {
-        item["token_id"] for item in worker.books_session.requests[0][1]
+    first_request_tokens = {
+        item["token_id"] for item in activation.books_session.requests[0][1]
     }
-    assert baseline_request_tokens == {
-        ACTIVE_UP,
-        ACTIVE_DOWN,
-        FUTURE_UP,
-        FUTURE_DOWN,
+    assert first_request_tokens == {
+        ACTIVE.up_token_id,
+        ACTIVE.down_token_id,
+        FUTURE.up_token_id,
+        FUTURE.down_token_id,
     }
-    activation_request_tokens = {
-        item["token_id"] for item in worker.books_session.requests[1][1]
+    second_request_tokens = {
+        item["token_id"] for item in activation.books_session.requests[1][1]
     }
-    assert activation_request_tokens == {FUTURE_UP, FUTURE_DOWN}
+    assert second_request_tokens == {
+        FUTURE.up_token_id,
+        FUTURE.down_token_id,
+    }
 
 
 def test_out_of_order_activation_keeps_each_market_independent() -> None:
-    worker = MarketActivationWorker(queue_price=Decimal("0.01"))
-    worker._register_candidates(
-        [
-            catalog_row(1_784_856_900, ACTIVE_CONDITION, accepting=True),
-            catalog_row(1_784_857_200, FUTURE_CONDITION, accepting=False),
-            catalog_row(1_784_857_500, NEWER_CONDITION, accepting=False),
-        ]
-    )
-    worker.books_session.close()
-    worker.books_session = BooksSession(
+    activation = worker()
+    activation._register_candidates([ACTIVE, FUTURE, NEWER])
+    activation.books_session.close()
+    activation.books_session = BooksSession(
         [
             [
-                {"asset_id": ACTIVE_UP, "bids": []},
-                {"asset_id": ACTIVE_DOWN, "bids": []},
+                {"asset_id": NEWER.up_token_id, "bids": []},
+                {"asset_id": NEWER.down_token_id, "bids": []},
             ],
             [
-                {"asset_id": NEWER_UP, "bids": []},
-                {"asset_id": NEWER_DOWN, "bids": []},
-            ]
+                {"asset_id": FUTURE.up_token_id, "bids": []},
+                {"asset_id": FUTURE.down_token_id, "bids": []},
+            ],
         ]
     )
 
-    worker._poll_books()
-    assert worker.drain() == []
+    activation._poll_books()
+    assert activation.drain()[0].market == NEWER
+    assert tuple(activation._candidates) == (ACTIVE.slug, FUTURE.slug)
 
-    worker._poll_books()
-
-    update = worker.drain()[0]
-    assert update.market.slug == "btc-updown-5m-1784857500"
-    assert tuple(worker._candidates) == ("btc-updown-5m-1784857200",)
-    assert worker._handled_slugs == {
-        "btc-updown-5m-1784856900",
-        "btc-updown-5m-1784857500",
-    }
-
-    worker.books_session.responses.append(
-        [
-            {"asset_id": FUTURE_UP, "bids": []},
-            {"asset_id": FUTURE_DOWN, "bids": []},
-        ]
-    )
-    worker._poll_books()
-
-    update = worker.drain()[0]
-    assert update.market.slug == "btc-updown-5m-1784857200"
-    assert worker._candidates == {}
-    assert worker._handled_slugs == {
-        "btc-updown-5m-1784856900",
-        "btc-updown-5m-1784857200",
-        "btc-updown-5m-1784857500",
-    }
-
-
-def test_tail_locator_finds_last_nonempty_page() -> None:
-    worker = MarketActivationWorker(queue_price=Decimal("0.01"))
-
-    def page(offset: int) -> dict:
-        data = [{}] * 1000 if offset <= 3000 else []
-        return {"data": data, "next_cursor": "next" if data else "LTE="}
-
-    worker._catalog_page = page
-
-    located = worker._locate_tail_page()
-
-    assert located is not None
-    assert located[0] == 3000
+    activation._poll_books()
+    assert activation.drain()[0].market == FUTURE
+    assert tuple(activation._candidates) == (ACTIVE.slug,)
+    assert activation._handled_slugs == {FUTURE.slug, NEWER.slug}

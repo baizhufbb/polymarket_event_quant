@@ -24,6 +24,9 @@ class MarketDiscovery:
         self.session = requests.Session()
         self.session.headers["User-Agent"] = "polymarket-btc-bot/0.1"
 
+    def close(self) -> None:
+        self.session.close()
+
     def discover(
         self,
         window_minutes: int = 40,
@@ -74,9 +77,11 @@ class MarketDiscovery:
             return None
         market = market_rows[0]
         slug = str(event.get("slug") or "")
+        return MarketDiscovery._parse_market(market, slug)
+
+    @staticmethod
+    def _parse_market(market: dict, slug: str) -> Market | None:
         if not slug.startswith("btc-updown-5m-"):
-            return None
-        if not market.get("acceptingOrders"):
             return None
         if not market.get("enableOrderBook"):
             return None
@@ -96,6 +101,33 @@ class MarketDiscovery:
                 tick_size=Decimal(str(market.get("orderPriceMinTickSize") or "0.01")),
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    @staticmethod
+    def parse_stream_market(message: dict) -> Market | None:
+        slug = str(message.get("slug") or "")
+        if not slug.startswith("btc-updown-5m-"):
+            return None
+        try:
+            start_ts = int(slug.rsplit("-", 1)[1])
+            token_ids = message.get("clob_token_ids") or message["assets_ids"]
+            outcomes = message["outcomes"]
+            token_by_outcome = dict(zip(outcomes, token_ids, strict=True))
+            return Market(
+                slug=slug,
+                condition_id=str(
+                    message.get("condition_id") or message["market"]
+                ),
+                start_ts=start_ts,
+                end_ts=start_ts + 300,
+                up_token_id=str(token_by_outcome["Up"]),
+                down_token_id=str(token_by_outcome["Down"]),
+                min_size=Decimal("5"),
+                tick_size=Decimal(
+                    str(message.get("order_price_min_tick_size") or "0.01")
+                ),
+            )
+        except (KeyError, TypeError, ValueError):
             return None
 
 

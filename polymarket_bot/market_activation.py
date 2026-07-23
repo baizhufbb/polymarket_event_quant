@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import base64
+import json
 import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -8,20 +8,17 @@ from queue import Empty, SimpleQueue
 from threading import Event, Lock, Thread
 
 import requests
+from websockets.sync.client import connect
 
-from .conditional_tokens import binary_token_ids
+from .discovery import MarketDiscovery
 from .models import Market
 
 
-CLOB_MARKETS = "https://clob.polymarket.com/markets"
 CLOB_BOOKS = "https://clob.polymarket.com/books"
-BTC_FIVE_MINUTE_PREFIX = "btc-updown-5m-"
-MARKET_SECONDS = 300
-CATALOG_PAGE_SIZE = 1000
-CATALOG_LOOKBACK_PAGES = 3
-CATALOG_REFRESH_SECONDS = 30.0
+MARKET_STREAM = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+MARKET_STREAM_RECONNECT_SECONDS = 1.0
+MARKET_STREAM_PING_SECONDS = 10.0
 ACTIVATION_POLL_SECONDS = 0.25
-END_CURSOR = "LTE="
 
 
 @dataclass(frozen=True)
@@ -35,41 +32,16 @@ class MarketActivationState:
 @dataclass(frozen=True)
 class MarketActivationUpdate:
     market: Market
+    market_announced_ts_ms: int | None
     books_detected_ts_ms: int
     queue_ahead_up: Decimal
     queue_ahead_down: Decimal
 
 
-def _catalog_cursor(offset: int) -> str:
-    return base64.b64encode(str(offset).encode()).decode()
-
-
-def _catalog_market(row: dict) -> Market | None:
-    slug = str(row.get("market_slug") or "")
-    if not slug.startswith(BTC_FIVE_MINUTE_PREFIX):
-        return None
-    if row.get("closed") or row.get("archived"):
-        return None
-
-    condition_id = str(row.get("condition_id") or "")
-    try:
-        start_ts = int(slug.removeprefix(BTC_FIVE_MINUTE_PREFIX))
-        up_token_id, down_token_id = binary_token_ids(condition_id)
-        min_size = Decimal(str(row.get("minimum_order_size") or 5))
-        tick_size = Decimal(str(row.get("minimum_tick_size") or "0.01"))
-    except (InvalidOperation, TypeError, ValueError):
-        return None
-
-    return Market(
-        slug=slug,
-        condition_id=condition_id,
-        start_ts=start_ts,
-        end_ts=start_ts + MARKET_SECONDS,
-        up_token_id=up_token_id,
-        down_token_id=down_token_id,
-        min_size=min_size,
-        tick_size=tick_size,
-    )
+@dataclass(frozen=True)
+class _Candidate:
+    market: Market
+    market_announced_ts_ms: int | None
 
 
 def _bid_size_at(book: dict, price: Decimal) -> Decimal:
@@ -83,15 +55,23 @@ def _bid_size_at(book: dict, price: Decimal) -> Decimal:
 
 
 class MarketActivationWorker:
-    """Register future CLOB markets, then emit them when both books appear."""
+    """Discover future Gamma markets, then emit them when both books appear."""
 
-    def __init__(self, *, queue_price: Decimal, wake_event: Event | None = None):
+    def __init__(
+        self,
+        *,
+        queue_price: Decimal,
+        window_minutes: int,
+        farthest_first: bool,
+        wake_event: Event | None = None,
+    ):
         self.queue_price = queue_price
+        self.window_minutes = window_minutes
+        self.farthest_first = farthest_first
         self.wake_event = wake_event
-        self.catalog_session = requests.Session()
+        self.discovery = MarketDiscovery()
         self.books_session = requests.Session()
-        for session in (self.catalog_session, self.books_session):
-            session.headers["User-Agent"] = "polymarket-btc-bot/0.1"
+        self.books_session.headers["User-Agent"] = "polymarket-btc-bot/0.1"
 
         self._stop = Event()
         self._healthy = Event()
@@ -101,16 +81,13 @@ class MarketActivationWorker:
         self._health_lock = Lock()
         self._candidate_lock = Lock()
         self._component_health: dict[str, bool | None] = {
-            "catalog": None,
+            "market_stream": None,
             "books": None,
         }
         self._attempted = False
         self._threads: list[Thread] = []
-        self._candidates: dict[str, Market] = {}
+        self._candidates: dict[str, _Candidate] = {}
         self._handled_slugs: set[str] = set()
-        self._catalog_initialized = False
-        self._books_baselined = False
-        self._tail_offset: int | None = None
 
     @property
     def healthy(self) -> bool:
@@ -121,8 +98,8 @@ class MarketActivationWorker:
             raise RuntimeError("market activation worker already started")
         self._threads = [
             Thread(
-                target=self._run_catalog,
-                name="polymarket-market-catalog",
+                target=self._run_market_stream,
+                name="polymarket-market-metadata",
                 daemon=True,
             ),
             Thread(
@@ -138,7 +115,7 @@ class MarketActivationWorker:
         self._stop.set()
         for thread in self._threads:
             thread.join(timeout=5.0)
-        self.catalog_session.close()
+        self.discovery.close()
         self.books_session.close()
 
     def drain(self) -> list[MarketActivationUpdate | MarketActivationState]:
@@ -149,20 +126,78 @@ class MarketActivationWorker:
             except Empty:
                 return updates
 
-    def _run_catalog(self) -> None:
+    def _run_market_stream(self) -> None:
         while not self._stop.is_set():
             try:
-                rows = self._read_catalog_tail()
+                markets = self.discovery.discover(
+                    self.window_minutes,
+                    farthest_first=self.farthest_first,
+                    timeout=5,
+                )
+                if not markets:
+                    raise RuntimeError("Gamma returned no BTC five-minute market")
                 if self._stop.is_set():
                     return
-                self._register_candidates(rows)
+                self._register_candidates(markets)
+                self._listen_market_stream(
+                    min(markets, key=lambda market: market.start_ts).up_token_id
+                )
             except Exception as exc:
                 self._set_component_health(
-                    "catalog", False, f"{type(exc).__name__}: {exc}"
+                    "market_stream", False, f"{type(exc).__name__}: {exc}"
                 )
-            else:
-                self._set_component_health("catalog", True)
-            self._stop.wait(CATALOG_REFRESH_SECONDS)
+            if not self._stop.is_set():
+                self._stop.wait(MARKET_STREAM_RECONNECT_SECONDS)
+
+    def _listen_market_stream(self, token_id: str) -> None:
+        with connect(
+            MARKET_STREAM,
+            open_timeout=5,
+            close_timeout=2,
+            ping_interval=None,
+        ) as websocket:
+            websocket.send(
+                json.dumps(
+                    {
+                        "assets_ids": [token_id],
+                        "type": "market",
+                        "custom_feature_enabled": True,
+                    }
+                )
+            )
+            self._set_component_health("market_stream", True)
+            next_ping = time.monotonic() + MARKET_STREAM_PING_SECONDS
+            while not self._stop.is_set():
+                timeout = max(0.1, min(0.5, next_ping - time.monotonic()))
+                try:
+                    raw = websocket.recv(timeout=timeout)
+                except TimeoutError:
+                    raw = None
+                if time.monotonic() >= next_ping:
+                    websocket.send("PING")
+                    next_ping = time.monotonic() + MARKET_STREAM_PING_SECONDS
+                if raw in (None, "PONG"):
+                    continue
+                messages = json.loads(raw)
+                if not isinstance(messages, list):
+                    messages = [messages]
+                for message in messages:
+                    if (
+                        not isinstance(message, dict)
+                        or message.get("event_type") != "new_market"
+                    ):
+                        continue
+                    market = MarketDiscovery.parse_stream_market(message)
+                    if market is None:
+                        continue
+                    try:
+                        announced_ts_ms = int(message["timestamp"])
+                    except (KeyError, TypeError, ValueError):
+                        announced_ts_ms = None
+                    self._register_candidates(
+                        [market],
+                        market_announced_ts_ms=announced_ts_ms,
+                    )
 
     def _run_books(self) -> None:
         while not self._stop.is_set():
@@ -179,121 +214,51 @@ class MarketActivationWorker:
             elapsed = time.monotonic() - started
             self._stop.wait(max(0.0, ACTIVATION_POLL_SECONDS - elapsed))
 
-    def _read_catalog_tail(self) -> list[dict]:
-        pages: list[dict] = []
-        if self._tail_offset is None:
-            located = self._locate_tail_page()
-            if located is None:
-                return []
-            self._tail_offset, tail_page = located
-            first_offset = max(
-                0,
-                self._tail_offset
-                - (CATALOG_LOOKBACK_PAGES - 1) * CATALOG_PAGE_SIZE,
-            )
-            for offset in range(
-                first_offset, self._tail_offset, CATALOG_PAGE_SIZE
-            ):
-                if self._stop.is_set():
-                    return []
-                pages.append(self._catalog_page(offset))
-            pages.append(tail_page)
-        else:
-            pages.append(self._catalog_page(self._tail_offset))
-
-        while (
-            not self._stop.is_set()
-            and len(pages[-1]["data"]) == CATALOG_PAGE_SIZE
-            and pages[-1].get("next_cursor") != END_CURSOR
-        ):
-            self._tail_offset += CATALOG_PAGE_SIZE
-            pages.append(self._catalog_page(self._tail_offset))
-
-        return [row for page in pages for row in page["data"]]
-
-    def _locate_tail_page(self) -> tuple[int, dict] | None:
-        pages: dict[int, dict] = {}
-
-        def fetch(offset: int) -> dict:
-            page = pages.get(offset)
-            if page is None:
-                page = self._catalog_page(offset)
-                pages[offset] = page
-            return page
-
-        low = 0
-        high = CATALOG_PAGE_SIZE
-        while not self._stop.is_set() and fetch(high)["data"]:
-            low = high
-            high *= 2
-        if self._stop.is_set():
-            return None
-
-        while high - low > CATALOG_PAGE_SIZE:
-            middle = ((low + high) // (2 * CATALOG_PAGE_SIZE)) * CATALOG_PAGE_SIZE
-            if fetch(middle)["data"]:
-                low = middle
-            else:
-                high = middle
-        return low, fetch(low)
-
-    def _catalog_page(self, offset: int) -> dict:
-        response = self.catalog_session.get(
-            CLOB_MARKETS,
-            params={"next_cursor": _catalog_cursor(offset)},
-            timeout=5,
-        )
-        response.raise_for_status()
-        page = response.json()
-        if not isinstance(page, dict) or not isinstance(page.get("data"), list):
-            raise RuntimeError("CLOB market catalog returned an invalid page")
-        return page
-
-    def _register_candidates(self, rows: list[dict]) -> None:
-        parsed = [
-            market
-            for row in rows
-            if (market := _catalog_market(row)) is not None
-        ]
-        if not parsed:
-            raise RuntimeError("CLOB catalog tail contains no BTC five-minute market")
+    def _register_candidates(
+        self,
+        markets: list[Market],
+        *,
+        market_announced_ts_ms: int | None = None,
+    ) -> None:
+        if not markets:
+            raise ValueError("at least one market is required")
 
         now_ts = int(time.time())
         with self._candidate_lock:
-            if not self._catalog_initialized:
-                self._catalog_initialized = True
-
-            for market in parsed:
+            for market in markets:
                 if market.slug in self._handled_slugs:
                     continue
                 if market.end_ts <= now_ts:
                     self._handled_slugs.add(market.slug)
                     self._candidates.pop(market.slug, None)
                     continue
-                self._candidates.setdefault(market.slug, market)
+                self._candidates.setdefault(
+                    market.slug,
+                    _Candidate(market, market_announced_ts_ms),
+                )
 
     def _poll_books(self) -> bool:
         with self._candidate_lock:
-            catalog_initialized = self._catalog_initialized
             now_ts = int(time.time())
             expired_slugs = [
                 slug
-                for slug, market in self._candidates.items()
-                if market.end_ts <= now_ts
+                for slug, candidate in self._candidates.items()
+                if candidate.market.end_ts <= now_ts
             ]
             for slug in expired_slugs:
                 self._candidates.pop(slug)
                 self._handled_slugs.add(slug)
             candidates = tuple(self._candidates.values())
         if not candidates:
-            if catalog_initialized:
-                self._books_baselined = True
             return False
 
         request = [
             {"token_id": token_id}
-            for market in candidates
-            for token_id in (market.up_token_id, market.down_token_id)
+            for candidate in candidates
+            for token_id in (
+                candidate.market.up_token_id,
+                candidate.market.down_token_id,
+            )
         ]
         response = self.books_session.post(CLOB_BOOKS, json=request, timeout=2)
         response.raise_for_status()
@@ -307,19 +272,8 @@ class MarketActivationWorker:
             if isinstance(book, dict)
         }
         books_detected_ts_ms = int(time.time() * 1000)
-        if not self._books_baselined:
-            with self._candidate_lock:
-                for market in candidates:
-                    if (
-                        market.up_token_id in books
-                        and market.down_token_id in books
-                    ):
-                        self._candidates.pop(market.slug, None)
-                        self._handled_slugs.add(market.slug)
-                self._books_baselined = True
-            return True
-
-        for market in candidates:
+        for candidate in candidates:
+            market = candidate.market
             up_book = books.get(market.up_token_id)
             down_book = books.get(market.down_token_id)
             if up_book is None or down_book is None:
@@ -331,6 +285,7 @@ class MarketActivationWorker:
             self._emit(
                 MarketActivationUpdate(
                     market=market,
+                    market_announced_ts_ms=candidate.market_announced_ts_ms,
                     books_detected_ts_ms=books_detected_ts_ms,
                     queue_ahead_up=_bid_size_at(up_book, self.queue_price),
                     queue_ahead_down=_bid_size_at(down_book, self.queue_price),

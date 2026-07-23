@@ -107,6 +107,8 @@ class BotService:
         self.market_activation_worker = (
             MarketActivationWorker(
                 queue_price=plan.buy_price,
+                window_minutes=lookahead_minutes,
+                farthest_first=True,
                 wake_event=self.wake_event,
             )
             if live and placement_order == "farthest-first"
@@ -248,7 +250,7 @@ class BotService:
         )
         if healthy:
             self._place_activated_markets()
-        gamma_needed = self.market_activation_worker is None or self.last_discovery == 0.0
+        gamma_needed = self.market_activation_worker is None
         if (
             healthy
             and gamma_needed
@@ -293,7 +295,7 @@ class BotService:
             if not self._consider_market(
                 update.market,
                 now_ts=now_ts,
-                trigger="clob_activation",
+                trigger="market_stream_activation",
                 orderbook_ready=True,
                 trigger_details=self._market_activation_details(update),
             ):
@@ -301,6 +303,7 @@ class BotService:
 
     def _market_activation_details(self, update: MarketActivationUpdate) -> dict:
         return {
+            "market_announced_ts_ms": update.market_announced_ts_ms,
             "books_detected_ts_ms": update.books_detected_ts_ms,
             "queue_price": str(self.plan.buy_price),
             "queue_ahead_up": str(update.queue_ahead_up),

@@ -39,17 +39,14 @@ Authenticated CLOB traffic uses `py-clob-client-v2 -> httpx -> httpcore`.
 `35ddb373e13be5940e5137798d5a63d67e10f3e2` from
 `baizhufbb/httpcore`, which contains the proxy TLS zombie-connection fix.
 Public discovery continues to use `requests`. Gamma fills the existing window
-once at startup. In live farthest-first mode, the CLOB market catalog registers
-future BTC conditions before their books exist. The first catalog snapshot is
-followed by a real batch `/books` snapshot: markets whose Up and Down books
-already exist become the startup baseline, while every market without both
-books remains pending independently. The bot does not use the catalog's delayed
-`accepting_orders` field to define this boundary. A later slot becoming active
-never removes an earlier pending slot. The bot derives both CTF token IDs
-locally, then checks every pending pair in one batch `/books` request every 250
-milliseconds. The first later response containing both books wakes the main
-loop and immediately submits the post-only pair. Ongoing entries do not wait
-for Gamma or the public `new_market` WebSocket event.
+once. The public CLOB market WebSocket then supplies each new market's
+condition and token IDs in real time. The global
+CLOB market catalog is not used for first discovery because a market can accept
+orders several minutes before that catalog exposes it. Gamma supplies startup
+condition and token IDs; every newly seen market remains pending independently
+until one batch `/books` request contains both books. Pending books are checked
+every 250 milliseconds. The first response containing both books wakes the main
+loop and immediately submits the post-only pair.
 
 ## Runtime sequence and interfaces
 
@@ -61,8 +58,8 @@ so each condition is tracked independently.
 | --- | --- | --- |
 | Parse command and validate credentials | Local CLI and `.env.trading` | `polymarket_bot/cli.py`, `polymarket_bot/config.py` |
 | Open the run and local state | SQLite `data/bot.sqlite` | `polymarket_bot/database.py` |
-| Fill the configured startup window | `GET https://gamma-api.polymarket.com/events` | `polymarket_bot/discovery.py` |
-| Register future metadata | `GET https://clob.polymarket.com/markets` | `polymarket_bot/market_activation.py` |
+| Discover startup metadata | `GET https://gamma-api.polymarket.com/events` | `polymarket_bot/discovery.py` |
+| Discover every new market | `wss://ws-subscriptions-clob.polymarket.com/ws/market` `new_market` events | `polymarket_bot/discovery.py`, `polymarket_bot/market_activation.py` |
 | Detect each book activation | `POST https://clob.polymarket.com/books` every 250 ms | `polymarket_bot/market_activation.py` |
 | Submit both entry orders | Authenticated CLOB batch `post_orders`, post-only GTC | `polymarket_bot/exchange.py` |
 | Receive fills and cancellations | Authenticated CLOB user WebSocket | `polymarket_bot/user_stream.py` |
@@ -72,22 +69,19 @@ so each condition is tracked independently.
 
 The live farthest-first path runs in this order:
 
-1. Gamma processes the configured existing startup window once.
-2. One initial batch `/books` snapshot baselines every market whose two books
-   already exist. Markets without both books remain pending; the unreliable
-   catalog `accepting_orders` field is not used for this decision.
-3. Later catalog refreshes add previously unseen markets, including a market
-   already active by the time the refresh sees it.
-4. One batch `/books` request checks every pending Up/Down token pair every
+1. Gamma fills the configured far-edge window once. The public market WebSocket
+   then registers each new BTC five-minute market with its real Up/Down token
+   IDs as soon as CLOB announces it.
+2. One batch `/books` request checks every pending Up/Down token pair every
    250 milliseconds.
-5. When both books exist, only that market leaves the pending set. The service
+3. When both books exist, only that market leaves the pending set. The service
    validates eligibility, database uniqueness, tick size, minimum size, and
    optional limits.
-6. The exchange signs Up and Down locally and submits both in one authenticated
+4. The exchange signs Up and Down locally and submits both in one authenticated
    post-only batch. If exactly one side is accepted, it is canceled.
-7. Accepted market and order IDs are committed to SQLite. The user WebSocket
+5. Accepted market and order IDs are committed to SQLite. The user WebSocket
    and REST reconciliation then maintain fills and terminal states.
-8. In buy-only mode, matched shares are held through resolution. With
+6. In buy-only mode, matched shares are held through resolution. With
    `--take-profit`, settled matched inventory is offered at the configured
    exit rungs. Resolved winners are redeemed by the periodic redemption worker.
 
