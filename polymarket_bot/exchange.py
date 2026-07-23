@@ -121,7 +121,10 @@ class Exchange:
         price: Decimal,
         size: Decimal,
     ) -> PlacementResult:
-        options = PartialCreateOrderOptions(tick_size=str(market.tick_size))
+        options = PartialCreateOrderOptions(
+            tick_size=str(market.tick_size),
+            neg_risk=False,
+        )
         specifications = (
             ("up", market.up_token_id),
             ("down", market.down_token_id),
@@ -252,7 +255,10 @@ class Exchange:
                 size=float(size),
                 side=Side.SELL,
             ),
-            PartialCreateOrderOptions(tick_size=str(market.tick_size)),
+            PartialCreateOrderOptions(
+                tick_size=str(market.tick_size),
+                neg_risk=False,
+            ),
         )
         response = self.client.post_order(signed, OrderType.GTC, post_only=False)
         if not _accepted(response):

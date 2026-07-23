@@ -25,11 +25,13 @@ class FakeClient:
         self.responses = responses
         self.canceled = []
         self.created_order_args = []
+        self.created_order_options = []
         self.posted_order_types = []
         self.posted_batch_types = []
 
     def create_order(self, order_args, options):
         self.created_order_args.append(order_args)
+        self.created_order_options.append(options)
         return {
             "token_id": order_args.token_id,
             "side": order_args.side,
@@ -79,6 +81,10 @@ def test_entries_are_post_only_gtc_without_expiration() -> None:
 
     assert result.complete
     assert [args.expiration for args in exchange.client.created_order_args] == [0, 0]
+    assert [options.neg_risk for options in exchange.client.created_order_options] == [
+        False,
+        False,
+    ]
     assert exchange.client.posted_batch_types == ["GTC", "GTC"]
 
 

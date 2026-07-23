@@ -1,5 +1,6 @@
 import logging
 from decimal import Decimal
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -147,6 +148,7 @@ def _service_for_run(database, tick, *, hours=None):
     service.heartbeat_seconds = None
     service.live = True
     service.logger = logging.getLogger("test")
+    service.wake_event = Event()
     service.run_id = 0
     service.heartbeat_worker = None
     service.geoblock_worker = None
@@ -164,9 +166,7 @@ def test_clob_activation_is_the_primary_placement_trigger() -> None:
     service.activation_market_updates = [
         MarketActivationUpdate(
             market=MARKET,
-            accepting_ts_ms=1_999_999_000_000,
-            detected_ts_ms=1_999_999_000_125,
-            ready_ts_ms=1_999_999_000_300,
+            books_detected_ts_ms=1_999_999_000_125,
             queue_ahead_up=Decimal("12.5"),
             queue_ahead_down=Decimal("8.25"),
         )
@@ -185,11 +185,7 @@ def test_clob_activation_is_the_primary_placement_trigger() -> None:
     assert calls[0][1]["trigger"] == "clob_activation"
     assert calls[0][1]["orderbook_ready"] is True
     assert calls[0][1]["trigger_details"] == {
-        "accepting_ts_ms": 1_999_999_000_000,
-        "detected_ts_ms": 1_999_999_000_125,
-        "ready_ts_ms": 1_999_999_000_300,
-        "accepting_to_detect_ms": 125,
-        "detect_to_ready_ms": 175,
+        "books_detected_ts_ms": 1_999_999_000_125,
         "queue_price": "0.01",
         "queue_ahead_up": "12.5",
         "queue_ahead_down": "8.25",

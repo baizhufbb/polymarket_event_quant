@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from decimal import Decimal
+from threading import Event
 
 from .config import BotConfig
 from .database import BotDatabase
@@ -80,6 +81,7 @@ class BotService:
         self.heartbeat_seconds = heartbeat_seconds
         self.live = live
         self.logger = logger
+        self.wake_event = Event()
         self.discovery = MarketDiscovery()
         self.exchange = Exchange(config) if live else None
         self.heartbeat_worker = (
@@ -103,7 +105,10 @@ class BotService:
             UserStreamWorker(config, logger=logger) if live else None
         )
         self.market_activation_worker = (
-            MarketActivationWorker(queue_price=plan.buy_price)
+            MarketActivationWorker(
+                queue_price=plan.buy_price,
+                wake_event=self.wake_event,
+            )
             if live and placement_order == "farthest-first"
             else None
         )
@@ -163,8 +168,9 @@ class BotService:
         cancel_on_shutdown = False
         try:
             while deadline is None or time.monotonic() < deadline:
+                self.wake_event.clear()
                 self._tick()
-                time.sleep(0.2)
+                self.wake_event.wait(0.2)
         except KeyboardInterrupt:
             cancel_on_shutdown = True
             self.logger.info("Ctrl+C received; stopping")
@@ -276,13 +282,6 @@ class BotService:
                     )
                 continue
             self.activation_market_updates.append(update)
-            self.database.event(
-                self.run_id,
-                "INFO",
-                "market_activation_ready",
-                slug=update.market.slug,
-                details=self._market_activation_details(update),
-            )
 
     def _place_activated_markets(self) -> None:
         updates, self.activation_market_updates = (
@@ -301,17 +300,8 @@ class BotService:
                 return
 
     def _market_activation_details(self, update: MarketActivationUpdate) -> dict:
-        accepting_to_detect_ms = (
-            update.detected_ts_ms - update.accepting_ts_ms
-            if update.accepting_ts_ms is not None
-            else None
-        )
         return {
-            "accepting_ts_ms": update.accepting_ts_ms,
-            "detected_ts_ms": update.detected_ts_ms,
-            "ready_ts_ms": update.ready_ts_ms,
-            "accepting_to_detect_ms": accepting_to_detect_ms,
-            "detect_to_ready_ms": update.ready_ts_ms - update.detected_ts_ms,
+            "books_detected_ts_ms": update.books_detected_ts_ms,
             "queue_price": str(self.plan.buy_price),
             "queue_ahead_up": str(update.queue_ahead_up),
             "queue_ahead_down": str(update.queue_ahead_down),

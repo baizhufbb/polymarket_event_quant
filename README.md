@@ -38,12 +38,13 @@ Authenticated CLOB traffic uses `py-clob-client-v2 -> httpx -> httpcore`.
 `httpcore` is pinned to commit
 `35ddb373e13be5940e5137798d5a63d67e10f3e2` from
 `baizhufbb/httpcore`, which contains the proxy TLS zombie-connection fix.
-Public Gamma discovery continues to use `requests`. In live farthest-first mode,
-Gamma exposes the next deterministic market slug and token IDs before trading
-opens. A background probe watches that exact CLOB market every 250 milliseconds
-and submits as soon as it accepts orders and both books exist. Gamma fills the
-existing window once at startup; ongoing new entries use only the CLOB activation
-probe.
+Public discovery continues to use `requests`. Gamma fills the existing window
+once at startup. In live farthest-first mode, the CLOB market catalog registers
+future BTC conditions before they accept orders. The bot derives both CTF token
+IDs locally, then checks every pending pair in one batch `/books` request every
+250 milliseconds. The first response containing both books wakes the main loop
+and immediately submits the post-only pair. Ongoing entries do not wait for
+Gamma or the public `new_market` WebSocket event.
 
 ## Configuration
 
@@ -94,9 +95,8 @@ heartbeat. It does not change Polymarket's server-side cancellation deadline.
 - When `--heartbeat-seconds` is enabled, a dedicated thread sends independently
   of discovery and reconciliation. A failed heartbeat pauses new orders and
   Polymarket may cancel every open order for the account.
-- Farthest-first live runs record CLOB acceptance detection, both-book readiness,
-  order-submission duration, and the aggregate queue already resting at the
-  configured entry price.
+- Farthest-first live runs record batch-book detection, order-submission duration,
+  and the aggregate queue already resting at the configured entry price.
 - A separate redemption thread scans every 30 minutes. It redeems only resolved
   positions with positive current value, waits for relayer confirmation, and
   never blindly retries an ambiguous or failed redemption in the same process.

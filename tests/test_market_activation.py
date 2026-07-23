@@ -1,116 +1,170 @@
 from decimal import Decimal
-from threading import Event
 
-from polymarket_bot.market_activation import MarketActivationWorker
-from polymarket_bot.models import Market
-
-
-MARKET = Market(
-    slug="btc-updown-5m-2000000300",
-    condition_id="0xcondition",
-    start_ts=2_000_000_300,
-    end_ts=2_000_000_600,
-    up_token_id="up-token",
-    down_token_id="down-token",
-    min_size=Decimal("5"),
-    tick_size=Decimal("0.01"),
+from polymarket_bot.market_activation import (
+    MarketActivationWorker,
+    _catalog_market,
 )
 
 
+ACTIVE_CONDITION = (
+    "0xbc2143c70ad2af9481e8dd46eb538f267d7c23ad781ddf5380e9a00d46e9e9cd"
+)
+FUTURE_CONDITION = (
+    "0xc46ba93f4d9553e8b4c4c1c9d6cbde68426896a40713f98605c753316e66a706"
+)
+FUTURE_UP = (
+    "40734400368422567759951081235288351135874433660498746514087358797347039269519"
+)
+FUTURE_DOWN = (
+    "12816584899393367254956664538948649976215330480366631889555978899000587885894"
+)
+ACTIVE_UP = (
+    "79690064268849976430077014249758289461450439393597627695915949752735045024504"
+)
+ACTIVE_DOWN = (
+    "62179804371407207770226633627836131020602362404226320415203031505393883439742"
+)
+
+
+def catalog_row(start_ts: int, condition_id: str, *, accepting: bool) -> dict:
+    return {
+        "market_slug": f"btc-updown-5m-{start_ts}",
+        "condition_id": condition_id,
+        "minimum_order_size": 5,
+        "minimum_tick_size": 0.01,
+        "accepting_orders": accepting,
+        "closed": False,
+        "archived": False,
+    }
+
+
 class Response:
-    def __init__(self, payload, status_code=200):
+    def __init__(self, payload):
         self.payload = payload
-        self.status_code = status_code
 
     def raise_for_status(self) -> None:
-        if self.status_code >= 400:
-            raise RuntimeError(f"HTTP {self.status_code}")
+        return None
 
     def json(self):
         return self.payload
 
 
-class Session:
+class BooksSession:
     def __init__(self, responses):
         self.responses = list(responses)
-        self.calls = []
+        self.requests = []
 
-    def get(self, url, **kwargs):
-        self.calls.append((url, kwargs))
-        return self.responses.pop(0)
-
-
-def worker_with(responses) -> MarketActivationWorker:
-    worker = MarketActivationWorker.__new__(MarketActivationWorker)
-    worker.queue_price = Decimal("0.01")
-    worker.session = Session(responses)
-    return worker
+    def post(self, url, *, json, timeout):
+        self.requests.append((url, json, timeout))
+        return Response(self.responses.pop(0))
 
 
-def test_candidate_waits_until_clob_accepts_orders() -> None:
-    worker = worker_with([Response({"accepting_orders": False})])
+def test_catalog_market_derives_tokens_before_activation() -> None:
+    market = _catalog_market(
+        catalog_row(1_784_857_200, FUTURE_CONDITION, accepting=False)
+    )
 
-    assert worker._poll_candidate(MARKET) is None
-    assert len(worker.session.calls) == 1
+    assert market is not None
+    assert market.up_token_id == FUTURE_UP
+    assert market.down_token_id == FUTURE_DOWN
+    assert market.tick_size == Decimal("0.01")
 
 
-def test_candidate_emits_after_both_books_exist() -> None:
-    worker = worker_with(
+def test_catalog_registers_only_markets_beyond_active_frontier() -> None:
+    worker = MarketActivationWorker(queue_price=Decimal("0.01"))
+    worker._register_candidates(
         [
-            Response(
-                {
-                    "accepting_orders": True,
-                    "accepting_order_timestamp": "2033-05-18T03:31:40Z",
-                }
-            ),
-            Response({"bids": [{"price": "0.01", "size": "12.5"}]}),
-            Response({"bids": [{"price": "0.01", "size": "8.25"}]}),
+            catalog_row(1_784_856_600, ACTIVE_CONDITION, accepting=False),
+            catalog_row(1_784_856_900, ACTIVE_CONDITION, accepting=True),
+            catalog_row(1_784_857_200, FUTURE_CONDITION, accepting=False),
         ]
     )
 
-    update = worker._poll_candidate(MARKET)
-
-    assert update is not None
-    assert update.market == MARKET
-    assert update.queue_ahead_up == Decimal("12.5")
-    assert update.queue_ahead_down == Decimal("8.25")
-    assert update.accepting_ts_ms == 1_999_999_900_000
-    assert len(worker.session.calls) == 3
+    assert worker._frontier_start_ts == 1_784_856_900
+    assert tuple(worker._candidates) == ("btc-updown-5m-1784857200",)
 
 
-def test_candidate_discovery_starts_after_farthest_active_market() -> None:
-    farthest = Market(
-        slug="btc-updown-5m-2000000000",
-        condition_id="farthest-condition",
-        start_ts=2_000_000_000,
-        end_ts=2_000_000_300,
-        up_token_id="farthest-up",
-        down_token_id="farthest-down",
-        min_size=Decimal("5"),
-        tick_size=Decimal("0.01"),
+def test_batch_books_emits_only_after_both_books_exist() -> None:
+    worker = MarketActivationWorker(queue_price=Decimal("0.01"))
+    worker._register_candidates(
+        [
+            catalog_row(1_784_856_900, ACTIVE_CONDITION, accepting=True),
+            catalog_row(1_784_857_200, FUTURE_CONDITION, accepting=False),
+        ]
+    )
+    worker.books_session.close()
+    worker.books_session = BooksSession(
+        [
+            [{"asset_id": FUTURE_UP, "bids": []}],
+            [
+                {
+                    "asset_id": FUTURE_UP,
+                    "bids": [{"price": "0.01", "size": "12.5"}],
+                },
+                {
+                    "asset_id": FUTURE_DOWN,
+                    "bids": [{"price": "0.01", "size": "8.25"}],
+                },
+            ],
+        ]
     )
 
-    class Discovery:
-        def __init__(self):
-            self.slugs = []
+    assert worker._poll_books() is True
+    assert worker.drain() == []
 
-        def discover(self, window_minutes, *, farthest_first, timeout):
-            assert window_minutes == 5
-            assert farthest_first is True
-            assert timeout == 2
-            return [farthest]
+    assert worker._poll_books() is True
+    update = worker.drain()[0]
+    assert update.market.slug == "btc-updown-5m-1784857200"
+    assert update.queue_ahead_up == Decimal("12.5")
+    assert update.queue_ahead_down == Decimal("8.25")
+    assert worker._candidates == {}
 
-        def candidate(self, slug):
-            self.slugs.append(slug)
-            return MARKET if slug == MARKET.slug else None
+    request_tokens = {
+        item["token_id"] for item in worker.books_session.requests[0][1]
+    }
+    assert request_tokens == {FUTURE_UP, FUTURE_DOWN}
 
-    worker = MarketActivationWorker.__new__(MarketActivationWorker)
-    worker.discovery = Discovery()
-    worker._stop = Event()
-    worker._next_start_ts = None
-    worker._candidates = {}
 
-    worker._discover_candidates()
+def test_newer_activation_discards_an_unavailable_older_candidate() -> None:
+    worker = MarketActivationWorker(queue_price=Decimal("0.01"))
+    worker._register_candidates(
+        [
+            catalog_row(1_784_856_900, ACTIVE_CONDITION, accepting=True),
+            catalog_row(1_784_857_200, FUTURE_CONDITION, accepting=False),
+            catalog_row(1_784_857_500, ACTIVE_CONDITION, accepting=False),
+        ]
+    )
+    worker.books_session.close()
+    worker.books_session = BooksSession(
+        [
+            [
+                {"asset_id": ACTIVE_UP, "bids": []},
+                {"asset_id": ACTIVE_DOWN, "bids": []},
+            ]
+        ]
+    )
 
-    assert worker.discovery.slugs == [MARKET.slug, "btc-updown-5m-2000000600"]
-    assert worker._candidates == {MARKET.slug: MARKET}
+    worker._poll_books()
+
+    update = worker.drain()[0]
+    assert update.market.slug == "btc-updown-5m-1784857500"
+    assert worker._candidates == {}
+    assert worker._handled_slugs == {
+        "btc-updown-5m-1784857200",
+        "btc-updown-5m-1784857500",
+    }
+
+
+def test_tail_locator_finds_last_nonempty_page() -> None:
+    worker = MarketActivationWorker(queue_price=Decimal("0.01"))
+
+    def page(offset: int) -> dict:
+        data = [{}] * 1000 if offset <= 3000 else []
+        return {"data": data, "next_cursor": "next" if data else "LTE="}
+
+    worker._catalog_page = page
+
+    located = worker._locate_tail_page()
+
+    assert located is not None
+    assert located[0] == 3000

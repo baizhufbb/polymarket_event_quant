@@ -131,28 +131,6 @@ def test_parse_market() -> None:
     assert market.end_ts == 2_000_000_300
 
 
-def test_parse_inactive_market_candidate() -> None:
-    event = {
-        "slug": "btc-updown-5m-2000000000",
-        "markets": [
-            {
-                "acceptingOrders": False,
-                "enableOrderBook": True,
-                "conditionId": "0xcondition",
-                "clobTokenIds": '["up-token", "down-token"]',
-                "outcomes": '["Up", "Down"]',
-                "orderMinSize": 5,
-                "orderPriceMinTickSize": 0.01,
-            }
-        ],
-    }
-
-    assert MarketDiscovery._parse(event) is None
-    market = MarketDiscovery._parse(event, accepting_only=False)
-    assert market is not None
-    assert market.condition_id == "0xcondition"
-
-
 def test_farthest_discovery_requests_only_the_far_edge_window() -> None:
     class Response:
         @staticmethod
