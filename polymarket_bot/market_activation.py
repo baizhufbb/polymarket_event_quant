@@ -108,7 +108,8 @@ class MarketActivationWorker:
         self._threads: list[Thread] = []
         self._candidates: dict[str, Market] = {}
         self._handled_slugs: set[str] = set()
-        self._frontier_start_ts: int | None = None
+        self._catalog_initialized = False
+        self._books_baselined = False
         self._tail_offset: int | None = None
 
     @property
@@ -250,34 +251,43 @@ class MarketActivationWorker:
 
     def _register_candidates(self, rows: list[dict]) -> None:
         parsed = [
-            (row, market)
+            market
             for row in rows
             if (market := _catalog_market(row)) is not None
         ]
-        with self._candidate_lock:
-            if self._frontier_start_ts is None:
-                active_starts = [
-                    market.start_ts
-                    for row, market in parsed
-                    if row.get("accepting_orders")
-                ]
-                if not active_starts:
-                    raise RuntimeError(
-                        "CLOB catalog tail contains no active BTC five-minute market"
-                    )
-                self._frontier_start_ts = max(active_starts)
+        if not parsed:
+            raise RuntimeError("CLOB catalog tail contains no BTC five-minute market")
 
-            for _, market in parsed:
-                if market.start_ts <= self._frontier_start_ts:
-                    continue
+        now_ts = int(time.time())
+        with self._candidate_lock:
+            if not self._catalog_initialized:
+                self._catalog_initialized = True
+
+            for market in parsed:
                 if market.slug in self._handled_slugs:
+                    continue
+                if market.end_ts <= now_ts:
+                    self._handled_slugs.add(market.slug)
+                    self._candidates.pop(market.slug, None)
                     continue
                 self._candidates.setdefault(market.slug, market)
 
     def _poll_books(self) -> bool:
         with self._candidate_lock:
+            catalog_initialized = self._catalog_initialized
+            now_ts = int(time.time())
+            expired_slugs = [
+                slug
+                for slug, market in self._candidates.items()
+                if market.end_ts <= now_ts
+            ]
+            for slug in expired_slugs:
+                self._candidates.pop(slug)
+                self._handled_slugs.add(slug)
             candidates = tuple(self._candidates.values())
         if not candidates:
+            if catalog_initialized:
+                self._books_baselined = True
             return False
 
         request = [
@@ -297,6 +307,18 @@ class MarketActivationWorker:
             if isinstance(book, dict)
         }
         books_detected_ts_ms = int(time.time() * 1000)
+        if not self._books_baselined:
+            with self._candidate_lock:
+                for market in candidates:
+                    if (
+                        market.up_token_id in books
+                        and market.down_token_id in books
+                    ):
+                        self._candidates.pop(market.slug, None)
+                        self._handled_slugs.add(market.slug)
+                self._books_baselined = True
+            return True
+
         for market in candidates:
             up_book = books.get(market.up_token_id)
             down_book = books.get(market.down_token_id)
@@ -305,14 +327,6 @@ class MarketActivationWorker:
             with self._candidate_lock:
                 if self._candidates.pop(market.slug, None) is None:
                     continue
-                stale_slugs = [
-                    slug
-                    for slug, candidate in self._candidates.items()
-                    if candidate.start_ts < market.start_ts
-                ]
-                for slug in stale_slugs:
-                    self._candidates.pop(slug)
-                    self._handled_slugs.add(slug)
                 self._handled_slugs.add(market.slug)
             self._emit(
                 MarketActivationUpdate(
