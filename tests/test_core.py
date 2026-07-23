@@ -97,12 +97,15 @@ def test_run_limits_are_optional_cli_parameters() -> None:
             "120",
             "--placement-order",
             "farthest-first",
+            "--cancel-before-end-seconds",
+            "0",
             "--heartbeat-seconds",
             "5",
         ]
     )
     assert reverse.lookahead_minutes == 120
     assert reverse.placement_order == "farthest-first"
+    assert reverse.cancel_before_end_seconds == 0
     assert reverse.heartbeat_seconds == Decimal("5")
 
 
@@ -126,6 +129,28 @@ def test_parse_market() -> None:
     assert market.up_token_id == "up-token"
     assert market.down_token_id == "down-token"
     assert market.end_ts == 2_000_000_300
+
+
+def test_parse_inactive_market_candidate() -> None:
+    event = {
+        "slug": "btc-updown-5m-2000000000",
+        "markets": [
+            {
+                "acceptingOrders": False,
+                "enableOrderBook": True,
+                "conditionId": "0xcondition",
+                "clobTokenIds": '["up-token", "down-token"]',
+                "outcomes": '["Up", "Down"]',
+                "orderMinSize": 5,
+                "orderPriceMinTickSize": 0.01,
+            }
+        ],
+    }
+
+    assert MarketDiscovery._parse(event) is None
+    market = MarketDiscovery._parse(event, accepting_only=False)
+    assert market is not None
+    assert market.condition_id == "0xcondition"
 
 
 def test_farthest_discovery_requests_only_the_far_edge_window() -> None:
@@ -369,3 +394,61 @@ def test_existing_market_is_never_rearmed(tmp_path) -> None:
         assert market_row["run_id"] == second_run
         assert market_row["state"] == "placing"
         assert not database.can_start_entry_plan(market.slug)
+
+
+def test_due_open_orders_filters_by_market_deadline(tmp_path) -> None:
+    early = Market(
+        slug="btc-updown-5m-2000000000",
+        condition_id="early-condition",
+        start_ts=2_000_000_000,
+        end_ts=2_000_000_300,
+        up_token_id="early-up",
+        down_token_id="early-down",
+        min_size=Decimal("5"),
+        tick_size=Decimal("0.01"),
+    )
+    later = Market(
+        slug="btc-updown-5m-2000000300",
+        condition_id="later-condition",
+        start_ts=2_000_000_300,
+        end_ts=2_000_000_600,
+        up_token_id="later-up",
+        down_token_id="later-down",
+        min_size=Decimal("5"),
+        tick_size=Decimal("0.01"),
+    )
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        run_id = database.start_run("live")
+        for market in (early, later):
+            database.add_market(run_id, market)
+            database.add_order(
+                run_id,
+                market.slug,
+                PlacedOrder(
+                    order_id=f"{market.slug}-live",
+                    outcome="up",
+                    token_id=market.up_token_id,
+                    price=Decimal("0.01"),
+                    size=Decimal("100"),
+                    status="live",
+                    raw={},
+                ),
+            )
+        database.add_order(
+            run_id,
+            early.slug,
+            PlacedOrder(
+                order_id="early-filled",
+                outcome="down",
+                token_id=early.down_token_id,
+                price=Decimal("0.01"),
+                size=Decimal("100"),
+                status="filled",
+                raw={},
+            ),
+        )
+
+        assert database.due_open_orders(early.end_ts - 1) == []
+        assert [row["order_id"] for row in database.due_open_orders(early.end_ts)] == [
+            f"{early.slug}-live"
+        ]

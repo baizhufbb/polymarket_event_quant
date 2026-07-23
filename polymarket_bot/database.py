@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS orders (
 
 CREATE INDEX IF NOT EXISTS idx_orders_slug ON orders(slug);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+CREATE INDEX IF NOT EXISTS idx_markets_end_ts ON markets(end_ts);
 
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -287,6 +288,23 @@ class BotDatabase:
                 )
                 ORDER BY o.created_ts
                 """
+            )
+        )
+
+    def due_open_orders(self, cutoff_ts: float) -> list[sqlite3.Row]:
+        return list(
+            self.connection.execute(
+                """
+                SELECT o.*, m.condition_id, m.end_ts, m.min_size, m.tick_size
+                FROM markets AS m INDEXED BY idx_markets_end_ts
+                CROSS JOIN orders AS o
+                WHERE m.end_ts <= ? AND o.slug=m.slug AND o.status IN (
+                    'open', 'live', 'delayed', 'unmatched', 'simulated',
+                    'cancel_requested'
+                )
+                ORDER BY m.end_ts, o.created_ts
+                """,
+                (cutoff_ts,),
             )
         )
 

@@ -8,11 +8,12 @@ from .config import BotConfig
 from .database import BotDatabase
 from .discovery import MarketDiscovery, is_eligible
 from .exchange import Exchange, normalize_order
+from .geoblock import GeoblockWorker
 from .heartbeat import HeartbeatWorker
-from .market_stream import (
-    MarketReadyUpdate,
-    MarketStreamState,
-    MarketStreamWorker,
+from .market_activation import (
+    MarketActivationState,
+    MarketActivationUpdate,
+    MarketActivationWorker,
 )
 from .models import Market, PlacedOrder, TradePlan
 from .reconciliation import ReconciliationWorker
@@ -86,26 +87,34 @@ class BotService:
             if self.exchange and heartbeat_seconds is not None
             else None
         )
+        self.geoblock_worker = (
+            GeoblockWorker(
+                self.exchange,
+                interval_seconds=config.geoblock_seconds,
+                retry_seconds=config.geoblock_retry_seconds,
+            )
+            if self.exchange
+            else None
+        )
         self.redemption_worker = (
             RedemptionWorker(config, config.redemption_seconds) if live else None
         )
         self.user_stream_worker = (
             UserStreamWorker(config, logger=logger) if live else None
         )
-        self.market_stream_worker = (
-            MarketStreamWorker(queue_price=plan.buy_price, logger=logger)
+        self.market_activation_worker = (
+            MarketActivationWorker(queue_price=plan.buy_price)
             if live and placement_order == "farthest-first"
             else None
         )
         self.reconciliation_worker = (
             ReconciliationWorker(self.exchange) if self.exchange else None
         )
-        self.ready_market_updates: list[MarketReadyUpdate] = []
+        self.activation_market_updates: list[MarketActivationUpdate] = []
         self.run_id = 0
         self.run_started_ts = int(time.time())
         self.last_discovery = 0.0
         self.last_reconcile = 0.0
-        self.last_geoblock = 0.0
 
     def run(self) -> None:
         mode = "live" if self.live else "dry-run"
@@ -130,7 +139,7 @@ class BotService:
                 else None
             ),
             "redemption_seconds": self.config.redemption_seconds,
-            "fast_market_stream": self.market_stream_worker is not None,
+            "early_activation_probe": self.market_activation_worker is not None,
         }
         self.run_id = self.database.start_run(mode, run_config)
         deadline = (
@@ -141,10 +150,12 @@ class BotService:
         self.database.event(self.run_id, "INFO", "run_started", details={"mode": mode})
         if self.heartbeat_worker:
             self.heartbeat_worker.start()
+        if self.geoblock_worker:
+            self.geoblock_worker.start()
         if self.user_stream_worker:
             self.user_stream_worker.start()
-        if self.market_stream_worker:
-            self.market_stream_worker.start()
+        if self.market_activation_worker:
+            self.market_activation_worker.start()
         if self.reconciliation_worker:
             self.reconciliation_worker.start()
         if self.redemption_worker:
@@ -174,9 +185,9 @@ class BotService:
             if self.redemption_worker:
                 self.redemption_worker.stop()
                 self._drain_redemption_updates()
-            if self.market_stream_worker:
-                self.market_stream_worker.stop()
-                self._drain_market_stream_updates()
+            if self.market_activation_worker:
+                self.market_activation_worker.stop()
+                self._drain_market_activation_updates()
             if self.reconciliation_worker:
                 self.reconciliation_worker.stop()
                 self._drain_reconciliation_updates()
@@ -185,6 +196,8 @@ class BotService:
                 self._drain_user_stream_updates()
             if self.heartbeat_worker:
                 self.heartbeat_worker.stop()
+            if self.geoblock_worker:
+                self.geoblock_worker.stop()
             if cancel_on_shutdown:
                 self._cancel_tracked_orders()
             row = self.database.connection.execute(
@@ -196,14 +209,12 @@ class BotService:
     def _tick(self) -> None:
         now = time.monotonic()
         self._drain_redemption_updates()
-        self._drain_market_stream_updates()
+        self._drain_market_activation_updates()
         self._drain_reconciliation_updates()
         stream_recovered = self._drain_user_stream_updates()
         recovered = self._drain_heartbeat_updates()
+        self._drain_geoblock_updates()
         self._cancel_due_orders(time.time())
-        if self.live and now - self.last_geoblock >= self.config.geoblock_seconds:
-            self._check_geoblock()
-            self.last_geoblock = now
         if (
             recovered
             or stream_recovered
@@ -220,18 +231,18 @@ class BotService:
         heartbeat_healthy = (
             self.heartbeat_worker is None or self.heartbeat_worker.healthy
         )
+        geoblock_healthy = (
+            self.geoblock_worker is None or self.geoblock_worker.healthy
+        )
         healthy = not self.live or bool(
-            heartbeat_healthy
+            geoblock_healthy
+            and heartbeat_healthy
             and self.user_stream_worker
             and self.user_stream_worker.healthy
         )
         if healthy:
-            self._place_ready_markets()
-        gamma_needed = (
-            self.market_stream_worker is None
-            or not self.market_stream_worker.healthy
-            or self.last_discovery == 0.0
-        )
+            self._place_activated_markets()
+        gamma_needed = self.market_activation_worker is None or self.last_discovery == 0.0
         if (
             healthy
             and gamma_needed
@@ -240,37 +251,71 @@ class BotService:
             self._discover_and_place()
             self.last_discovery = now
 
-    def _drain_market_stream_updates(self) -> None:
-        if not self.market_stream_worker:
+    def _drain_market_activation_updates(self) -> None:
+        if not self.market_activation_worker:
             return
-        for update in self.market_stream_worker.drain():
-            if isinstance(update, MarketStreamState):
+        for update in self.market_activation_worker.drain():
+            if isinstance(update, MarketActivationState):
                 if update.healthy:
                     self.database.event(
                         self.run_id,
                         "INFO",
-                        "market_stream_connected",
+                        "market_activation_connected",
                         details={"recovered": update.recovered},
                     )
-                    self.logger.info("market WebSocket connected")
+                    self.logger.info("market activation probe connected")
                 else:
                     self.database.event(
                         self.run_id,
                         "ERROR",
-                        "market_stream_disconnected",
+                        "market_activation_disconnected",
                         details={"error": update.error},
                     )
-                    self.logger.error("market WebSocket unavailable: %s", update.error)
+                    self.logger.error(
+                        "market activation probe unavailable: %s", update.error
+                    )
                 continue
-
-            self.ready_market_updates.append(update)
+            self.activation_market_updates.append(update)
             self.database.event(
                 self.run_id,
                 "INFO",
-                "market_books_ready",
+                "market_activation_ready",
                 slug=update.market.slug,
-                details=self._market_stream_details(update),
+                details=self._market_activation_details(update),
             )
+
+    def _place_activated_markets(self) -> None:
+        updates, self.activation_market_updates = (
+            self.activation_market_updates,
+            [],
+        )
+        now_ts = int(time.time())
+        for update in updates:
+            if not self._consider_market(
+                update.market,
+                now_ts=now_ts,
+                trigger="clob_activation",
+                orderbook_ready=True,
+                trigger_details=self._market_activation_details(update),
+            ):
+                return
+
+    def _market_activation_details(self, update: MarketActivationUpdate) -> dict:
+        accepting_to_detect_ms = (
+            update.detected_ts_ms - update.accepting_ts_ms
+            if update.accepting_ts_ms is not None
+            else None
+        )
+        return {
+            "accepting_ts_ms": update.accepting_ts_ms,
+            "detected_ts_ms": update.detected_ts_ms,
+            "ready_ts_ms": update.ready_ts_ms,
+            "accepting_to_detect_ms": accepting_to_detect_ms,
+            "detect_to_ready_ms": update.ready_ts_ms - update.detected_ts_ms,
+            "queue_price": str(self.plan.buy_price),
+            "queue_ahead_up": str(update.queue_ahead_up),
+            "queue_ahead_down": str(update.queue_ahead_down),
+        }
 
     def _drain_reconciliation_updates(self) -> None:
         if not self.reconciliation_worker:
@@ -328,36 +373,10 @@ class BotService:
                 ):
                     rearm_discovery = True
 
-        if rearm_discovery:
+        if rearm_discovery and self.market_activation_worker is None:
             self.last_discovery = 0.0
         if order_changed and self.exchange and not self.plan.buy_only:
             self._place_missing_exits(int(time.time()))
-
-    def _place_ready_markets(self) -> None:
-        updates, self.ready_market_updates = self.ready_market_updates, []
-        now_ts = int(time.time())
-        for update in updates:
-            if not self._consider_market(
-                update.market,
-                now_ts=now_ts,
-                trigger="market_ws",
-                orderbook_ready=True,
-                trigger_details=self._market_stream_details(update),
-            ):
-                return
-
-    def _market_stream_details(self, update: MarketReadyUpdate) -> dict:
-        return {
-            "event_ts_ms": update.event_ts_ms,
-            "received_ts_ms": update.received_ts_ms,
-            "ready_ts_ms": update.ready_ts_ms,
-            "transport_ms": update.received_ts_ms - update.event_ts_ms,
-            "subscribe_to_ready_ms": update.ready_ts_ms - update.received_ts_ms,
-            "event_to_ready_ms": update.ready_ts_ms - update.event_ts_ms,
-            "queue_price": str(self.plan.buy_price),
-            "queue_ahead_up": str(update.queue_ahead_up),
-            "queue_ahead_down": str(update.queue_ahead_down),
-        }
 
     def _drain_user_stream_updates(self) -> bool:
         if not self.user_stream_worker:
@@ -473,12 +492,11 @@ class BotService:
                 )
 
     def _cancel_due_orders(self, now_ts: float) -> None:
-        tracked = self.database.tracked_open_orders()
-        due = [
-            row
-            for row in tracked
-            if now_ts >= row["end_ts"] - self.cancel_before_end_seconds
-        ]
+        if self.cancel_before_end_seconds == 0:
+            return
+        due = self.database.due_open_orders(
+            now_ts + self.cancel_before_end_seconds
+        )
         order_ids = [row["order_id"] for row in due]
         if not order_ids:
             return
@@ -535,12 +553,37 @@ class BotService:
                     )
         return recovered
 
-    def _check_geoblock(self) -> None:
-        result = self.exchange.geoblock() if self.exchange else {"blocked": False}
-        if result.get("blocked"):
-            self.database.event(self.run_id, "ERROR", "geoblocked", details=result)
-            raise RuntimeError(
-                f"trading blocked in {result.get('country')} {result.get('region')}"
+    def _drain_geoblock_updates(self) -> None:
+        if not self.geoblock_worker:
+            return
+        for update in self.geoblock_worker.drain():
+            if update.blocked:
+                result = update.result or {}
+                self.database.event(
+                    self.run_id, "ERROR", "geoblocked", details=result
+                )
+                raise RuntimeError(
+                    f"trading blocked in {result.get('country')} "
+                    f"{result.get('region')}"
+                )
+            if update.available:
+                if update.recovered:
+                    self.database.event(
+                        self.run_id, "INFO", "geoblock_check_recovered"
+                    )
+                    self.logger.info(
+                        "geoblock check recovered; new placements resumed"
+                    )
+                continue
+            self.database.event(
+                self.run_id,
+                "ERROR",
+                "geoblock_check_failed",
+                details={"error": update.error},
+            )
+            self.logger.error(
+                "geoblock check unavailable; new placements paused: %s",
+                update.error,
             )
 
     def _discover_and_place(self) -> None:

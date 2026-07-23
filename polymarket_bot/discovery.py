@@ -11,6 +11,7 @@ from .models import Market
 
 
 GAMMA_EVENTS = "https://gamma-api.polymarket.com/events"
+GAMMA_EVENT_BY_SLUG = f"{GAMMA_EVENTS}/slug"
 BTC_FIVE_MINUTE_SERIES_ID = 10684
 GAMMA_PAGE_SIZE = 100
 
@@ -29,6 +30,7 @@ class MarketDiscovery:
         window_minutes: int = 40,
         *,
         farthest_first: bool = False,
+        timeout: float = 20,
     ) -> list[Market]:
         now = datetime.now(timezone.utc)
         requested = math.ceil(window_minutes / 5) if farthest_first else 100
@@ -51,7 +53,7 @@ class MarketDiscovery:
             response = self.session.get(
                 GAMMA_EVENTS,
                 params=params | {"limit": page_size, "offset": len(events)},
-                timeout=20,
+                timeout=timeout,
             )
             response.raise_for_status()
             page = response.json()
@@ -66,8 +68,18 @@ class MarketDiscovery:
             reverse=farthest_first,
         )
 
+    def candidate(self, slug: str) -> Market | None:
+        response = self.session.get(
+            f"{GAMMA_EVENT_BY_SLUG}/{slug}",
+            timeout=2,
+        )
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return self._parse(response.json(), accepting_only=False)
+
     @staticmethod
-    def _parse(event: dict) -> Market | None:
+    def _parse(event: dict, *, accepting_only: bool = True) -> Market | None:
         market_rows = event.get("markets") or []
         if len(market_rows) != 1:
             return None
@@ -75,7 +87,9 @@ class MarketDiscovery:
         slug = str(event.get("slug") or "")
         if not slug.startswith("btc-updown-5m-"):
             return None
-        if not market.get("acceptingOrders") or not market.get("enableOrderBook"):
+        if accepting_only and not market.get("acceptingOrders"):
+            return None
+        if not market.get("enableOrderBook"):
             return None
         try:
             start_ts = int(slug.rsplit("-", 1)[1])

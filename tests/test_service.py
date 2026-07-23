@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import pytest
 
 from polymarket_bot.database import BotDatabase
+from polymarket_bot.geoblock import GeoblockUpdate
+from polymarket_bot.market_activation import MarketActivationUpdate
 from polymarket_bot.models import ExitTarget, Market, PlacedOrder, TradePlan
 from polymarket_bot.reconciliation import (
     ReconciledOrder,
@@ -147,12 +149,124 @@ def _service_for_run(database, tick, *, hours=None):
     service.logger = logging.getLogger("test")
     service.run_id = 0
     service.heartbeat_worker = None
+    service.geoblock_worker = None
     service.user_stream_worker = None
-    service.market_stream_worker = None
+    service.market_activation_worker = None
     service.reconciliation_worker = None
     service.redemption_worker = None
     service._tick = tick
     return service
+
+
+def test_clob_activation_is_the_primary_placement_trigger() -> None:
+    service = BotService.__new__(BotService)
+    service.plan = TradePlan(Decimal("0.01"), (), Decimal("1"))
+    service.activation_market_updates = [
+        MarketActivationUpdate(
+            market=MARKET,
+            accepting_ts_ms=1_999_999_000_000,
+            detected_ts_ms=1_999_999_000_125,
+            ready_ts_ms=1_999_999_000_300,
+            queue_ahead_up=Decimal("12.5"),
+            queue_ahead_down=Decimal("8.25"),
+        )
+    ]
+    calls = []
+
+    def consider(market, **kwargs):
+        calls.append((market, kwargs))
+        return True
+
+    service._consider_market = consider
+    service._place_activated_markets()
+
+    assert service.activation_market_updates == []
+    assert calls[0][0] == MARKET
+    assert calls[0][1]["trigger"] == "clob_activation"
+    assert calls[0][1]["orderbook_ready"] is True
+    assert calls[0][1]["trigger_details"] == {
+        "accepting_ts_ms": 1_999_999_000_000,
+        "detected_ts_ms": 1_999_999_000_125,
+        "ready_ts_ms": 1_999_999_000_300,
+        "accepting_to_detect_ms": 125,
+        "detect_to_ready_ms": 175,
+        "queue_price": "0.01",
+        "queue_ahead_up": "12.5",
+        "queue_ahead_down": "8.25",
+    }
+
+
+def test_activation_probe_allows_only_initial_gamma_discovery() -> None:
+    service = BotService.__new__(BotService)
+    service.config = SimpleNamespace(
+        order_poll_seconds=60,
+        discovery_seconds=0,
+    )
+    service.live = False
+    service.redemption_worker = None
+    service.market_activation_worker = SimpleNamespace(
+        healthy=False,
+        drain=lambda: [],
+    )
+    service.activation_market_updates = []
+    service.reconciliation_worker = None
+    service.user_stream_worker = None
+    service.heartbeat_worker = None
+    service.geoblock_worker = None
+    service.last_reconcile = float("inf")
+    service.last_discovery = 0.0
+    service._cancel_due_orders = lambda _now: None
+    discoveries = []
+    service._discover_and_place = lambda: discoveries.append(True)
+
+    service._tick()
+    service._tick()
+
+    assert discoveries == [True]
+
+
+def test_geoblock_network_failure_pauses_without_raising(tmp_path) -> None:
+    update = GeoblockUpdate(
+        available=False,
+        blocked=False,
+        changed=True,
+        recovered=False,
+        error="SSLError: handshake failed",
+    )
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        run_id = database.start_run("live")
+        service = BotService.__new__(BotService)
+        service.run_id = run_id
+        service.database = database
+        service.logger = logging.getLogger("test")
+        service.geoblock_worker = SimpleNamespace(drain=lambda: [update])
+
+        service._drain_geoblock_updates()
+
+        event = database.connection.execute(
+            "SELECT event_type FROM events ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert event["event_type"] == "geoblock_check_failed"
+
+
+def test_explicit_geoblock_still_stops_trading(tmp_path) -> None:
+    update = GeoblockUpdate(
+        available=True,
+        blocked=True,
+        changed=True,
+        recovered=False,
+        result={"blocked": True, "country": "US", "region": "NY"},
+    )
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        run_id = database.start_run("live")
+        service = BotService.__new__(BotService)
+        service.run_id = run_id
+        service.database = database
+        service.logger = logging.getLogger("test")
+        service.geoblock_worker = SimpleNamespace(drain=lambda: [update])
+
+        with pytest.raises(RuntimeError, match="trading blocked in US NY"):
+            service._drain_geoblock_updates()
 
 
 def test_run_cancels_tracked_orders_on_ctrl_c(tmp_path) -> None:

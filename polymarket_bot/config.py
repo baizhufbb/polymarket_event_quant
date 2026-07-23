@@ -35,6 +35,7 @@ class BotConfig:
     discovery_seconds: float = 5.0
     order_poll_seconds: float = 1.0
     geoblock_seconds: float = 300.0
+    geoblock_retry_seconds: float = 5.0
     redemption_seconds: float = 1800.0
 
     @property

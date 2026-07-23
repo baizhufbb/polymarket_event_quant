@@ -24,6 +24,7 @@ until stopped.
 - An omitted limit is unlimited.
 - Cancel remaining entry and exit orders before the market cutoff; the lead time
   is controlled by `--cancel-before-end-seconds` and defaults to two seconds.
+  Set it to `0` to leave orders resting until Polymarket closes the market.
 - Polymarket's disconnect-cancels-orders heartbeat is disabled unless
   `--heartbeat-seconds SECONDS` is supplied.
 - Every 30 minutes, redeem resolved winning positions back into available pUSD.
@@ -38,9 +39,11 @@ Authenticated CLOB traffic uses `py-clob-client-v2 -> httpx -> httpcore`.
 `35ddb373e13be5940e5137798d5a63d67e10f3e2` from
 `baizhufbb/httpcore`, which contains the proxy TLS zombie-connection fix.
 Public Gamma discovery continues to use `requests`. In live farthest-first mode,
-the public market WebSocket detects each new BTC five-minute market and waits
-for both CLOB books before submitting. Gamma fills the startup window and
-recovers any event missed during a socket reconnect.
+Gamma exposes the next deterministic market slug and token IDs before trading
+opens. A background probe watches that exact CLOB market every 250 milliseconds
+and submits as soon as it accepts orders and both books exist. Gamma fills the
+existing window once at startup; ongoing new entries use only the CLOB activation
+probe.
 
 ## Configuration
 
@@ -91,7 +94,7 @@ heartbeat. It does not change Polymarket's server-side cancellation deadline.
 - When `--heartbeat-seconds` is enabled, a dedicated thread sends independently
   of discovery and reconciliation. A failed heartbeat pauses new orders and
   Polymarket may cancel every open order for the account.
-- Farthest-first live runs record the new-market timestamp, both-book readiness,
+- Farthest-first live runs record CLOB acceptance detection, both-book readiness,
   order-submission duration, and the aggregate queue already resting at the
   configured entry price.
 - A separate redemption thread scans every 30 minutes. It redeems only resolved
@@ -111,6 +114,9 @@ heartbeat. It does not change Polymarket's server-side cancellation deadline.
   later order would lose the original queue position.
 - The bot checks Polymarket geoblocking before and during live operation.
 - A local process lock prevents two bot instances from placing duplicate orders.
+- Runtime geoblock checks run outside the main loop. A temporary network failure
+  pauses new placements and retries every five seconds without stopping order
+  tracking; an explicit blocked response still stops the run.
 
 ## Database
 
