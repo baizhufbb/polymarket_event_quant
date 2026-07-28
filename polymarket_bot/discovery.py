@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -11,6 +12,7 @@ from .models import Market
 
 
 GAMMA_EVENTS = "https://gamma-api.polymarket.com/events"
+GAMMA_MARKETS_BY_SLUG = "https://gamma-api.polymarket.com/markets/slug"
 BTC_FIVE_MINUTE_SERIES_ID = 10684
 GAMMA_PAGE_SIZE = 100
 
@@ -33,6 +35,7 @@ class MarketDiscovery:
         *,
         farthest_first: bool = False,
         timeout: float = 20,
+        fresh: bool = False,
     ) -> list[Market]:
         now = datetime.now(timezone.utc)
         requested = math.ceil(window_minutes / 5) if farthest_first else 100
@@ -52,11 +55,24 @@ class MarketDiscovery:
         events = []
         while len(events) < requested:
             page_size = min(GAMMA_PAGE_SIZE, requested - len(events))
-            response = self.session.get(
-                GAMMA_EVENTS,
-                params=params | {"limit": page_size, "offset": len(events)},
-                timeout=timeout,
-            )
+            request_params = params | {
+                "limit": page_size,
+                "offset": len(events),
+            }
+            request_headers = None
+            if fresh:
+                request_params["_cb"] = str(time.time_ns())
+                request_headers = {
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                }
+            request_kwargs = {
+                "params": request_params,
+                "timeout": timeout,
+            }
+            if request_headers is not None:
+                request_kwargs["headers"] = request_headers
+            response = self.session.get(GAMMA_EVENTS, **request_kwargs)
             response.raise_for_status()
             page = response.json()
             events.extend(page)
@@ -69,6 +85,33 @@ class MarketDiscovery:
             key=lambda item: item.start_ts,
             reverse=farthest_first,
         )
+
+    def find_by_slug(
+        self,
+        slug: str,
+        *,
+        timeout: float = 5,
+        fresh: bool = False,
+    ) -> Market | None:
+        params = {"_cb": str(time.time_ns())} if fresh else None
+        headers = (
+            {"Cache-Control": "no-cache", "Pragma": "no-cache"}
+            if fresh
+            else None
+        )
+        request_kwargs = {"timeout": timeout}
+        if params is not None:
+            request_kwargs["params"] = params
+        if headers is not None:
+            request_kwargs["headers"] = headers
+        response = self.session.get(
+            f"{GAMMA_MARKETS_BY_SLUG}/{slug}",
+            **request_kwargs,
+        )
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return self._parse_market(response.json(), slug)
 
     @staticmethod
     def _parse(event: dict) -> Market | None:
@@ -101,33 +144,6 @@ class MarketDiscovery:
                 tick_size=Decimal(str(market.get("orderPriceMinTickSize") or "0.01")),
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-            return None
-
-    @staticmethod
-    def parse_stream_market(message: dict) -> Market | None:
-        slug = str(message.get("slug") or "")
-        if not slug.startswith("btc-updown-5m-"):
-            return None
-        try:
-            start_ts = int(slug.rsplit("-", 1)[1])
-            token_ids = message.get("clob_token_ids") or message["assets_ids"]
-            outcomes = message["outcomes"]
-            token_by_outcome = dict(zip(outcomes, token_ids, strict=True))
-            return Market(
-                slug=slug,
-                condition_id=str(
-                    message.get("condition_id") or message["market"]
-                ),
-                start_ts=start_ts,
-                end_ts=start_ts + 300,
-                up_token_id=str(token_by_outcome["Up"]),
-                down_token_id=str(token_by_outcome["Down"]),
-                min_size=Decimal("5"),
-                tick_size=Decimal(
-                    str(message.get("order_price_min_tick_size") or "0.01")
-                ),
-            )
-        except (KeyError, TypeError, ValueError):
             return None
 
 

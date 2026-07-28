@@ -18,7 +18,6 @@ from .market_activation import (
 )
 from .models import Market, PlacedOrder, TradePlan
 from .reconciliation import ReconciliationWorker
-from .redemption import RedemptionWorker
 from .user_stream import UserStreamState, UserStreamWorker, UserTradeUpdate
 
 
@@ -98,15 +97,11 @@ class BotService:
             if self.exchange
             else None
         )
-        self.redemption_worker = (
-            RedemptionWorker(config, config.redemption_seconds) if live else None
-        )
         self.user_stream_worker = (
             UserStreamWorker(config, logger=logger) if live else None
         )
         self.market_activation_worker = (
             MarketActivationWorker(
-                queue_price=plan.buy_price,
                 window_minutes=lookahead_minutes,
                 farthest_first=True,
                 wake_event=self.wake_event,
@@ -145,7 +140,6 @@ class BotService:
                 if self.heartbeat_seconds is not None
                 else None
             ),
-            "redemption_seconds": self.config.redemption_seconds,
             "early_activation_probe": self.market_activation_worker is not None,
         }
         self.run_id = self.database.start_run(mode, run_config)
@@ -165,8 +159,6 @@ class BotService:
             self.market_activation_worker.start()
         if self.reconciliation_worker:
             self.reconciliation_worker.start()
-        if self.redemption_worker:
-            self.redemption_worker.start()
         cancel_on_shutdown = False
         try:
             while deadline is None or time.monotonic() < deadline:
@@ -190,9 +182,6 @@ class BotService:
         else:
             self.database.stop_run(self.run_id, "completed")
         finally:
-            if self.redemption_worker:
-                self.redemption_worker.stop()
-                self._drain_redemption_updates()
             if self.market_activation_worker:
                 self.market_activation_worker.stop()
                 self._drain_market_activation_updates()
@@ -216,7 +205,6 @@ class BotService:
 
     def _tick(self) -> None:
         now = time.monotonic()
-        self._drain_redemption_updates()
         self._drain_market_activation_updates()
         self._drain_reconciliation_updates()
         stream_recovered = self._drain_user_stream_updates()
@@ -295,7 +283,7 @@ class BotService:
             if not self._consider_market(
                 update.market,
                 now_ts=now_ts,
-                trigger="market_stream_activation",
+                trigger="market_parameters_activation",
                 orderbook_ready=True,
                 trigger_details=self._market_activation_details(update),
             ):
@@ -303,11 +291,10 @@ class BotService:
 
     def _market_activation_details(self, update: MarketActivationUpdate) -> dict:
         return {
-            "market_announced_ts_ms": update.market_announced_ts_ms,
-            "books_detected_ts_ms": update.books_detected_ts_ms,
-            "queue_price": str(self.plan.buy_price),
-            "queue_ahead_up": str(update.queue_ahead_up),
-            "queue_ahead_down": str(update.queue_ahead_down),
+            "market_discovered_ts_ms": update.market_discovered_ts_ms,
+            "market_parameters_detected_ts_ms": (
+                update.market_parameters_detected_ts_ms
+            ),
         }
 
     def _drain_reconciliation_updates(self) -> None:
@@ -427,62 +414,6 @@ class BotService:
         ):
             self._place_missing_exits(int(time.time()))
         return recovered
-
-    def _drain_redemption_updates(self) -> None:
-        if not self.redemption_worker:
-            return
-        for update in self.redemption_worker.drain():
-            details = {
-                "scanned_positions": update.scanned_positions,
-                "eligible_conditions": update.eligible_conditions,
-                "redeemed": [
-                    {
-                        "condition_id": item.condition_id,
-                        "payout": str(item.payout),
-                        "transaction_hash": item.transaction_hash,
-                        "transaction_id": item.transaction_id,
-                    }
-                    for item in update.redeemed
-                ],
-                "errors": [
-                    {
-                        "condition_id": item.condition_id,
-                        "transaction_id": item.transaction_id,
-                        "error": item.error,
-                    }
-                    for item in update.errors
-                ],
-            }
-            if update.scan_error:
-                details["error"] = update.scan_error
-                self.database.event(
-                    self.run_id,
-                    "ERROR",
-                    "redemption_scan_failed",
-                    details=details,
-                )
-                self.logger.error("redemption scan failed: %s", update.scan_error)
-                continue
-            level = "ERROR" if update.errors else "INFO"
-            self.database.event(
-                self.run_id,
-                level,
-                "redemption_sweep",
-                details=details,
-            )
-            for item in update.redeemed:
-                self.logger.info(
-                    "redeemed %s pUSD for condition %s: %s",
-                    item.payout,
-                    item.condition_id,
-                    item.transaction_hash,
-                )
-            for item in update.errors:
-                self.logger.error(
-                    "redemption blocked for condition %s: %s",
-                    item.condition_id,
-                    item.error,
-                )
 
     def _cancel_due_orders(self, now_ts: float) -> None:
         if self.cancel_before_end_seconds == 0:
@@ -700,6 +631,7 @@ class BotService:
             return
 
         placement_started_ts_ms = int(time.time() * 1000)
+        submission_error = None
         try:
             result = self.exchange.place_dual(
                 market,
@@ -707,7 +639,7 @@ class BotService:
                 size=self.plan.order_size,
             )
         except Exception as exc:
-            initial_error = f"{type(exc).__name__}: {exc}"
+            submission_error = f"{type(exc).__name__}: {exc}"
             try:
                 result = self.exchange.reconcile_ambiguous_dual(
                     market,
@@ -716,7 +648,7 @@ class BotService:
                 )
             except Exception as reconcile_exc:
                 error = (
-                    f"submission={initial_error}; reconciliation="
+                    f"submission={submission_error}; reconciliation="
                     f"{type(reconcile_exc).__name__}: {reconcile_exc}"
                 )
                 self.database.set_market_state(market.slug, "error", error)
@@ -734,6 +666,14 @@ class BotService:
                 return
 
         placement_finished_ts_ms = int(time.time() * 1000)
+        placement_details = {
+            "trigger": trigger,
+            "placement_started_ts_ms": placement_started_ts_ms,
+            "placement_finished_ts_ms": placement_finished_ts_ms,
+            **(trigger_details or {}),
+        }
+        if submission_error:
+            placement_details["submission_error"] = submission_error
         for order in result.orders:
             self.database.add_order(self.run_id, market.slug, order)
         if result.complete:
@@ -745,17 +685,44 @@ class BotService:
                 slug=market.slug,
                 details={
                     "order_ids": [order.order_id for order in result.orders],
-                    "trigger": trigger,
-                    "placement_started_ts_ms": placement_started_ts_ms,
-                    "placement_finished_ts_ms": placement_finished_ts_ms,
                     "placement_ms": (
                         placement_finished_ts_ms - placement_started_ts_ms
                     ),
-                    **(trigger_details or {}),
+                    **placement_details,
                 },
             )
             self.logger.info("LIVE %s: both orders accepted", market.slug)
         else:
+            discovered_ts_ms = (
+                trigger_details.get("market_discovered_ts_ms")
+                if trigger_details
+                else int(time.time() * 1000)
+            )
+            if (
+                result.retryable
+                and self.market_activation_worker
+                and self.market_activation_worker.requeue(
+                    market,
+                    market_discovered_ts_ms=discovered_ts_ms,
+                )
+            ):
+                self.database.set_market_state(
+                    market.slug, "waiting_for_order_engine", result.error
+                )
+                self.database.event(
+                    self.run_id,
+                    "INFO",
+                    "placement_waiting_for_engine",
+                    slug=market.slug,
+                    details={
+                        "error": result.error,
+                        **placement_details,
+                    },
+                )
+                self.logger.info(
+                    "LIVE %s: order engine not ready; retrying", market.slug
+                )
+                return
             self.database.set_market_state(market.slug, "error", result.error)
             self.database.event(
                 self.run_id,
@@ -764,10 +731,7 @@ class BotService:
                 slug=market.slug,
                 details={
                     "error": result.error,
-                    "trigger": trigger,
-                    "placement_started_ts_ms": placement_started_ts_ms,
-                    "placement_finished_ts_ms": placement_finished_ts_ms,
-                    **(trigger_details or {}),
+                    **placement_details,
                 },
             )
 

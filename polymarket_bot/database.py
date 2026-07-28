@@ -182,7 +182,19 @@ class BotDatabase:
         )
 
     def can_start_entry_plan(self, slug: str) -> bool:
-        return not self.has_market(slug)
+        row = self.connection.execute(
+            "SELECT state FROM markets WHERE slug=?", (slug,)
+        ).fetchone()
+        if row is None:
+            return True
+        if row["state"] != "waiting_for_order_engine":
+            return False
+        return (
+            self.connection.execute(
+                "SELECT 1 FROM orders WHERE slug=? LIMIT 1", (slug,)
+            ).fetchone()
+            is None
+        )
 
     def add_market(self, run_id: int, market: Market, state: str = "placing") -> None:
         self.connection.execute(

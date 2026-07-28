@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from decimal import Decimal
 
 import requests
@@ -23,6 +24,10 @@ from .models import Market, PlacedOrder, PlacementResult
 CLOB_HOST = "https://clob.polymarket.com"
 GEOBLOCK_URL = "https://polymarket.com/api/geoblock"
 TOKEN_SCALE = Decimal("1000000")
+MARKET_NOT_READY = "the market is not yet ready to process new orders"
+ORDERBOOK_MISSING_PREFIX = "the orderbook "
+ORDERBOOK_MISSING_SUFFIX = " does not exist"
+TRANSIENT_RETRY_SECONDS = 0.03
 
 
 def _order_id(response: object) -> str | None:
@@ -39,6 +44,21 @@ def _accepted(response: object) -> bool:
     if response.get("success") is False:
         return False
     return bool(_order_id(response))
+
+
+def _order_engine_not_ready(response: object) -> bool:
+    if not isinstance(response, dict) or _order_id(response):
+        return False
+    error = str(response.get("errorMsg") or "").lower()
+    return error == MARKET_NOT_READY or (
+        error.startswith(ORDERBOOK_MISSING_PREFIX)
+        and error.endswith(ORDERBOOK_MISSING_SUFFIX)
+    )
+
+
+def _transient_submission_error(error: PolyApiException) -> bool:
+    status = error.status_code
+    return status is None or 500 <= status < 600
 
 
 def _heartbeat_id(payload: object) -> str | None:
@@ -142,7 +162,19 @@ class Exchange:
             )
             signed.append(PostOrdersV2Args(order=order, orderType=OrderType.GTC))
 
-        responses = self.client.post_orders(signed, post_only=True)
+        try:
+            responses = self.client.post_orders(signed, post_only=True)
+        except PolyApiException as exc:
+            if not _transient_submission_error(exc):
+                raise
+            time.sleep(TRANSIENT_RETRY_SECONDS)
+            try:
+                responses = self.client.post_orders(signed, post_only=True)
+            except Exception as retry_exc:
+                raise RuntimeError(
+                    f"transient submission retry failed: "
+                    f"initial={exc}; retry={type(retry_exc).__name__}: {retry_exc}"
+                ) from retry_exc
         accepted = []
         errors = []
         for (outcome, token_id), response in zip(
@@ -169,8 +201,15 @@ class Exchange:
             return PlacementResult(tuple(accepted))
         if accepted:
             self.client.cancel_orders([order.order_id for order in accepted])
+        retryable = (
+            not accepted
+            and len(responses) == 2
+            and all(_order_engine_not_ready(response) for response in responses)
+        )
         return PlacementResult(
-            tuple(accepted), "; ".join(errors) or "partial placement"
+            tuple(accepted),
+            "; ".join(errors) or "partial placement",
+            retryable=retryable,
         )
 
     def reconcile_ambiguous_dual(
@@ -236,7 +275,9 @@ class Exchange:
         if found_ids:
             self.cancel_orders(found_ids)
         return PlacementResult(
-            (), "ambiguous submission did not produce exactly two orders"
+            (),
+            "ambiguous submission did not produce exactly two orders",
+            retryable=True,
         )
 
     def place_exit(

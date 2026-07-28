@@ -154,19 +154,65 @@ def test_parse_market_before_accepting_orders() -> None:
     assert market.down_token_id == "down-token"
 
 
-def test_parse_stream_market() -> None:
-    market = MarketDiscovery.parse_stream_market(
-        {
-            "slug": "btc-updown-5m-1784857200",
-            "market": "0xcondition",
-            "assets_ids": ["up-token", "down-token"],
-            "outcomes": ["Up", "Down"],
-            "order_price_min_tick_size": "0.01",
-        }
-    )
+def test_fresh_slug_lookup_bypasses_gamma_cache() -> None:
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def raise_for_status() -> None:
+            return None
+
+        @staticmethod
+        def json() -> dict:
+            return {
+                "conditionId": "0xcondition",
+                "enableOrderBook": True,
+                "clobTokenIds": '["up-token", "down-token"]',
+                "outcomes": '["Up", "Down"]',
+                "orderMinSize": 5,
+                "orderPriceMinTickSize": 0.01,
+            }
+
+    class Session:
+        def __init__(self) -> None:
+            self.call = None
+
+        def get(self, url, **kwargs):
+            self.call = (url, kwargs)
+            return Response()
+
+    slug = "btc-updown-5m-1784857200"
+    discovery = MarketDiscovery()
+    discovery.session = Session()
+
+    market = discovery.find_by_slug(slug, fresh=True)
+
     assert market is not None
     assert market.up_token_id == "up-token"
     assert market.down_token_id == "down-token"
+    url, kwargs = discovery.session.call
+    assert url.endswith(f"/markets/slug/{slug}")
+    assert kwargs["timeout"] == 5
+    assert kwargs["params"]["_cb"].isdigit()
+    assert kwargs["headers"] == {
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+
+def test_missing_slug_returns_none() -> None:
+    class Response:
+        status_code = 404
+
+    class Session:
+        @staticmethod
+        def get(_url, **_kwargs):
+            return Response()
+
+    discovery = MarketDiscovery()
+    discovery.session = Session()
+
+    assert discovery.find_by_slug("btc-updown-5m-1784857200") is None
 
 
 def test_farthest_discovery_requests_only_the_far_edge_window() -> None:
@@ -409,6 +455,42 @@ def test_existing_market_is_never_rearmed(tmp_path) -> None:
         ).fetchone()
         assert market_row["run_id"] == second_run
         assert market_row["state"] == "placing"
+        assert not database.can_start_entry_plan(market.slug)
+
+
+def test_order_engine_wait_can_retry_only_without_orders(tmp_path) -> None:
+    market = Market(
+        slug="btc-updown-5m-2000000000",
+        condition_id="0xcondition",
+        start_ts=2_000_000_000,
+        end_ts=2_000_000_300,
+        up_token_id="up-token",
+        down_token_id="down-token",
+        min_size=Decimal("5"),
+        tick_size=Decimal("0.01"),
+    )
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        run_id = database.start_run("live")
+        database.add_market(
+            run_id, market, state="waiting_for_order_engine"
+        )
+
+        assert database.can_start_entry_plan(market.slug)
+
+        database.add_order(
+            run_id,
+            market.slug,
+            PlacedOrder(
+                order_id="unexpected-order",
+                outcome="up",
+                token_id=market.up_token_id,
+                price=Decimal("0.01"),
+                size=Decimal("100"),
+                status="live",
+                raw={},
+            ),
+        )
+
         assert not database.can_start_entry_plan(market.slug)
 
 

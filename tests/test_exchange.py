@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 import httpx
+import pytest
 
 from polymarket_bot.exchange import Exchange
 from polymarket_bot.models import Market
@@ -55,6 +56,56 @@ class FakeClient:
         return {"success": True, "orderID": "exit-order", "status": "live"}
 
 
+class TransientRetryClient(FakeClient):
+    def __init__(self, responses):
+        super().__init__(responses)
+        self.posted_batches = []
+
+    def post_orders(self, signed, post_only=False):
+        self.posted_batches.append(tuple(signed))
+        if len(self.posted_batches) == 1:
+            raise PolyApiException(error_msg="Request exception!")
+        return super().post_orders(signed, post_only=post_only)
+
+
+def test_transient_batch_failure_reuses_the_same_signed_orders() -> None:
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = TransientRetryClient(
+        [
+            {"success": True, "orderID": "up-order", "status": "live"},
+            {"success": True, "orderID": "down-order", "status": "live"},
+        ]
+    )
+
+    result = exchange.place_dual(MARKET, price=Decimal("0.01"), size=Decimal("100"))
+
+    assert result.complete
+    assert len(exchange.client.posted_batches) == 2
+    assert exchange.client.posted_batches[0][0] is exchange.client.posted_batches[1][0]
+    assert exchange.client.posted_batches[0][1] is exchange.client.posted_batches[1][1]
+
+
+def test_business_rejection_exception_is_not_retried() -> None:
+    class RejectedClient(FakeClient):
+        def __init__(self):
+            super().__init__([])
+            self.calls = 0
+
+        def post_orders(self, signed, post_only=False):
+            self.calls += 1
+            request = httpx.Request("POST", "https://clob.polymarket.com/orders")
+            response = httpx.Response(400, json={"error": "rejected"}, request=request)
+            raise PolyApiException(response)
+
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = RejectedClient()
+
+    with pytest.raises(PolyApiException):
+        exchange.place_dual(MARKET, price=Decimal("0.01"), size=Decimal("100"))
+
+    assert exchange.client.calls == 1
+
+
 def test_partial_batch_is_immediately_canceled() -> None:
     exchange = Exchange.__new__(Exchange)
     exchange.client = FakeClient(
@@ -65,7 +116,50 @@ def test_partial_batch_is_immediately_canceled() -> None:
     )
     result = exchange.place_dual(MARKET, price=Decimal("0.01"), size=Decimal("100"))
     assert not result.complete
+    assert not result.retryable
     assert exchange.client.canceled == ["up-order"]
+
+
+def test_market_not_ready_pair_is_retryable() -> None:
+    exchange = Exchange.__new__(Exchange)
+    response = {
+        "success": True,
+        "orderID": "",
+        "errorMsg": "the market is not yet ready to process new orders",
+    }
+    exchange.client = FakeClient([dict(response), dict(response)])
+
+    result = exchange.place_dual(MARKET, price=Decimal("0.01"), size=Decimal("100"))
+
+    assert not result.complete
+    assert result.orders == ()
+    assert result.retryable
+    assert exchange.client.canceled == []
+
+
+def test_missing_orderbook_pair_is_retryable() -> None:
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = FakeClient(
+        [
+            {
+                "success": True,
+                "orderID": "",
+                "errorMsg": "the orderbook up-token does not exist",
+            },
+            {
+                "success": True,
+                "orderID": "",
+                "errorMsg": "the orderbook down-token does not exist",
+            },
+        ]
+    )
+
+    result = exchange.place_dual(MARKET, price=Decimal("0.01"), size=Decimal("100"))
+
+    assert not result.complete
+    assert result.orders == ()
+    assert result.retryable
+    assert exchange.client.canceled == []
 
 
 def test_entries_are_post_only_gtc_without_expiration() -> None:
@@ -114,6 +208,20 @@ def test_ambiguous_submission_adopts_exact_pair() -> None:
     )
     assert result.complete
     assert {order.order_id for order in result.orders} == {"up-order", "down-order"}
+
+
+def test_ambiguous_submission_without_orders_is_retryable() -> None:
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = FakeClient([])
+    exchange.open_orders = lambda condition_id: []
+
+    result = exchange.reconcile_ambiguous_dual(
+        MARKET, price=Decimal("0.01"), size=Decimal("100")
+    )
+
+    assert not result.complete
+    assert result.orders == ()
+    assert result.retryable
 
 
 def test_exit_is_a_non_post_only_sell_limit() -> None:

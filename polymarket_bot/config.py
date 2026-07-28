@@ -30,13 +30,10 @@ class BotConfig:
     api_key: str | None
     api_secret: str | None
     api_passphrase: str | None
-    relayer_api_key: str | None
-    relayer_api_key_address: str | None
     discovery_seconds: float = 5.0
     order_poll_seconds: float = 60.0
     geoblock_seconds: float = 300.0
     geoblock_retry_seconds: float = 5.0
-    redemption_seconds: float = 1800.0
 
     @property
     def database_path(self) -> Path:
@@ -60,12 +57,6 @@ class BotConfig:
             api_key=api_key,
             api_secret=api_secret,
             api_passphrase=api_passphrase,
-            relayer_api_key=(
-                os.getenv("POLYMARKET_RELAYER_API_KEY", "").strip() or None
-            ),
-            relayer_api_key_address=(
-                os.getenv("POLYMARKET_RELAYER_API_KEY_ADDRESS", "").strip() or None
-            ),
         )
         config.validate(live=live, authenticated=authenticated)
         return config
@@ -81,8 +72,6 @@ class BotConfig:
                 )
             if not self.api_key or not self.api_secret or not self.api_passphrase:
                 raise ValueError("CLOB API credentials are required for live mode")
-            if not self.relayer_api_key or not self.relayer_api_key_address:
-                raise ValueError("Relayer credentials are required for live mode")
 
 
 @dataclass(frozen=True)

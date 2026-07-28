@@ -8,7 +8,13 @@ import pytest
 from polymarket_bot.database import BotDatabase
 from polymarket_bot.geoblock import GeoblockUpdate
 from polymarket_bot.market_activation import MarketActivationUpdate
-from polymarket_bot.models import ExitTarget, Market, PlacedOrder, TradePlan
+from polymarket_bot.models import (
+    ExitTarget,
+    Market,
+    PlacedOrder,
+    PlacementResult,
+    TradePlan,
+)
 from polymarket_bot.reconciliation import (
     ReconciledOrder,
     ReconciliationUpdate,
@@ -67,6 +73,58 @@ class PendingBookExchange(FakeExchange):
     def order_books_ready(self, market):
         self.readiness_calls.append(market.slug)
         return False
+
+
+class RetryPlacementExchange(FakeExchange):
+    def __init__(self):
+        super().__init__()
+        self.place_calls = 0
+
+    def place_dual(self, market, *, price, size):
+        self.place_calls += 1
+        if self.place_calls == 1:
+            return PlacementResult(
+                (),
+                "the market is not yet ready to process new orders",
+                retryable=True,
+            )
+        return PlacementResult(
+            (
+                PlacedOrder(
+                    order_id="up-order",
+                    outcome="up",
+                    token_id=market.up_token_id,
+                    price=price,
+                    size=size,
+                    status="live",
+                    raw={},
+                ),
+                PlacedOrder(
+                    order_id="down-order",
+                    outcome="down",
+                    token_id=market.down_token_id,
+                    price=price,
+                    size=size,
+                    status="live",
+                    raw={},
+                ),
+            )
+        )
+
+
+class AmbiguousRetryPlacementExchange(RetryPlacementExchange):
+    def place_dual(self, market, *, price, size):
+        if self.place_calls == 0:
+            self.place_calls = 1
+            raise RuntimeError("network interrupted")
+        return super().place_dual(market, price=price, size=size)
+
+    def reconcile_ambiguous_dual(self, market, *, price, size):
+        return PlacementResult(
+            (),
+            "ambiguous submission did not produce exactly two orders",
+            retryable=True,
+        )
 
 
 class FakeReconciliationWorker:
@@ -136,7 +194,7 @@ class LadderExitExchange(ExitExchange):
 
 def _service_for_run(database, tick, *, hours=None):
     service = BotService.__new__(BotService)
-    service.config = SimpleNamespace(redemption_seconds=1800)
+    service.config = SimpleNamespace()
     service.database = database
     service.plan = TradePlan(Decimal("0.01"), (), Decimal("1"))
     service.hours = hours
@@ -155,21 +213,18 @@ def _service_for_run(database, tick, *, hours=None):
     service.user_stream_worker = None
     service.market_activation_worker = None
     service.reconciliation_worker = None
-    service.redemption_worker = None
     service._tick = tick
     return service
 
 
-def test_market_stream_activation_is_the_primary_placement_trigger() -> None:
+def test_market_parameter_activation_is_the_primary_placement_trigger() -> None:
     service = BotService.__new__(BotService)
     service.plan = TradePlan(Decimal("0.01"), (), Decimal("1"))
     service.activation_market_updates = [
         MarketActivationUpdate(
             market=MARKET,
-            market_announced_ts_ms=1_999_999_000_000,
-            books_detected_ts_ms=1_999_999_000_125,
-            queue_ahead_up=Decimal("12.5"),
-            queue_ahead_down=Decimal("8.25"),
+            market_discovered_ts_ms=1_999_999_000_000,
+            market_parameters_detected_ts_ms=1_999_999_000_125,
         )
     ]
     calls = []
@@ -183,15 +238,128 @@ def test_market_stream_activation_is_the_primary_placement_trigger() -> None:
 
     assert service.activation_market_updates == []
     assert calls[0][0] == MARKET
-    assert calls[0][1]["trigger"] == "market_stream_activation"
+    assert calls[0][1]["trigger"] == "market_parameters_activation"
     assert calls[0][1]["orderbook_ready"] is True
     assert calls[0][1]["trigger_details"] == {
-        "market_announced_ts_ms": 1_999_999_000_000,
-        "books_detected_ts_ms": 1_999_999_000_125,
-        "queue_price": "0.01",
-        "queue_ahead_up": "12.5",
-        "queue_ahead_down": "8.25",
+        "market_discovered_ts_ms": 1_999_999_000_000,
+        "market_parameters_detected_ts_ms": 1_999_999_000_125,
     }
+
+
+def test_order_engine_not_ready_requeues_until_pair_is_accepted(tmp_path) -> None:
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        run_id = database.start_run("live")
+        exchange = RetryPlacementExchange()
+        requeued = []
+        service = BotService.__new__(BotService)
+        service.database = database
+        service.plan = TradePlan(Decimal("0.01"), (), Decimal("1"))
+        service.max_reserved_usd = None
+        service.max_daily_filled_cost = None
+        service.exchange = exchange
+        service.market_activation_worker = SimpleNamespace(
+            requeue=lambda market, **kwargs: requeued.append((market, kwargs)) or True
+        )
+        service.run_id = run_id
+        service.run_started_ts = 0
+        service.live = True
+        service.logger = logging.getLogger("test")
+        details = {
+            "market_discovered_ts_ms": 1_999_999_000_000,
+            "market_parameters_detected_ts_ms": 1_999_999_000_125,
+        }
+
+        service._consider_market(
+            MARKET,
+            now_ts=1_999_999_000,
+            trigger="market_parameters_activation",
+            orderbook_ready=True,
+            trigger_details=details,
+        )
+
+        row = database.connection.execute(
+            "SELECT state FROM markets WHERE slug=?", (MARKET.slug,)
+        ).fetchone()
+        assert row["state"] == "waiting_for_order_engine"
+        assert database.can_start_entry_plan(MARKET.slug)
+        assert requeued == [
+            (
+                MARKET,
+                {"market_discovered_ts_ms": 1_999_999_000_000},
+            )
+        ]
+
+        service._consider_market(
+            MARKET,
+            now_ts=1_999_999_000,
+            trigger="market_parameters_activation",
+            orderbook_ready=True,
+            trigger_details=details,
+        )
+
+        row = database.connection.execute(
+            "SELECT state FROM markets WHERE slug=?", (MARKET.slug,)
+        ).fetchone()
+        assert row["state"] == "active"
+        assert exchange.place_calls == 2
+        assert not database.can_start_entry_plan(MARKET.slug)
+        assert {
+            row["order_id"]
+            for row in database.connection.execute(
+                "SELECT order_id FROM orders WHERE slug=?", (MARKET.slug,)
+            )
+        } == {"up-order", "down-order"}
+
+
+def test_ambiguous_submission_requeues_and_records_original_error(tmp_path) -> None:
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        run_id = database.start_run("live")
+        exchange = AmbiguousRetryPlacementExchange()
+        requeued = []
+        service = BotService.__new__(BotService)
+        service.database = database
+        service.plan = TradePlan(Decimal("0.01"), (), Decimal("1"))
+        service.max_reserved_usd = None
+        service.max_daily_filled_cost = None
+        service.exchange = exchange
+        service.market_activation_worker = SimpleNamespace(
+            requeue=lambda market, **kwargs: requeued.append(market.slug) or True
+        )
+        service.run_id = run_id
+        service.run_started_ts = 0
+        service.live = True
+        service.logger = logging.getLogger("test")
+
+        service._consider_market(
+            MARKET,
+            now_ts=1_999_999_000,
+            trigger="market_parameters_activation",
+            orderbook_ready=True,
+        )
+
+        event = database.connection.execute(
+            """
+            SELECT details_json
+            FROM events
+            WHERE slug=? AND event_type='placement_waiting_for_engine'
+            """,
+            (MARKET.slug,),
+        ).fetchone()
+        assert requeued == [MARKET.slug]
+        assert "RuntimeError: network interrupted" in event["details_json"]
+
+        service._consider_market(
+            MARKET,
+            now_ts=1_999_999_000,
+            trigger="market_parameters_activation",
+            orderbook_ready=True,
+        )
+
+        state = database.connection.execute(
+            "SELECT state FROM markets WHERE slug=?", (MARKET.slug,)
+        ).fetchone()["state"]
+        assert state == "active"
+        assert exchange.place_calls == 2
 
 
 def test_activation_worker_owns_continuous_gamma_discovery() -> None:
@@ -201,7 +369,6 @@ def test_activation_worker_owns_continuous_gamma_discovery() -> None:
         discovery_seconds=0,
     )
     service.live = False
-    service.redemption_worker = None
     service.market_activation_worker = SimpleNamespace(
         healthy=False,
         drain=lambda: [],

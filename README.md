@@ -27,7 +27,8 @@ until stopped.
   Set it to `0` to leave orders resting until Polymarket closes the market.
 - Polymarket's disconnect-cancels-orders heartbeat is disabled unless
   `--heartbeat-seconds SECONDS` is supplied.
-- Every 30 minutes, redeem resolved winning positions back into available pUSD.
+- The bot does not submit redemption transactions. Resolved winnings are
+  returned by Polymarket's account-side settlement service.
 
 This is an experimental tail-event strategy. It has not been proven to have a
 stable positive expectation. Use a dedicated wallet and small limits.
@@ -39,51 +40,52 @@ Authenticated CLOB traffic uses `py-clob-client-v2 -> httpx -> httpcore`.
 `35ddb373e13be5940e5137798d5a63d67e10f3e2` from
 `baizhufbb/httpcore`, which contains the proxy TLS zombie-connection fix.
 Public discovery continues to use `requests`. Gamma fills the existing window
-once. The public CLOB market WebSocket then supplies each new market's
-condition and token IDs in real time. The global
-CLOB market catalog is not used for first discovery because a market can accept
-orders several minutes before that catalog exposes it. Gamma supplies startup
-condition and token IDs; every newly seen market remains pending independently
-until one batch `/books` request contains both books. Pending books are checked
-every 250 milliseconds. The first response containing both books wakes the main
-loop and immediately submits the post-only pair.
+once, then the predictable next five-minute slug is queried every second. These
+requests include a unique cache buster because Gamma otherwise advertises a
+five-minute public cache. Each newly discovered condition is checked against
+`GET /clob-markets/{condition_id}` every 250 milliseconds. As soon as CLOB
+returns both real token IDs, the main loop is woken and submits the post-only
+pair.
 
 ## Runtime sequence and interfaces
 
-The scheduled five-minute slot, metadata creation time, and order-book
-activation time are separate. Polymarket may activate books out of slot order,
-so each condition is tracked independently.
+The scheduled five-minute slot, Gamma metadata creation time, CLOB parameter
+availability, and order acceptance time are separate. Markets may become ready
+out of slot order, so each condition is tracked independently.
 
 | Stage | Interface | Code |
 | --- | --- | --- |
 | Parse command and validate credentials | Local CLI and `.env.trading` | `polymarket_bot/cli.py`, `polymarket_bot/config.py` |
 | Open the run and local state | SQLite `data/bot.sqlite` | `polymarket_bot/database.py` |
 | Discover startup metadata | `GET https://gamma-api.polymarket.com/events` | `polymarket_bot/discovery.py` |
-| Discover every new market | `wss://ws-subscriptions-clob.polymarket.com/ws/market` `new_market` events | `polymarket_bot/discovery.py`, `polymarket_bot/market_activation.py` |
-| Detect each book activation | `POST https://clob.polymarket.com/books` every 250 ms | `polymarket_bot/market_activation.py` |
+| Discover every new market | Cache-busted `GET https://gamma-api.polymarket.com/markets/slug/{slug}` every second | `polymarket_bot/discovery.py`, `polymarket_bot/market_activation.py` |
+| Detect CLOB market parameters | `GET https://clob.polymarket.com/clob-markets/{condition_id}` every 250 ms | `polymarket_bot/market_activation.py` |
 | Submit both entry orders | Authenticated CLOB batch `post_orders`, post-only GTC | `polymarket_bot/exchange.py` |
 | Receive fills and cancellations | Authenticated CLOB user WebSocket | `polymarket_bot/user_stream.py` |
 | Verify open-order state | CLOB `get_open_orders` and `get_order` | `polymarket_bot/reconciliation.py` |
 | Place configured exits | CLOB conditional-token balance plus GTC sell orders | `polymarket_bot/service.py`, `polymarket_bot/exchange.py` |
-| Collect resolved winners | Polymarket relayer/SecureClient every 30 minutes | `polymarket_bot/redemption.py` |
 
 The live farthest-first path runs in this order:
 
-1. Gamma fills the configured far-edge window once. The public market WebSocket
-   then registers each new BTC five-minute market with its real Up/Down token
-   IDs as soon as CLOB announces it.
-2. One batch `/books` request checks every pending Up/Down token pair every
-   250 milliseconds.
-3. When both books exist, only that market leaves the pending set. The service
-   validates eligibility, database uniqueness, tick size, minimum size, and
-   optional limits.
+1. Gamma fills the configured far-edge window once. The worker then predicts the
+   exact next BTC five-minute slug and requests that slug every second with a
+   unique cache buster until its condition and real Up/Down token IDs exist.
+2. Each discovered condition is checked independently through
+   `/clob-markets/{condition_id}` every 250 milliseconds.
+3. When CLOB returns both token IDs, only that market leaves the pending set.
+   The service validates eligibility, database uniqueness, tick size, minimum
+   size, and optional limits.
 4. The exchange signs Up and Down locally and submits both in one authenticated
-   post-only batch. If exactly one side is accepted, it is canceled.
+   post-only batch. If both sides return no order IDs and explicitly report
+   either that the market is not ready or that the new order books do not yet
+   exist, the market returns to the 250-millisecond CLOB parameter poll and
+   repeats until accepted or expired. Other failures are not treated as
+   readiness signals. If exactly one side is accepted, it is canceled.
 5. Accepted market and order IDs are committed to SQLite. The user WebSocket
    and REST reconciliation then maintain fills and terminal states.
 6. In buy-only mode, matched shares are held through resolution. With
    `--take-profit`, settled matched inventory is offered at the configured
-   exit rungs. Resolved winners are redeemed by the periodic redemption worker.
+   exit rungs. Redemption is outside the trading process.
 
 ## Configuration
 
@@ -105,8 +107,7 @@ Order size is `usd-per-side / buy-price`. Each take-profit fraction is applied
 to the matched entry size, including incremental partial fills.
 
 Omitting `--take-profit` selects buy-only mode. Matched shares are not offered
-for sale; resolved winning positions are collected by the 30-minute redemption
-worker.
+for sale; they remain held through resolution.
 
 Omitting `--heartbeat-seconds` leaves GTC orders on the exchange during a
 network or process outage. Supplying a value above zero and below ten enables
@@ -117,8 +118,9 @@ heartbeat. It does not change Polymarket's server-side cancellation deadline.
 
 - `run` is a dry-run unless `--live` is supplied.
 - Live mode also requires `POLYMARKET_LIVE_ACK=I_UNDERSTAND_REAL_ORDERS`.
-- Order submission retries are disabled. An ambiguous response is recorded and
-  is not blindly submitted again.
+- A transient network or server failure retries the same signed Up/Down batch
+  once. If the result remains ambiguous, the bot reconciles exchange orders
+  before the market is queued for another placement attempt.
 - Up and Down are submitted in one batch. If only one is accepted, the bot
   immediately cancels it.
 - Entry and take-profit orders are ordinary GTC limits, so they do not depend on a
@@ -134,11 +136,8 @@ heartbeat. It does not change Polymarket's server-side cancellation deadline.
 - When `--heartbeat-seconds` is enabled, a dedicated thread sends independently
   of discovery and reconciliation. A failed heartbeat pauses new orders and
   Polymarket may cancel every open order for the account.
-- Farthest-first live runs record batch-book detection, order-submission duration,
-  and the aggregate queue already resting at the configured entry price.
-- A separate redemption thread scans every 30 minutes. It redeems only resolved
-  positions with positive current value, waits for relayer confirmation, and
-  never blindly retries an ambiguous or failed redemption in the same process.
+- Farthest-first live runs record Gamma discovery, CLOB parameter detection, and
+  order-submission timestamps.
 - When enabled, an expired heartbeat ID is replaced from the protocol's `400`
   response and retried once. Recovery triggers an immediate open-order
   reconciliation.
@@ -148,9 +147,9 @@ heartbeat. It does not change Polymarket's server-side cancellation deadline.
 - Ctrl+C cancels all open orders recorded by this bot. Every other shutdown path,
   including runtime failures and a completed `--hours` duration, leaves exchange
   orders open for the next run to reconcile.
-- Entry placement is attempted only once per market across all runs. A cancelled,
-  rejected, failed, or ambiguous entry pair is never submitted again because a
-  later order would lose the original queue position.
+- Explicitly rejected or partially accepted entry batches are not retried.
+  Order-engine-not-ready and reconciled ambiguous submissions remain eligible
+  until a complete Up/Down pair is accepted or the market ends.
 - The bot checks Polymarket geoblocking before and during live operation.
 - A local process lock prevents two bot instances from placing duplicate orders.
 - Runtime geoblock checks run outside the main loop. A temporary network failure
@@ -232,7 +231,7 @@ uv run --env-file .env.trading bot.py run --live `
 uv run pytest
 ```
 
-The bot records matched entry and exit sizes and redeems resolved winning
-positions through the configured Relayer credentials. A successful exit sale
-already returns pUSD immediately and therefore needs no redemption. Make sure
-the wallet has enough available pUSD for the orders you allow the bot to open.
+The bot records matched entry and exit sizes but does not redeem resolved
+positions. A successful exit sale returns pUSD immediately; resolved winnings
+are handled outside this process. Make sure the wallet has enough available
+pUSD for the orders you allow the bot to open.
