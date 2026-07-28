@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from decimal import Decimal
 
@@ -28,6 +29,17 @@ MARKET_NOT_READY = "the market is not yet ready to process new orders"
 ORDERBOOK_MISSING_PREFIX = "the orderbook "
 ORDERBOOK_MISSING_SUFFIX = " does not exist"
 TRANSIENT_RETRY_SECONDS = 0.03
+DUPLICATE_ORDER_PATTERN = re.compile(
+    r"\border\s+(0x[0-9a-f]{64})\s+is invalid\.\s*duplicated\.",
+    re.IGNORECASE,
+)
+
+
+def _duplicate_order_id(response: object) -> str | None:
+    if not isinstance(response, dict):
+        return None
+    match = DUPLICATE_ORDER_PATTERN.search(str(response.get("errorMsg") or ""))
+    return match.group(1) if match else None
 
 
 def _order_id(response: object) -> str | None:
@@ -35,12 +47,15 @@ def _order_id(response: object) -> str | None:
         return None
     return (
         response.get("orderID") or response.get("orderId") or response.get("order_id")
+        or _duplicate_order_id(response)
     )
 
 
 def _accepted(response: object) -> bool:
     if not isinstance(response, dict):
         return False
+    if _duplicate_order_id(response):
+        return True
     if response.get("success") is False:
         return False
     return bool(_order_id(response))
@@ -98,6 +113,7 @@ class Exchange:
             retry_on_error=False,
         )
         self.heartbeat_id = ""
+        self._dual_submissions: dict[tuple, list[PostOrdersV2Args]] = {}
 
     @staticmethod
     def geoblock() -> dict:
@@ -149,23 +165,29 @@ class Exchange:
             ("up", market.up_token_id),
             ("down", market.down_token_id),
         )
-        signed = []
-        for _, token_id in specifications:
-            order = self.client.create_order(
-                OrderArgs(
-                    token_id=token_id,
-                    price=float(price),
-                    size=float(size),
-                    side=Side.BUY,
-                ),
-                options,
-            )
-            signed.append(PostOrdersV2Args(order=order, orderType=OrderType.GTC))
+        submission_key = self._dual_submission_key(market, price=price, size=size)
+        submissions = self._dual_submission_cache()
+        signed = submissions.get(submission_key)
+        if signed is None:
+            signed = []
+            for _, token_id in specifications:
+                order = self.client.create_order(
+                    OrderArgs(
+                        token_id=token_id,
+                        price=float(price),
+                        size=float(size),
+                        side=Side.BUY,
+                    ),
+                    options,
+                )
+                signed.append(PostOrdersV2Args(order=order, orderType=OrderType.GTC))
+            submissions[submission_key] = signed
 
         try:
             responses = self.client.post_orders(signed, post_only=True)
         except PolyApiException as exc:
             if not _transient_submission_error(exc):
+                submissions.pop(submission_key, None)
                 raise
             time.sleep(TRANSIENT_RETRY_SECONDS)
             try:
@@ -198,19 +220,55 @@ class Exchange:
                 errors.append(str(response))
 
         if len(accepted) == 2:
+            submissions.pop(submission_key, None)
             return PlacementResult(tuple(accepted))
         if accepted:
             self.client.cancel_orders([order.order_id for order in accepted])
+            submissions.pop(submission_key, None)
         retryable = (
             not accepted
             and len(responses) == 2
             and all(_order_engine_not_ready(response) for response in responses)
         )
+        if not retryable:
+            submissions.pop(submission_key, None)
         return PlacementResult(
             tuple(accepted),
             "; ".join(errors) or "partial placement",
             retryable=retryable,
         )
+
+    @staticmethod
+    def _dual_submission_key(
+        market: Market,
+        *,
+        price: Decimal,
+        size: Decimal,
+    ) -> tuple:
+        return (
+            market.condition_id,
+            market.up_token_id,
+            market.down_token_id,
+            price,
+            size,
+        )
+
+    def _dual_submission_cache(self) -> dict[tuple, list[PostOrdersV2Args]]:
+        cache = getattr(self, "_dual_submissions", None)
+        if cache is None:
+            cache = {}
+            self._dual_submissions = cache
+        return cache
+
+    def _forget_dual_submission(
+        self,
+        market: Market,
+        *,
+        price: Decimal,
+        size: Decimal,
+    ) -> None:
+        key = self._dual_submission_key(market, price=price, size=size)
+        self._dual_submission_cache().pop(key, None)
 
     def reconcile_ambiguous_dual(
         self,
@@ -264,6 +322,7 @@ class Exchange:
                         role="entry",
                     )
                 )
+            self._forget_dual_submission(market, price=price, size=size)
             return PlacementResult(tuple(orders))
 
         found_ids = [
@@ -274,6 +333,11 @@ class Exchange:
         ]
         if found_ids:
             self.cancel_orders(found_ids)
+            self._forget_dual_submission(market, price=price, size=size)
+            return PlacementResult(
+                (),
+                "ambiguous submission produced a partial or duplicate order set",
+            )
         return PlacementResult(
             (),
             "ambiguous submission did not produce exactly two orders",

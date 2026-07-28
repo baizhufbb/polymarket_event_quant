@@ -68,6 +68,21 @@ class TransientRetryClient(FakeClient):
         return super().post_orders(signed, post_only=post_only)
 
 
+class SequencedClient(FakeClient):
+    def __init__(self, response_batches):
+        super().__init__([])
+        self.response_batches = list(response_batches)
+        self.posted_batches = []
+
+    def post_orders(self, signed, post_only=False):
+        assert post_only is True
+        self.posted_batches.append(tuple(signed))
+        response = self.response_batches.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
 def test_transient_batch_failure_reuses_the_same_signed_orders() -> None:
     exchange = Exchange.__new__(Exchange)
     exchange.client = TransientRetryClient(
@@ -83,6 +98,97 @@ def test_transient_batch_failure_reuses_the_same_signed_orders() -> None:
     assert len(exchange.client.posted_batches) == 2
     assert exchange.client.posted_batches[0][0] is exchange.client.posted_batches[1][0]
     assert exchange.client.posted_batches[0][1] is exchange.client.posted_batches[1][1]
+
+
+def test_market_retry_reuses_the_same_signed_orders() -> None:
+    not_ready = {
+        "success": True,
+        "orderID": "",
+        "errorMsg": "the market is not yet ready to process new orders",
+    }
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = SequencedClient(
+        [
+            [dict(not_ready), dict(not_ready)],
+            [
+                {"success": True, "orderID": "up-order", "status": "live"},
+                {"success": True, "orderID": "down-order", "status": "live"},
+            ],
+        ]
+    )
+
+    first = exchange.place_dual(
+        MARKET, price=Decimal("0.01"), size=Decimal("100")
+    )
+    second = exchange.place_dual(
+        MARKET, price=Decimal("0.01"), size=Decimal("100")
+    )
+
+    assert first.retryable
+    assert second.complete
+    assert len(exchange.client.created_order_args) == 2
+    assert exchange.client.posted_batches[0][0] is exchange.client.posted_batches[1][0]
+    assert exchange.client.posted_batches[0][1] is exchange.client.posted_batches[1][1]
+
+
+def test_ambiguous_retry_reuses_the_same_signed_orders() -> None:
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = SequencedClient(
+        [
+            PolyApiException(error_msg="Request exception!"),
+            PolyApiException(error_msg="Request exception!"),
+            [
+                {"success": True, "orderID": "up-order", "status": "live"},
+                {"success": True, "orderID": "down-order", "status": "live"},
+            ],
+        ]
+    )
+    exchange.open_orders = lambda condition_id: []
+
+    with pytest.raises(RuntimeError):
+        exchange.place_dual(MARKET, price=Decimal("0.01"), size=Decimal("100"))
+    reconciliation = exchange.reconcile_ambiguous_dual(
+        MARKET, price=Decimal("0.01"), size=Decimal("100")
+    )
+    result = exchange.place_dual(
+        MARKET, price=Decimal("0.01"), size=Decimal("100")
+    )
+
+    assert reconciliation.retryable
+    assert result.complete
+    assert len(exchange.client.created_order_args) == 2
+    assert all(
+        batch[0] is exchange.client.posted_batches[0][0]
+        and batch[1] is exchange.client.posted_batches[0][1]
+        for batch in exchange.client.posted_batches
+    )
+
+
+def test_duplicate_responses_recover_the_original_order_ids() -> None:
+    up_id = "0x" + "1" * 64
+    down_id = "0x" + "2" * 64
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = FakeClient(
+        [
+            {
+                "success": False,
+                "orderID": "",
+                "errorMsg": f"order {up_id} is invalid. Duplicated.",
+            },
+            {
+                "success": False,
+                "orderID": "",
+                "errorMsg": f"order {down_id} is invalid. Duplicated.",
+            },
+        ]
+    )
+
+    result = exchange.place_dual(
+        MARKET, price=Decimal("0.01"), size=Decimal("100")
+    )
+
+    assert result.complete
+    assert {order.order_id for order in result.orders} == {up_id, down_id}
 
 
 def test_business_rejection_exception_is_not_retried() -> None:
