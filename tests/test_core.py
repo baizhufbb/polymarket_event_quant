@@ -108,6 +108,22 @@ def test_run_limits_are_optional_cli_parameters() -> None:
     assert reverse.cancel_before_end_seconds == 0
     assert reverse.heartbeat_seconds == Decimal("5")
 
+    next_market_only = _parser().parse_args(
+        [
+            "run",
+            "--buy-price",
+            "0.01",
+            "--usd-per-side",
+            "1",
+            "--lookahead-minutes",
+            "0",
+            "--placement-order",
+            "farthest-first",
+        ]
+    )
+    assert next_market_only.lookahead_minutes == 0
+    assert next_market_only.placement_order == "farthest-first"
+
 
 def test_parse_market() -> None:
     event = {

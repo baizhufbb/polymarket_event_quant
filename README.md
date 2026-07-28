@@ -219,6 +219,12 @@ uv run --env-file .env.trading bot.py run --live `
   --lookahead-minutes 40 --placement-order farthest-first `
   --cancel-before-end-seconds 2
 
+# Skip existing markets and begin with the next newly announced farthest market.
+uv run --env-file .env.trading bot.py run --live `
+  --buy-price 0.01 --usd-per-side 1 `
+  --lookahead-minutes 0 --placement-order farthest-first `
+  --cancel-before-end-seconds 0
+
 # Run with explicit optional limits.
 uv run --env-file .env.trading bot.py run --live `
   --buy-price 0.01 --usd-per-side 1 `

@@ -241,3 +241,37 @@ def test_discovery_advances_only_when_the_next_slug_exists() -> None:
         NEWER.slug,
         next_market.slug,
     )
+
+
+def test_zero_window_seeds_cursor_without_registering_existing_market() -> None:
+    activation = MarketActivationWorker(
+        window_minutes=0,
+        farthest_first=True,
+    )
+    next_slug = f"btc-updown-5m-{NEWER.start_ts + MARKET_SECONDS}"
+    next_market = Market(
+        slug=next_slug,
+        condition_id="next",
+        start_ts=NEWER.start_ts + MARKET_SECONDS,
+        end_ts=NEWER.end_ts + MARKET_SECONDS,
+        up_token_id="next-up",
+        down_token_id="next-down",
+        min_size=NEWER.min_size,
+        tick_size=NEWER.tick_size,
+    )
+    activation.discovery = Discovery([NEWER], {next_slug: next_market})
+
+    activation._poll_discovery()
+
+    assert activation.discovery.discover_calls == [
+        (
+            5,
+            {
+                "farthest_first": True,
+                "timeout": 5,
+                "fresh": True,
+            },
+        )
+    ]
+    assert tuple(activation._candidates) == (next_market.slug,)
+    assert NEWER.slug not in activation._handled_slugs

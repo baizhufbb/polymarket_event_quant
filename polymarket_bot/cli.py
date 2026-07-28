@@ -68,7 +68,15 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--hours", type=_decimal_arg)
     run.add_argument("--max-reserved-usd", type=_decimal_arg)
     run.add_argument("--max-daily-filled-cost", type=_decimal_arg)
-    run.add_argument("--lookahead-minutes", type=int, default=40)
+    run.add_argument(
+        "--lookahead-minutes",
+        type=int,
+        default=40,
+        help=(
+            "startup placement window; with farthest-first, 0 skips all "
+            "existing markets and starts with the next newly announced market"
+        ),
+    )
     run.add_argument("--cancel-before-end-seconds", type=int, default=2)
     run.add_argument(
         "--heartbeat-seconds",
@@ -137,8 +145,15 @@ def main() -> None:
         for name, value in optional_positive.items():
             if value is not None and value <= 0:
                 raise SystemExit(f"{name} must be positive when provided")
-        if args.lookahead_minutes <= 0:
-            raise SystemExit("--lookahead-minutes must be positive")
+        if args.lookahead_minutes < 0:
+            raise SystemExit("--lookahead-minutes cannot be negative")
+        if (
+            args.lookahead_minutes == 0
+            and args.placement_order != "farthest-first"
+        ):
+            raise SystemExit(
+                "--lookahead-minutes 0 requires --placement-order farthest-first"
+            )
         if args.cancel_before_end_seconds < 0:
             raise SystemExit("--cancel-before-end-seconds cannot be negative")
         if args.heartbeat_seconds is not None and not (

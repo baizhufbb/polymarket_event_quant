@@ -143,15 +143,17 @@ class MarketActivationWorker:
 
     def _poll_discovery(self) -> None:
         if self._next_start_ts is None:
+            seed_only = self.window_minutes == 0
             markets = self.discovery.discover(
-                self.window_minutes,
+                max(self.window_minutes, MARKET_SECONDS // 60),
                 farthest_first=self.farthest_first,
                 timeout=5,
                 fresh=True,
             )
             if not markets:
                 raise RuntimeError("Gamma returned no BTC five-minute market")
-            self._register_candidates(markets)
+            if not seed_only:
+                self._register_candidates(markets)
             self._next_start_ts = (
                 max(market.start_ts for market in markets) + MARKET_SECONDS
             )
