@@ -87,7 +87,11 @@ def test_setup_apply_persists_runtime_values_without_printing_secrets(
     monkeypatch.setattr(
         setup_mod,
         "_get_json",
-        lambda url: {"blocked": False} if "geoblock" in url else {},
+        lambda url: (
+            {"blocked": True, "country": "IE", "region": "L"}
+            if "geoblock" in url
+            else {}
+        ),
     )
     monkeypatch.setattr(
         setup_mod,
@@ -116,6 +120,20 @@ def test_setup_apply_persists_runtime_values_without_printing_secrets(
     assert values["POLYMARKET_CLOB_API_KEY"] == "clob-key"
     assert values["POLYMARKET_CLOB_API_SECRET"] == "clob-secret"
     assert values["POLYMARKET_CLOB_API_PASSPHRASE"] == "clob-passphrase"
+
+
+def test_setup_apply_rejects_api_restricted_country(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        setup_mod,
+        "_get_json",
+        lambda _: {"blocked": True, "country": "US", "region": "NY"},
+    )
+
+    with pytest.raises(RuntimeError, match="network location is blocked"):
+        setup_mod.setup_wallet(_config(tmp_path), apply=True)
 
 
 def test_setup_apply_rejects_relayer_key_for_another_address(

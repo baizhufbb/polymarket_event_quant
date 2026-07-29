@@ -9,6 +9,7 @@ from eth_account import Account
 from polymarket import ApiKeyCreds, RelayerApiKey, SecureClient
 
 from .config import SetupConfig
+from .geoblock import is_api_trading_blocked
 
 
 CHAIN_ID = 137
@@ -135,7 +136,7 @@ def setup_wallet(config: SetupConfig, *, apply: bool) -> dict[str, Any]:
             "for Deposit Wallet setup"
         )
     geoblock = _get_json(GEOBLOCK_URL)
-    if geoblock.get("blocked") is True:
+    if is_api_trading_blocked(geoblock):
         raise RuntimeError("Polymarket reports that this network location is blocked")
     deposit_asset = _polygon_usdc()
 

@@ -1,4 +1,6 @@
-from polymarket_bot.geoblock import GeoblockWorker
+import pytest
+
+from polymarket_bot.geoblock import GeoblockWorker, is_api_trading_blocked
 
 
 class FakeExchange:
@@ -41,3 +43,22 @@ def test_explicit_block_never_becomes_healthy() -> None:
     assert update.available
     assert update.blocked
     assert not worker.healthy
+
+
+@pytest.mark.parametrize("country", ["IE", "JP", "MT", "NL"])
+def test_frontend_only_country_keeps_api_trading_healthy(country: str) -> None:
+    result = {"blocked": True, "country": country, "region": ""}
+    worker = GeoblockWorker(
+        FakeExchange([result]), interval_seconds=300, retry_seconds=5
+    )
+
+    update = worker.run_once()
+
+    assert update.available
+    assert not update.blocked
+    assert worker.healthy
+    assert update.result == result
+
+
+def test_unknown_blocked_country_remains_api_blocked() -> None:
+    assert is_api_trading_blocked({"blocked": True, "country": "XX"})

@@ -6,6 +6,16 @@ from threading import Event, Thread
 from typing import Protocol
 
 
+API_UNRESTRICTED_FRONTEND_ONLY_COUNTRIES = frozenset({"IE", "JP", "MT", "NL"})
+
+
+def is_api_trading_blocked(result: dict) -> bool:
+    if result.get("blocked") is not True:
+        return False
+    country = str(result.get("country") or "").upper()
+    return country not in API_UNRESTRICTED_FRONTEND_ONLY_COUNTRIES
+
+
 class GeoblockExchange(Protocol):
     def geoblock(self) -> dict: ...
 
@@ -80,7 +90,7 @@ class GeoblockWorker:
                 error=f"{type(exc).__name__}: {exc}",
             )
         else:
-            blocked = result.get("blocked") is True
+            blocked = is_api_trading_blocked(result)
             if blocked:
                 self._healthy.clear()
             else:
