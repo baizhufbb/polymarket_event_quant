@@ -76,11 +76,11 @@ The live farthest-first path runs in this order:
    The service validates eligibility, database uniqueness, tick size, minimum
    size, and optional limits.
 4. The exchange signs Up and Down locally and submits both in one authenticated
-   post-only batch. If both sides return no order IDs and explicitly report
-   either that the market is not ready or that the new order books do not yet
-   exist, the market returns to the 250-millisecond CLOB parameter poll and
-   repeats until accepted or expired. Other failures are not treated as
-   readiness signals. If exactly one side is accepted, it is canceled.
+   post-only batch. An explicit engine-readiness rejection (`invalid token id`,
+   `market not found`, market not ready, or missing order books) preserves the
+   signed pair and immediately retries from the main loop without another
+   parameter request or an added delay. Ambiguous network failures are
+   reconciled before retrying. If exactly one side is accepted, it is canceled.
 5. Accepted market and order IDs are committed to SQLite. The user WebSocket
    and REST reconciliation then maintain fills and terminal states.
 6. In buy-only mode, matched shares are held through resolution. With

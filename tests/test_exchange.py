@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from polymarket_bot.exchange import Exchange
-from polymarket_bot.models import Market
+from polymarket_bot.models import Market, PlacementResult
 from py_clob_client_v2 import Side
 from py_clob_client_v2.exceptions import PolyApiException
 
@@ -83,6 +83,11 @@ class SequencedClient(FakeClient):
         return response
 
 
+def api_error(status_code: int, message: str) -> PolyApiException:
+    response = httpx.Response(status_code, json={"error": message})
+    return PolyApiException(response)
+
+
 def test_transient_batch_failure_reuses_the_same_signed_orders() -> None:
     exchange = Exchange.__new__(Exchange)
     exchange.client = TransientRetryClient(
@@ -129,6 +134,69 @@ def test_market_retry_reuses_the_same_signed_orders() -> None:
     assert len(exchange.client.created_order_args) == 2
     assert exchange.client.posted_batches[0][0] is exchange.client.posted_batches[1][0]
     assert exchange.client.posted_batches[0][1] is exchange.client.posted_batches[1][1]
+
+
+@pytest.mark.parametrize(
+    ("status_code", "message"),
+    ((400, "invalid token id"), (404, "market not found")),
+)
+def test_explicit_engine_rejection_reuses_the_same_signed_orders(
+    status_code: int,
+    message: str,
+) -> None:
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = SequencedClient(
+        [
+            api_error(status_code, message),
+            [
+                {"success": True, "orderID": "up-order", "status": "live"},
+                {"success": True, "orderID": "down-order", "status": "live"},
+            ],
+        ]
+    )
+
+    first = exchange.place_dual(
+        MARKET, price=Decimal("0.01"), size=Decimal("100")
+    )
+    second = exchange.place_dual(
+        MARKET, price=Decimal("0.01"), size=Decimal("100")
+    )
+
+    assert first == PlacementResult((), message, retryable=True)
+    assert second.complete
+    assert len(exchange.client.created_order_args) == 2
+    assert exchange.client.posted_batches[0][0] is exchange.client.posted_batches[1][0]
+    assert exchange.client.posted_batches[0][1] is exchange.client.posted_batches[1][1]
+
+
+def test_engine_rejection_after_transient_failure_stays_retryable() -> None:
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = SequencedClient(
+        [
+            PolyApiException(error_msg="Request exception!"),
+            api_error(400, "invalid token id"),
+            [
+                {"success": True, "orderID": "up-order", "status": "live"},
+                {"success": True, "orderID": "down-order", "status": "live"},
+            ],
+        ]
+    )
+
+    first = exchange.place_dual(
+        MARKET, price=Decimal("0.01"), size=Decimal("100")
+    )
+    second = exchange.place_dual(
+        MARKET, price=Decimal("0.01"), size=Decimal("100")
+    )
+
+    assert first == PlacementResult((), "invalid token id", retryable=True)
+    assert second.complete
+    assert len(exchange.client.created_order_args) == 2
+    assert all(
+        batch[0] is exchange.client.posted_batches[0][0]
+        and batch[1] is exchange.client.posted_batches[0][1]
+        for batch in exchange.client.posted_batches
+    )
 
 
 def test_ambiguous_retry_reuses_the_same_signed_orders() -> None:

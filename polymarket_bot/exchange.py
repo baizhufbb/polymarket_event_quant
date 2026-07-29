@@ -28,6 +28,10 @@ TOKEN_SCALE = Decimal("1000000")
 MARKET_NOT_READY = "the market is not yet ready to process new orders"
 ORDERBOOK_MISSING_PREFIX = "the orderbook "
 ORDERBOOK_MISSING_SUFFIX = " does not exist"
+ORDER_ENGINE_NOT_READY_ERRORS = {
+    (400, "invalid token id"),
+    (404, "market not found"),
+}
 TRANSIENT_RETRY_SECONDS = 0.03
 DUPLICATE_ORDER_PATTERN = re.compile(
     r"\border\s+(0x[0-9a-f]{64})\s+is invalid\.\s*duplicated\.",
@@ -74,6 +78,16 @@ def _order_engine_not_ready(response: object) -> bool:
 def _transient_submission_error(error: PolyApiException) -> bool:
     status = error.status_code
     return status is None or 500 <= status < 600
+
+
+def _order_engine_not_ready_error(error: PolyApiException) -> str | None:
+    payload = error.error_msg
+    if not isinstance(payload, dict):
+        return None
+    message = str(payload.get("error") or "").lower()
+    if (error.status_code, message) not in ORDER_ENGINE_NOT_READY_ERRORS:
+        return None
+    return message
 
 
 def _heartbeat_id(payload: object) -> str | None:
@@ -186,6 +200,9 @@ class Exchange:
         try:
             responses = self.client.post_orders(signed, post_only=True)
         except PolyApiException as exc:
+            not_ready_error = _order_engine_not_ready_error(exc)
+            if not_ready_error:
+                return PlacementResult((), not_ready_error, retryable=True)
             if not _transient_submission_error(exc):
                 submissions.pop(submission_key, None)
                 raise
@@ -193,6 +210,10 @@ class Exchange:
             try:
                 responses = self.client.post_orders(signed, post_only=True)
             except Exception as retry_exc:
+                if isinstance(retry_exc, PolyApiException):
+                    not_ready_error = _order_engine_not_ready_error(retry_exc)
+                    if not_ready_error:
+                        return PlacementResult((), not_ready_error, retryable=True)
                 raise RuntimeError(
                     f"transient submission retry failed: "
                     f"initial={exc}; retry={type(retry_exc).__name__}: {retry_exc}"

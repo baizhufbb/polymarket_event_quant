@@ -250,16 +250,15 @@ def test_order_engine_not_ready_requeues_until_pair_is_accepted(tmp_path) -> Non
     with BotDatabase(tmp_path / "bot.sqlite") as database:
         run_id = database.start_run("live")
         exchange = RetryPlacementExchange()
-        requeued = []
         service = BotService.__new__(BotService)
         service.database = database
         service.plan = TradePlan(Decimal("0.01"), (), Decimal("1"))
         service.max_reserved_usd = None
         service.max_daily_filled_cost = None
         service.exchange = exchange
-        service.market_activation_worker = SimpleNamespace(
-            requeue=lambda market, **kwargs: requeued.append((market, kwargs)) or True
-        )
+        service.market_activation_worker = SimpleNamespace()
+        service.activation_market_updates = []
+        service.wake_event = Event()
         service.run_id = run_id
         service.run_started_ts = 0
         service.live = True
@@ -282,20 +281,16 @@ def test_order_engine_not_ready_requeues_until_pair_is_accepted(tmp_path) -> Non
         ).fetchone()
         assert row["state"] == "waiting_for_order_engine"
         assert database.can_start_entry_plan(MARKET.slug)
-        assert requeued == [
-            (
-                MARKET,
-                {"market_discovered_ts_ms": 1_999_999_000_000},
+        assert service.wake_event.is_set()
+        assert service.activation_market_updates == [
+            MarketActivationUpdate(
+                market=MARKET,
+                market_discovered_ts_ms=1_999_999_000_000,
+                market_parameters_detected_ts_ms=1_999_999_000_125,
             )
         ]
 
-        service._consider_market(
-            MARKET,
-            now_ts=1_999_999_000,
-            trigger="market_parameters_activation",
-            orderbook_ready=True,
-            trigger_details=details,
-        )
+        service._place_activated_markets()
 
         row = database.connection.execute(
             "SELECT state FROM markets WHERE slug=?", (MARKET.slug,)
@@ -315,16 +310,15 @@ def test_ambiguous_submission_requeues_and_records_original_error(tmp_path) -> N
     with BotDatabase(tmp_path / "bot.sqlite") as database:
         run_id = database.start_run("live")
         exchange = AmbiguousRetryPlacementExchange()
-        requeued = []
         service = BotService.__new__(BotService)
         service.database = database
         service.plan = TradePlan(Decimal("0.01"), (), Decimal("1"))
         service.max_reserved_usd = None
         service.max_daily_filled_cost = None
         service.exchange = exchange
-        service.market_activation_worker = SimpleNamespace(
-            requeue=lambda market, **kwargs: requeued.append(market.slug) or True
-        )
+        service.market_activation_worker = SimpleNamespace()
+        service.activation_market_updates = []
+        service.wake_event = Event()
         service.run_id = run_id
         service.run_started_ts = 0
         service.live = True
@@ -335,6 +329,10 @@ def test_ambiguous_submission_requeues_and_records_original_error(tmp_path) -> N
             now_ts=1_999_999_000,
             trigger="market_parameters_activation",
             orderbook_ready=True,
+            trigger_details={
+                "market_discovered_ts_ms": 1_999_999_000_000,
+                "market_parameters_detected_ts_ms": 1_999_999_000_125,
+            },
         )
 
         event = database.connection.execute(
@@ -345,15 +343,11 @@ def test_ambiguous_submission_requeues_and_records_original_error(tmp_path) -> N
             """,
             (MARKET.slug,),
         ).fetchone()
-        assert requeued == [MARKET.slug]
+        assert service.wake_event.is_set()
+        assert len(service.activation_market_updates) == 1
         assert "RuntimeError: network interrupted" in event["details_json"]
 
-        service._consider_market(
-            MARKET,
-            now_ts=1_999_999_000,
-            trigger="market_parameters_activation",
-            orderbook_ready=True,
-        )
+        service._place_activated_markets()
 
         state = database.connection.execute(
             "SELECT state FROM markets WHERE slug=?", (MARKET.slug,)

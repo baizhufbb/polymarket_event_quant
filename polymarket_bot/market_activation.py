@@ -109,24 +109,6 @@ class MarketActivationWorker:
             except Empty:
                 return updates
 
-    def requeue(
-        self,
-        market: Market,
-        *,
-        market_discovered_ts_ms: int,
-    ) -> bool:
-        now_ts = int(time.time())
-        with self._candidate_lock:
-            if self._stop.is_set() or market.end_ts <= now_ts:
-                self._candidates.pop(market.slug, None)
-                self._handled_slugs.add(market.slug)
-                return False
-            self._handled_slugs.discard(market.slug)
-            self._candidates[market.slug] = _Candidate(
-                market, market_discovered_ts_ms
-            )
-        return True
-
     def _run_discovery(self) -> None:
         while not self._stop.is_set():
             started = time.monotonic()

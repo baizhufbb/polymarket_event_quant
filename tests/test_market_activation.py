@@ -153,25 +153,6 @@ def test_incomplete_clob_parameters_remain_pending() -> None:
     assert activation.drain() == []
 
 
-def test_retryable_market_returns_to_parameter_polling() -> None:
-    activation = worker()
-    activation._register_candidates([ACTIVE])
-    activation.market_session.close()
-    activation.market_session = MarketSession([Response(market_payload(ACTIVE))])
-    activation._poll_market_parameters()
-    activation.drain()
-
-    assert activation.requeue(
-        ACTIVE, market_discovered_ts_ms=1_999_999_000_000
-    )
-    assert tuple(activation._candidates) == (ACTIVE.slug,)
-    assert ACTIVE.slug not in activation._handled_slugs
-    assert (
-        activation._candidates[ACTIVE.slug].market_discovered_ts_ms
-        == 1_999_999_000_000
-    )
-
-
 def test_out_of_order_activation_keeps_each_market_independent() -> None:
     activation = worker()
     activation._register_candidates([ACTIVE, FUTURE, NEWER])

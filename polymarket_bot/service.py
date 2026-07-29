@@ -701,11 +701,18 @@ class BotService:
             if (
                 result.retryable
                 and self.market_activation_worker
-                and self.market_activation_worker.requeue(
-                    market,
-                    market_discovered_ts_ms=discovered_ts_ms,
-                )
+                and trigger_details
             ):
+                self.activation_market_updates.append(
+                    MarketActivationUpdate(
+                        market=market,
+                        market_discovered_ts_ms=discovered_ts_ms,
+                        market_parameters_detected_ts_ms=trigger_details[
+                            "market_parameters_detected_ts_ms"
+                        ],
+                    )
+                )
+                self.wake_event.set()
                 self.database.set_market_state(
                     market.slug, "waiting_for_order_engine", result.error
                 )
