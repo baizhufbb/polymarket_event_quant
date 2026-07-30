@@ -1,10 +1,18 @@
+import json
 import logging
+import time
 from decimal import Decimal
 
 from polymarket.models.clob.user_events import UserOrderEvent, UserTradeEvent
 
 from polymarket_bot.database import BotDatabase
-from polymarket_bot.models import ExitTarget, Market, PlacedOrder, TradePlan
+from polymarket_bot.models import (
+    ExitTarget,
+    Market,
+    PlacedOrder,
+    PlacementResult,
+    TradePlan,
+)
 from polymarket_bot.service import BotService
 from polymarket_bot.user_stream import (
     UserOrderUpdate,
@@ -57,7 +65,14 @@ class ExitExchange:
         )
 
 
-def _order_event(*, event_type: str, status: str, matched: str) -> UserOrderEvent:
+def _order_event(
+    *,
+    event_type: str,
+    status: str,
+    matched: str,
+    timestamp: str | None = None,
+    created_at: str | None = None,
+) -> UserOrderEvent:
     return UserOrderEvent.model_validate(
         {
             "topic": "user",
@@ -73,6 +88,8 @@ def _order_event(*, event_type: str, status: str, matched: str) -> UserOrderEven
                 "price": "0.01",
                 "type": event_type,
                 "status": status,
+                "timestamp": timestamp,
+                "created_at": created_at,
             },
         }
     )
@@ -128,6 +145,26 @@ def test_normalize_order_marks_full_match_and_cancellation_terminal() -> None:
     assert filled.status == "filled"
     assert cancelled.status == "cancelled"
     assert cancelled.matched_size == Decimal("25")
+
+
+def test_normalize_order_records_placement_timestamps() -> None:
+    before = time.time_ns() // 1_000_000
+    update = UserStreamWorker._normalize_order(
+        _order_event(
+            event_type="PLACEMENT",
+            status="LIVE",
+            matched="0",
+            timestamp="2000000000123",
+            created_at="2000000000",
+        )
+    )
+    after = time.time_ns() // 1_000_000
+
+    assert update.event_type == "PLACEMENT"
+    assert update.exchange_event_ts_ms == 2_000_000_000_123
+    assert update.exchange_created_ts_ms == 2_000_000_000_000
+    assert update.received_ts_ms is not None
+    assert before <= update.received_ts_ms <= after
 
 
 def test_normalize_trade_includes_maker_order_and_status() -> None:
@@ -188,6 +225,76 @@ def test_stream_fill_places_exit_without_waiting_for_rest_poll(tmp_path) -> None
         row = database.order("up-order")
         assert row["matched_size"] == "25"
         assert database.order("up-exit") is not None
+
+
+def test_placement_event_queued_during_http_submission_is_recorded(tmp_path) -> None:
+    class PlacementStream(FakeUserStream):
+        def __init__(self):
+            super().__init__([])
+
+    class PlacementExchange:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def place_dual(self, market, *, price, size):
+            received_ts_ms = time.time_ns() // 1_000_000
+            self.stream.updates.extend(
+                UserOrderUpdate(
+                    order_id=f"{outcome}-order",
+                    status="live",
+                    matched_size=Decimal("0"),
+                    raw={"source": "user_ws"},
+                    event_type="PLACEMENT",
+                    exchange_event_ts_ms=received_ts_ms - 1,
+                    exchange_created_ts_ms=received_ts_ms - 2,
+                    received_ts_ms=received_ts_ms,
+                )
+                for outcome in ("up", "down")
+            )
+            return PlacementResult(
+                tuple(
+                    PlacedOrder(
+                        order_id=f"{outcome}-order",
+                        outcome=outcome,
+                        token_id=getattr(market, f"{outcome}_token_id"),
+                        price=price,
+                        size=size,
+                        status="live",
+                        raw={},
+                    )
+                    for outcome in ("up", "down")
+                )
+            )
+
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        run_id = database.start_run("live")
+        stream = PlacementStream()
+        service = BotService.__new__(BotService)
+        service.database = database
+        service.exchange = PlacementExchange(stream)
+        service.run_id = run_id
+        service.plan = TradePlan(Decimal("0.01"), (), Decimal("1"))
+        service.live = True
+        service.logger = logging.getLogger("test")
+        service.user_stream_worker = stream
+
+        service._place(MARKET, trigger="test")
+        service._drain_user_stream_updates()
+
+        events = database.connection.execute(
+            """
+            SELECT slug, details_json
+            FROM events
+            WHERE event_type='order_placement_observed'
+            ORDER BY id
+            """
+        ).fetchall()
+        assert len(events) == 2
+        assert {json.loads(row["details_json"])["order_id"] for row in events} == {
+            "up-order",
+            "down-order",
+        }
+        assert all(row["slug"] == MARKET.slug for row in events)
 
 
 def test_matched_order_waits_when_conditional_tokens_are_not_settled(tmp_path) -> None:

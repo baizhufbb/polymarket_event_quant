@@ -404,6 +404,19 @@ class BotService:
                 matched_size=update.matched_size,
                 raw=update.raw,
             )
+            if update.event_type == "PLACEMENT":
+                self.database.event(
+                    self.run_id,
+                    "INFO",
+                    "order_placement_observed",
+                    slug=row["slug"],
+                    details={
+                        "order_id": update.order_id,
+                        "exchange_event_ts_ms": update.exchange_event_ts_ms,
+                        "exchange_created_ts_ms": update.exchange_created_ts_ms,
+                        "user_stream_received_ts_ms": update.received_ts_ms,
+                    },
+                )
             if row["role"] == "entry" and update.matched_size > previous_matched:
                 order_changed = True
 

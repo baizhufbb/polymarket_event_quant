@@ -22,6 +22,10 @@ class UserOrderUpdate:
     status: str
     matched_size: Decimal
     raw: dict
+    event_type: str | None = None
+    exchange_event_ts_ms: int | None = None
+    exchange_created_ts_ms: int | None = None
+    received_ts_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -189,6 +193,18 @@ class UserStreamWorker:
             status=status,
             matched_size=matched_size,
             raw=event.model_dump(mode="json", by_alias=True),
+            event_type=payload.order_event_type,
+            exchange_event_ts_ms=(
+                int(payload.timestamp.timestamp() * 1000)
+                if payload.timestamp is not None
+                else None
+            ),
+            exchange_created_ts_ms=(
+                int(payload.created_at.timestamp() * 1000)
+                if payload.created_at is not None
+                else None
+            ),
+            received_ts_ms=time.time_ns() // 1_000_000,
         )
 
     @staticmethod
