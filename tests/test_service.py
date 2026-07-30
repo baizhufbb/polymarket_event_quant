@@ -1,3 +1,4 @@
+import json
 import logging
 from decimal import Decimal
 from threading import Event
@@ -76,13 +77,14 @@ class PendingBookExchange(FakeExchange):
 
 
 class RetryPlacementExchange(FakeExchange):
-    def __init__(self):
+    def __init__(self, failures=1):
         super().__init__()
         self.place_calls = 0
+        self.failures = failures
 
     def place_dual(self, market, *, price, size):
         self.place_calls += 1
-        if self.place_calls == 1:
+        if self.place_calls <= self.failures:
             return PlacementResult(
                 (),
                 "the market is not yet ready to process new orders",
@@ -258,6 +260,7 @@ def test_order_engine_not_ready_requeues_until_pair_is_accepted(tmp_path) -> Non
         service.exchange = exchange
         service.market_activation_worker = SimpleNamespace()
         service.activation_market_updates = []
+        service._order_engine_waits = {}
         service.wake_event = Event()
         service.run_id = run_id
         service.run_started_ts = 0
@@ -318,6 +321,7 @@ def test_ambiguous_submission_requeues_and_records_original_error(tmp_path) -> N
         service.exchange = exchange
         service.market_activation_worker = SimpleNamespace()
         service.activation_market_updates = []
+        service._order_engine_waits = {}
         service.wake_event = Event()
         service.run_id = run_id
         service.run_started_ts = 0
@@ -354,6 +358,67 @@ def test_ambiguous_submission_requeues_and_records_original_error(tmp_path) -> N
         ).fetchone()["state"]
         assert state == "active"
         assert exchange.place_calls == 2
+
+
+def test_order_engine_wait_records_only_first_retry_and_final_summary(
+    tmp_path,
+) -> None:
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        run_id = database.start_run("live")
+        exchange = RetryPlacementExchange(failures=3)
+        service = BotService.__new__(BotService)
+        service.database = database
+        service.plan = TradePlan(Decimal("0.01"), (), Decimal("1"))
+        service.max_reserved_usd = None
+        service.max_daily_filled_cost = None
+        service.exchange = exchange
+        service.market_activation_worker = SimpleNamespace()
+        service.activation_market_updates = []
+        service._order_engine_waits = {}
+        service.wake_event = Event()
+        service.run_id = run_id
+        service.run_started_ts = 0
+        service.live = True
+        service.logger = logging.getLogger("test")
+        details = {
+            "market_discovered_ts_ms": 1_999_999_000_000,
+            "market_parameters_detected_ts_ms": 1_999_999_000_125,
+        }
+
+        service._consider_market(
+            MARKET,
+            now_ts=1_999_999_000,
+            trigger="market_parameters_activation",
+            orderbook_ready=True,
+            trigger_details=details,
+        )
+        service._place_activated_markets()
+        service._place_activated_markets()
+        service._place_activated_markets()
+
+        waiting_events = database.connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM events
+            WHERE slug=? AND event_type='placement_waiting_for_engine'
+            """,
+            (MARKET.slug,),
+        ).fetchone()[0]
+        placed_details = json.loads(
+            database.connection.execute(
+                """
+                SELECT details_json
+                FROM events
+                WHERE slug=? AND event_type='dual_orders_placed'
+                """,
+                (MARKET.slug,),
+            ).fetchone()[0]
+        )
+
+        assert exchange.place_calls == 4
+        assert waiting_events == 1
+        assert placed_details["order_engine_not_ready_attempts"] == 3
+        assert placed_details["local_gap_before_acceptance_ms"] >= 0
 
 
 def test_activation_worker_owns_continuous_gamma_discovery() -> None:

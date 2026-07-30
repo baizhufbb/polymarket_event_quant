@@ -15,6 +15,14 @@ from .service import BotService
 from .setup import setup_wallet
 
 
+class _ExpectedOrderEngineFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name != "py_clob_client_v2.http_helpers.helpers":
+            return True
+        message = record.getMessage().lower()
+        return "invalid token id" not in message and "market not found" not in message
+
+
 def _decimal_arg(value: str) -> Decimal:
     try:
         parsed = Decimal(value)
@@ -109,6 +117,8 @@ def _logger(config: BotConfig) -> logging.Logger:
     file_handler.setFormatter(formatter)
     logger.addHandler(console)
     logger.addHandler(file_handler)
+    clob_logger = logging.getLogger("py_clob_client_v2.http_helpers.helpers")
+    clob_logger.addFilter(_ExpectedOrderEngineFilter())
     return logger
 
 

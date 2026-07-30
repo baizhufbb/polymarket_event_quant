@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass
 from decimal import Decimal
 from threading import Event
 
@@ -32,6 +33,13 @@ TERMINAL_ORDER_STATES = {
     "failed",
     "terminal_unknown",
 }
+
+
+@dataclass
+class _OrderEngineWait:
+    attempts: int
+    first_started_ts_ms: int
+    last_finished_ts_ms: int
 
 
 def _classify_cancel_result(result: object) -> tuple[list[str], list[str]]:
@@ -113,6 +121,7 @@ class BotService:
             ReconciliationWorker(self.exchange) if self.exchange else None
         )
         self.activation_market_updates: list[MarketActivationUpdate] = []
+        self._order_engine_waits: dict[str, _OrderEngineWait] = {}
         self.run_id = 0
         self.run_started_ts = int(time.time())
         self.last_discovery = 0.0
@@ -618,7 +627,9 @@ class BotService:
         trigger: str,
         trigger_details: dict | None = None,
     ) -> None:
-        self.database.prepare_market(self.run_id, market)
+        engine_wait = self._order_engine_waits.get(market.slug)
+        if engine_wait is None:
+            self.database.prepare_market(self.run_id, market)
         if not self.live:
             for outcome, token_id in (
                 ("up", market.up_token_id),
@@ -660,6 +671,7 @@ class BotService:
                     size=self.plan.order_size,
                 )
             except Exception as reconcile_exc:
+                self._order_engine_waits.pop(market.slug, None)
                 error = (
                     f"submission={submission_error}; reconciliation="
                     f"{type(reconcile_exc).__name__}: {reconcile_exc}"
@@ -687,9 +699,25 @@ class BotService:
         }
         if submission_error:
             placement_details["submission_error"] = submission_error
+        if engine_wait is not None:
+            placement_details.update(
+                {
+                    "order_engine_not_ready_attempts": engine_wait.attempts,
+                    "order_engine_wait_started_ts_ms": (
+                        engine_wait.first_started_ts_ms
+                    ),
+                    "order_engine_last_rejected_ts_ms": (
+                        engine_wait.last_finished_ts_ms
+                    ),
+                    "local_gap_before_acceptance_ms": (
+                        placement_started_ts_ms - engine_wait.last_finished_ts_ms
+                    ),
+                }
+            )
         for order in result.orders:
             self.database.add_order(self.run_id, market.slug, order)
         if result.complete:
+            self._order_engine_waits.pop(market.slug, None)
             self.database.set_market_state(market.slug, "active")
             self.database.event(
                 self.run_id,
@@ -716,6 +744,33 @@ class BotService:
                 and self.market_activation_worker
                 and trigger_details
             ):
+                if engine_wait is None:
+                    engine_wait = _OrderEngineWait(
+                        attempts=1,
+                        first_started_ts_ms=placement_started_ts_ms,
+                        last_finished_ts_ms=placement_finished_ts_ms,
+                    )
+                    self._order_engine_waits[market.slug] = engine_wait
+                    self.database.set_market_state(
+                        market.slug, "waiting_for_order_engine", result.error
+                    )
+                    self.database.event(
+                        self.run_id,
+                        "INFO",
+                        "placement_waiting_for_engine",
+                        slug=market.slug,
+                        details={
+                            "error": result.error,
+                            **placement_details,
+                        },
+                    )
+                    self.logger.info(
+                        "LIVE %s: order engine not ready; retrying",
+                        market.slug,
+                    )
+                else:
+                    engine_wait.attempts += 1
+                    engine_wait.last_finished_ts_ms = placement_finished_ts_ms
                 self.activation_market_updates.append(
                     MarketActivationUpdate(
                         market=market,
@@ -726,23 +781,8 @@ class BotService:
                     )
                 )
                 self.wake_event.set()
-                self.database.set_market_state(
-                    market.slug, "waiting_for_order_engine", result.error
-                )
-                self.database.event(
-                    self.run_id,
-                    "INFO",
-                    "placement_waiting_for_engine",
-                    slug=market.slug,
-                    details={
-                        "error": result.error,
-                        **placement_details,
-                    },
-                )
-                self.logger.info(
-                    "LIVE %s: order engine not ready; retrying", market.slug
-                )
                 return
+            self._order_engine_waits.pop(market.slug, None)
             self.database.set_market_state(market.slug, "error", result.error)
             self.database.event(
                 self.run_id,

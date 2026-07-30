@@ -277,6 +277,7 @@ def test_placement_event_queued_during_http_submission_is_recorded(tmp_path) -> 
         service.live = True
         service.logger = logging.getLogger("test")
         service.user_stream_worker = stream
+        service._order_engine_waits = {}
 
         service._place(MARKET, trigger="test")
         service._drain_user_stream_updates()
