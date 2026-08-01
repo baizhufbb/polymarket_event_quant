@@ -8,12 +8,13 @@ LOCK_PORT = 47831
 
 
 class SingleInstance:
-    def __init__(self) -> None:
+    def __init__(self, port: int = LOCK_PORT) -> None:
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.port = port
 
     def __enter__(self) -> "SingleInstance":
         try:
-            self.socket.bind((LOCK_HOST, LOCK_PORT))
+            self.socket.bind((LOCK_HOST, self.port))
             self.socket.listen(1)
         except OSError as exc:
             self.socket.close()

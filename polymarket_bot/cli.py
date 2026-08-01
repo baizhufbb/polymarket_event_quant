@@ -5,12 +5,14 @@ import json
 import logging
 from decimal import Decimal, InvalidOperation
 from logging.handlers import TimedRotatingFileHandler
+from pathlib import Path
 
 from .config import BotConfig, SetupConfig
 from .database import BotDatabase
 from .exchange import Exchange
 from .lock import SingleInstance
 from .models import ExitTarget, TradePlan
+from .paper import PaperDatabase, PaperSimulator, paper_database_path
 from .service import BotService
 from .setup import setup_wallet
 
@@ -61,6 +63,22 @@ def _parser() -> argparse.ArgumentParser:
         "doctor", help="check account and network without placing orders"
     )
     subparsers.add_parser("status", help="show local bot state")
+    subparsers.add_parser("paper-status", help="show paper simulation results")
+    paper = subparsers.add_parser(
+        "paper", help="simulate buy-and-hold fills without credentials or orders"
+    )
+    paper.add_argument("--buy-price", type=_decimal_arg, required=True)
+    paper.add_argument("--usd-per-side", type=_decimal_arg, required=True)
+    paper.add_argument("--hours", type=_decimal_arg)
+    paper.add_argument(
+        "--lookahead-minutes",
+        type=int,
+        default=0,
+        help=(
+            "startup observation window; 0 skips existing markets and starts "
+            "with the next newly announced market"
+        ),
+    )
     run = subparsers.add_parser("run", help="run continuously; dry-run unless --live")
     run.add_argument("--live", action="store_true")
     run.add_argument("--buy-price", type=_decimal_arg, required=True)
@@ -104,21 +122,26 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _logger(config: BotConfig) -> logging.Logger:
-    config.log_path.parent.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger("polymarket_bot")
+    logger = _rotating_logger("polymarket_bot", config.log_path)
+    clob_logger = logging.getLogger("py_clob_client_v2.http_helpers.helpers")
+    clob_logger.addFilter(_ExpectedOrderEngineFilter())
+    return logger
+
+
+def _rotating_logger(name: str, path: Path) -> logging.Logger:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     console = logging.StreamHandler()
     console.setFormatter(formatter)
     file_handler = TimedRotatingFileHandler(
-        config.log_path, when="midnight", backupCount=14, encoding="utf-8"
+        path, when="midnight", backupCount=14, encoding="utf-8"
     )
     file_handler.setFormatter(formatter)
     logger.addHandler(console)
     logger.addHandler(file_handler)
-    clob_logger = logging.getLogger("py_clob_client_v2.http_helpers.helpers")
-    clob_logger.addFilter(_ExpectedOrderEngineFilter())
     return logger
 
 
@@ -127,6 +150,36 @@ def main() -> None:
     if args.command == "setup":
         result = setup_wallet(SetupConfig.load(apply=args.apply), apply=args.apply)
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        return
+
+    project_root = Path(__file__).resolve().parents[1]
+    if args.command == "paper-status":
+        with PaperDatabase(paper_database_path(project_root)) as database:
+            print(json.dumps(database.status(), ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "paper":
+        plan = TradePlan(
+            buy_price=args.buy_price,
+            exit_targets=(),
+            usd_per_side=args.usd_per_side,
+        )
+        plan.validate()
+        if args.hours is not None and args.hours <= 0:
+            raise SystemExit("--hours must be positive when provided")
+        if args.lookahead_minutes < 0:
+            raise SystemExit("--lookahead-minutes cannot be negative")
+        with SingleInstance(port=47832):
+            with PaperDatabase(paper_database_path(project_root)) as database:
+                PaperSimulator(
+                    database,
+                    plan,
+                    lookahead_minutes=args.lookahead_minutes,
+                    hours=args.hours,
+                    logger=_rotating_logger(
+                        "polymarket_paper", project_root / "logs" / "paper.log"
+                    ),
+                ).run()
         return
 
     live = bool(getattr(args, "live", False))

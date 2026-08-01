@@ -119,6 +119,8 @@ heartbeat. It does not change Polymarket's server-side cancellation deadline.
 ## Safety
 
 - `run` is a dry-run unless `--live` is supplied.
+- The ordinary dry-run checks discovery and order planning only. It does not
+  model fills or profitability. Use `paper` for an execution-aware simulation.
 - Live mode also requires `POLYMARKET_LIVE_ACK=I_UNDERSTAND_REAL_ORDERS`.
 - A transient network or server failure immediately retries the same signed
   Up/Down batch once, without creating new order hashes. If the result remains
@@ -163,7 +165,7 @@ heartbeat. It does not change Polymarket's server-side cancellation deadline.
 
 ## Database
 
-The only database is `data/bot.sqlite`:
+Live and ordinary dry-run state use `data/bot.sqlite`:
 
 - `runs`: every start and stop, mode, fixed trading parameters, optional
   heartbeat status, and terminal error.
@@ -172,6 +174,19 @@ The only database is `data/bot.sqlite`:
 - `events`: operational audit log.
 
 There is no market-data warehouse and no historical backtest database.
+
+Paper simulation uses the separate `data/paper.sqlite`. It records the public
+0.01 queue when each market first becomes observable, then settles the
+hypothetical orders from public taker trades after the market resolves. The
+fill model is FIFO and deliberately does not assume that orders ahead canceled,
+so exact-price fills are a conservative lower bound. A trade through the limit
+price confirms a full fill. Direct sells of an outcome and complementary buys
+of the opposite outcome are both counted. Reported PnL excludes variable maker
+rebates and never uses wallet credentials or authenticated order endpoints.
+The status report also shows active and peak order reserve. Paper mode assumes
+every observed market receives both configured orders even when that requires
+more collateral than the account actually holds; use the reserve figures when
+judging whether its PnL is practically reproducible.
 
 ## Commands
 
@@ -202,6 +217,15 @@ uv run bot.py run --buy-price 0.02 --usd-per-side 1 --lookahead-minutes 40
 
 # Show database state.
 uv run bot.py status
+
+# Simulate the current one-cent, $1-per-side hold-to-resolution strategy.
+# With lookahead 0, existing markets are skipped and the first settled samples
+# arrive only after newly announced markets have finished.
+uv run bot.py paper --buy-price 0.01 --usd-per-side 1 `
+  --lookahead-minutes 0
+
+# Show fill counts, conservative PnL, ROI, and recent paper markets.
+uv run bot.py paper-status
 
 # Run live continuously.
 uv run --env-file .env.trading bot.py run --live `
