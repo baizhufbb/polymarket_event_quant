@@ -34,3 +34,21 @@ def test_fetches_open_orders_once_and_queries_only_missing_orders() -> None:
     assert exchange.get_calls == ["closed-order"]
     assert update.orders[0].raw["status"] == "live"
     assert update.orders[1].raw["status"] == "cancelled"
+
+
+def test_missing_order_becomes_terminal_unknown() -> None:
+    exchange = FakeExchange()
+    exchange.get_order = lambda order_id: None
+    worker = ReconciliationWorker(exchange)
+
+    update = worker._fetch(
+        (TrackedOrderSnapshot("missing-order", "market-a", "100"),)
+    )
+
+    assert update.batch_error is None
+    assert update.orders[0].error is None
+    assert update.orders[0].raw == {
+        "id": "missing-order",
+        "status": "terminal_unknown",
+        "size_matched": "0",
+    }

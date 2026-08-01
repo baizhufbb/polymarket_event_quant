@@ -3,7 +3,7 @@ from decimal import Decimal
 import httpx
 import pytest
 
-from polymarket_bot.exchange import Exchange
+from polymarket_bot.exchange import AmbiguousPlacementError, Exchange
 from polymarket_bot.models import Market, PlacementResult
 from py_clob_client_v2 import Side
 from py_clob_client_v2.exceptions import PolyApiException
@@ -88,7 +88,7 @@ def api_error(status_code: int, message: str) -> PolyApiException:
     return PolyApiException(response)
 
 
-def test_transient_batch_failure_reuses_the_same_signed_orders() -> None:
+def test_transient_batch_failure_immediately_reuses_the_same_signed_orders() -> None:
     exchange = Exchange.__new__(Exchange)
     exchange.client = TransientRetryClient(
         [
@@ -213,7 +213,7 @@ def test_ambiguous_retry_reuses_the_same_signed_orders() -> None:
     )
     exchange.open_orders = lambda condition_id: []
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(AmbiguousPlacementError):
         exchange.place_dual(MARKET, price=Decimal("0.01"), size=Decimal("100"))
     reconciliation = exchange.reconcile_ambiguous_dual(
         MARKET, price=Decimal("0.01"), size=Decimal("100")
@@ -230,6 +230,89 @@ def test_ambiguous_retry_reuses_the_same_signed_orders() -> None:
         and batch[1] is exchange.client.posted_batches[0][1]
         for batch in exchange.client.posted_batches
     )
+
+
+def test_http_protocol_failure_is_retryable_with_the_same_signed_orders() -> None:
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = SequencedClient(
+        [
+            httpx.RemoteProtocolError("server disconnected"),
+            [
+                {"success": True, "orderID": "up-order", "status": "live"},
+                {"success": True, "orderID": "down-order", "status": "live"},
+            ],
+        ]
+    )
+    exchange.open_orders = lambda condition_id: []
+
+    with pytest.raises(AmbiguousPlacementError) as raised:
+        exchange.place_dual(MARKET, price=Decimal("0.01"), size=Decimal("100"))
+    reconciliation = exchange.reconcile_ambiguous_dual(
+        MARKET, price=Decimal("0.01"), size=Decimal("100")
+    )
+    result = exchange.place_dual(
+        MARKET, price=Decimal("0.01"), size=Decimal("100")
+    )
+
+    assert raised.value.retryable
+    assert reconciliation.retryable
+    assert result.complete
+    assert len(exchange.client.created_order_args) == 2
+    assert all(
+        batch[0] is exchange.client.posted_batches[0][0]
+        and batch[1] is exchange.client.posted_batches[0][1]
+        for batch in exchange.client.posted_batches
+    )
+
+
+def test_incomplete_batch_response_is_reconciled_before_retry() -> None:
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = SequencedClient(
+        [
+            [{"success": True, "orderID": "up-order", "status": "live"}],
+            [
+                {"success": True, "orderID": "up-order", "status": "live"},
+                {"success": True, "orderID": "down-order", "status": "live"},
+            ],
+        ]
+    )
+    exchange.open_orders = lambda condition_id: []
+
+    with pytest.raises(AmbiguousPlacementError):
+        exchange.place_dual(MARKET, price=Decimal("0.01"), size=Decimal("100"))
+    reconciliation = exchange.reconcile_ambiguous_dual(
+        MARKET, price=Decimal("0.01"), size=Decimal("100")
+    )
+    result = exchange.place_dual(
+        MARKET, price=Decimal("0.01"), size=Decimal("100")
+    )
+
+    assert reconciliation.retryable
+    assert result.complete
+    assert len(exchange.client.created_order_args) == 2
+
+
+def test_terminal_rejection_after_ambiguous_attempt_is_not_requeued() -> None:
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = SequencedClient(
+        [
+            PolyApiException(error_msg="Request exception!"),
+            api_error(400, "rejected"),
+        ]
+    )
+    exchange.open_orders = lambda condition_id: []
+
+    with pytest.raises(AmbiguousPlacementError) as raised:
+        exchange.place_dual(MARKET, price=Decimal("0.01"), size=Decimal("100"))
+    result = exchange.reconcile_ambiguous_dual(
+        MARKET,
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        retryable_if_missing=raised.value.retryable,
+    )
+
+    assert not raised.value.retryable
+    assert not result.retryable
 
 
 def test_duplicate_responses_recover_the_original_order_ids() -> None:
@@ -259,7 +342,7 @@ def test_duplicate_responses_recover_the_original_order_ids() -> None:
     assert {order.order_id for order in result.orders} == {up_id, down_id}
 
 
-def test_business_rejection_exception_is_not_retried() -> None:
+def test_business_rejection_is_terminal_and_not_retried() -> None:
     class RejectedClient(FakeClient):
         def __init__(self):
             super().__init__([])
@@ -274,10 +357,14 @@ def test_business_rejection_exception_is_not_retried() -> None:
     exchange = Exchange.__new__(Exchange)
     exchange.client = RejectedClient()
 
-    with pytest.raises(PolyApiException):
-        exchange.place_dual(MARKET, price=Decimal("0.01"), size=Decimal("100"))
+    result = exchange.place_dual(
+        MARKET, price=Decimal("0.01"), size=Decimal("100")
+    )
 
     assert exchange.client.calls == 1
+    assert not result.complete
+    assert not result.retryable
+    assert "rejected" in result.error
 
 
 def test_partial_batch_is_immediately_canceled() -> None:

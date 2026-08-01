@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from polymarket_bot.database import BotDatabase
+from polymarket_bot.exchange import AmbiguousPlacementError
 from polymarket_bot.geoblock import GeoblockUpdate
 from polymarket_bot.market_activation import MarketActivationUpdate
 from polymarket_bot.models import (
@@ -66,6 +67,12 @@ class FakeExchange:
         return self.cancel_result or {"canceled": order_ids, "not_canceled": {}}
 
 
+class FailingCancelExchange(FakeExchange):
+    def cancel_orders(self, order_ids):
+        self.cancel_calls.append(order_ids)
+        raise RuntimeError("temporary exchange error")
+
+
 class PendingBookExchange(FakeExchange):
     def __init__(self):
         super().__init__()
@@ -118,15 +125,34 @@ class AmbiguousRetryPlacementExchange(RetryPlacementExchange):
     def place_dual(self, market, *, price, size):
         if self.place_calls == 0:
             self.place_calls = 1
-            raise RuntimeError("network interrupted")
+            raise AmbiguousPlacementError("network interrupted")
         return super().place_dual(market, price=price, size=size)
 
-    def reconcile_ambiguous_dual(self, market, *, price, size):
+    def reconcile_ambiguous_dual(
+        self,
+        market,
+        *,
+        price,
+        size,
+        retryable_if_missing=True,
+    ):
         return PlacementResult(
             (),
             "ambiguous submission did not produce exactly two orders",
-            retryable=True,
+            retryable=retryable_if_missing,
         )
+
+
+class ReconciliationOutagePlacementExchange(AmbiguousRetryPlacementExchange):
+    def reconcile_ambiguous_dual(
+        self,
+        market,
+        *,
+        price,
+        size,
+        retryable_if_missing=True,
+    ):
+        raise RuntimeError("reconciliation temporarily unavailable")
 
 
 class FakeReconciliationWorker:
@@ -260,7 +286,7 @@ def test_order_engine_not_ready_requeues_until_pair_is_accepted(tmp_path) -> Non
         service.exchange = exchange
         service.market_activation_worker = SimpleNamespace()
         service.activation_market_updates = []
-        service._order_engine_waits = {}
+        service._placement_retries = {}
         service.wake_event = Event()
         service.run_id = run_id
         service.run_started_ts = 0
@@ -282,7 +308,7 @@ def test_order_engine_not_ready_requeues_until_pair_is_accepted(tmp_path) -> Non
         row = database.connection.execute(
             "SELECT state FROM markets WHERE slug=?", (MARKET.slug,)
         ).fetchone()
-        assert row["state"] == "waiting_for_order_engine"
+        assert row["state"] == "placement_pending"
         assert database.can_start_entry_plan(MARKET.slug)
         assert service.wake_event.is_set()
         assert service.activation_market_updates == [
@@ -321,7 +347,7 @@ def test_ambiguous_submission_requeues_and_records_original_error(tmp_path) -> N
         service.exchange = exchange
         service.market_activation_worker = SimpleNamespace()
         service.activation_market_updates = []
-        service._order_engine_waits = {}
+        service._placement_retries = {}
         service.wake_event = Event()
         service.run_id = run_id
         service.run_started_ts = 0
@@ -343,13 +369,13 @@ def test_ambiguous_submission_requeues_and_records_original_error(tmp_path) -> N
             """
             SELECT details_json
             FROM events
-            WHERE slug=? AND event_type='placement_waiting_for_engine'
+            WHERE slug=? AND event_type='placement_retry_started'
             """,
             (MARKET.slug,),
         ).fetchone()
         assert service.wake_event.is_set()
         assert len(service.activation_market_updates) == 1
-        assert "RuntimeError: network interrupted" in event["details_json"]
+        assert "AmbiguousPlacementError: network interrupted" in event["details_json"]
 
         service._place_activated_markets()
 
@@ -360,7 +386,108 @@ def test_ambiguous_submission_requeues_and_records_original_error(tmp_path) -> N
         assert exchange.place_calls == 2
 
 
-def test_order_engine_wait_records_only_first_retry_and_final_summary(
+def test_reconciliation_outage_requeues_missing_market(tmp_path) -> None:
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        run_id = database.start_run("live")
+        exchange = ReconciliationOutagePlacementExchange()
+        service = BotService.__new__(BotService)
+        service.database = database
+        service.plan = TradePlan(Decimal("0.01"), (), Decimal("1"))
+        service.max_reserved_usd = None
+        service.max_daily_filled_cost = None
+        service.exchange = exchange
+        service.market_activation_worker = None
+        service.activation_market_updates = []
+        service._placement_retries = {}
+        service.wake_event = Event()
+        service.run_id = run_id
+        service.run_started_ts = 0
+        service.live = True
+        service.logger = logging.getLogger("test")
+
+        service._consider_market(
+            MARKET,
+            now_ts=1_999_999_000,
+            trigger="gamma",
+            orderbook_ready=True,
+        )
+
+        market_row = database.connection.execute(
+            "SELECT state FROM markets WHERE slug=?", (MARKET.slug,)
+        ).fetchone()
+        retry_event = database.connection.execute(
+            """
+            SELECT details_json
+            FROM events
+            WHERE slug=? AND event_type='placement_retry_started'
+            """,
+            (MARKET.slug,),
+        ).fetchone()
+        assert market_row["state"] == "placement_pending"
+        assert database.can_start_entry_plan(MARKET.slug)
+        assert len(service.activation_market_updates) == 1
+        assert "reconciliation temporarily unavailable" in retry_event["details_json"]
+
+        service._place_activated_markets()
+
+        state = database.connection.execute(
+            "SELECT state FROM markets WHERE slug=?", (MARKET.slug,)
+        ).fetchone()["state"]
+        assert state == "active"
+        assert exchange.place_calls == 2
+        assert service._placement_retries == {}
+
+
+def test_pending_placement_expires_when_market_ends(tmp_path) -> None:
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        run_id = database.start_run("live")
+        exchange = RetryPlacementExchange(failures=2)
+        service = BotService.__new__(BotService)
+        service.database = database
+        service.plan = TradePlan(Decimal("0.01"), (), Decimal("1"))
+        service.max_reserved_usd = None
+        service.max_daily_filled_cost = None
+        service.exchange = exchange
+        service.market_activation_worker = None
+        service.activation_market_updates = []
+        service._placement_retries = {}
+        service.wake_event = Event()
+        service.run_id = run_id
+        service.run_started_ts = 0
+        service.live = True
+        service.logger = logging.getLogger("test")
+
+        service._consider_market(
+            MARKET,
+            now_ts=MARKET.start_ts,
+            trigger="gamma",
+            orderbook_ready=True,
+        )
+        service._consider_market(
+            MARKET,
+            now_ts=MARKET.end_ts,
+            trigger="placement_retry",
+            orderbook_ready=True,
+        )
+
+        market_row = database.connection.execute(
+            "SELECT state, error FROM markets WHERE slug=?", (MARKET.slug,)
+        ).fetchone()
+        event = database.connection.execute(
+            """
+            SELECT details_json
+            FROM events
+            WHERE slug=? AND event_type='placement_retry_expired'
+            """,
+            (MARKET.slug,),
+        ).fetchone()
+        assert market_row["state"] == "expired"
+        assert "market ended" in market_row["error"]
+        assert json.loads(event["details_json"])["placement_retry_attempts"] == 1
+        assert service._placement_retries == {}
+
+
+def test_placement_retry_records_only_first_failure_and_final_summary(
     tmp_path,
 ) -> None:
     with BotDatabase(tmp_path / "bot.sqlite") as database:
@@ -374,7 +501,7 @@ def test_order_engine_wait_records_only_first_retry_and_final_summary(
         service.exchange = exchange
         service.market_activation_worker = SimpleNamespace()
         service.activation_market_updates = []
-        service._order_engine_waits = {}
+        service._placement_retries = {}
         service.wake_event = Event()
         service.run_id = run_id
         service.run_started_ts = 0
@@ -400,7 +527,7 @@ def test_order_engine_wait_records_only_first_retry_and_final_summary(
             """
             SELECT COUNT(*)
             FROM events
-            WHERE slug=? AND event_type='placement_waiting_for_engine'
+            WHERE slug=? AND event_type='placement_retry_started'
             """,
             (MARKET.slug,),
         ).fetchone()[0]
@@ -417,7 +544,7 @@ def test_order_engine_wait_records_only_first_retry_and_final_summary(
 
         assert exchange.place_calls == 4
         assert waiting_events == 1
-        assert placed_details["order_engine_not_ready_attempts"] == 3
+        assert placed_details["placement_retry_attempts"] == 3
         assert placed_details["local_gap_before_acceptance_ms"] >= 0
 
 
@@ -942,7 +1069,10 @@ def test_cancels_open_orders_before_market_end(tmp_path) -> None:
         status = database.connection.execute(
             "SELECT status FROM orders WHERE order_id='up-order'"
         ).fetchone()["status"]
-        assert status == "cancel_requested"
+        assert status == "cancelled"
+
+        service._cancel_due_orders(MARKET.end_ts - 1)
+        assert exchange.cancel_calls == [["up-order"]]
 
 
 def test_cancel_due_stops_retrying_terminal_unknown_order(tmp_path) -> None:
@@ -986,6 +1116,40 @@ def test_cancel_due_stops_retrying_terminal_unknown_order(tmp_path) -> None:
         assert status == "terminal_unknown"
 
 
+def test_cancel_due_does_not_repeat_ambiguous_cancel_request(tmp_path) -> None:
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        run_id = database.start_run("live")
+        database.add_market(run_id, MARKET)
+        database.add_order(
+            run_id,
+            MARKET.slug,
+            PlacedOrder(
+                order_id="ambiguous-order",
+                outcome="up",
+                token_id="up-token",
+                price=Decimal("0.01"),
+                size=Decimal("100"),
+                status="live",
+                raw={},
+            ),
+        )
+        exchange = FailingCancelExchange()
+        service = BotService.__new__(BotService)
+        service.database = database
+        service.exchange = exchange
+        service.run_id = run_id
+        service.cancel_before_end_seconds = 2
+
+        service._cancel_due_orders(MARKET.end_ts - 2)
+        service._cancel_due_orders(MARKET.end_ts - 1)
+
+        assert exchange.cancel_calls == [["ambiguous-order"]]
+        status = database.connection.execute(
+            "SELECT status FROM orders WHERE order_id='ambiguous-order'"
+        ).fetchone()["status"]
+        assert status == "cancel_requested"
+
+
 def test_shutdown_cancel_records_only_confirmed_results(tmp_path) -> None:
     with BotDatabase(tmp_path / "bot.sqlite") as database:
         run_id = database.start_run("live")
@@ -1026,7 +1190,7 @@ def test_shutdown_cancel_records_only_confirmed_results(tmp_path) -> None:
             for row in database.connection.execute("SELECT order_id, status FROM orders")
         }
         assert statuses == {
-            "canceled-order": "cancel_requested",
+            "canceled-order": "cancelled",
             "stale-order": "terminal_unknown",
-            "retryable-order": "live",
+            "retryable-order": "cancel_requested",
         }

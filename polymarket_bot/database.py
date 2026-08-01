@@ -187,7 +187,7 @@ class BotDatabase:
         ).fetchone()
         if row is None:
             return True
-        if row["state"] != "waiting_for_order_engine":
+        if row["state"] != "placement_pending":
             return False
         return (
             self.connection.execute(
@@ -311,8 +311,7 @@ class BotDatabase:
                 FROM markets AS m INDEXED BY idx_markets_end_ts
                 CROSS JOIN orders AS o
                 WHERE m.end_ts <= ? AND o.slug=m.slug AND o.status IN (
-                    'open', 'live', 'delayed', 'unmatched', 'simulated',
-                    'cancel_requested'
+                    'open', 'live', 'delayed', 'unmatched', 'simulated'
                 )
                 ORDER BY m.end_ts, o.created_ts
                 """,

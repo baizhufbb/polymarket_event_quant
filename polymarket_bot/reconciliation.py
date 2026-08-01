@@ -117,6 +117,12 @@ class ReconciliationWorker:
                 raw = open_by_id.get(snapshot.order_id)
                 if raw is None:
                     raw = self.exchange.get_order(snapshot.order_id)
+                if raw is None:
+                    raw = {
+                        "id": snapshot.order_id,
+                        "status": "terminal_unknown",
+                        "size_matched": "0",
+                    }
                 if not isinstance(raw, dict):
                     raise ValueError("exchange returned no order payload")
                 results.append(ReconciledOrder(snapshot=snapshot, raw=raw))

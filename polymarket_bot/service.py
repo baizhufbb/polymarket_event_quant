@@ -9,7 +9,7 @@ from threading import Event
 from .config import BotConfig
 from .database import BotDatabase
 from .discovery import MarketDiscovery, is_eligible
-from .exchange import Exchange, normalize_order
+from .exchange import AmbiguousPlacementError, Exchange, normalize_order
 from .geoblock import GeoblockWorker
 from .heartbeat import HeartbeatWorker
 from .market_activation import (
@@ -17,7 +17,7 @@ from .market_activation import (
     MarketActivationUpdate,
     MarketActivationWorker,
 )
-from .models import Market, PlacedOrder, TradePlan
+from .models import Market, PlacedOrder, PlacementResult, TradePlan
 from .reconciliation import ReconciliationWorker
 from .user_stream import UserStreamState, UserStreamWorker, UserTradeUpdate
 
@@ -36,7 +36,7 @@ TERMINAL_ORDER_STATES = {
 
 
 @dataclass
-class _OrderEngineWait:
+class _PlacementRetryState:
     attempts: int
     first_started_ts_ms: int
     last_finished_ts_ms: int
@@ -121,7 +121,7 @@ class BotService:
             ReconciliationWorker(self.exchange) if self.exchange else None
         )
         self.activation_market_updates: list[MarketActivationUpdate] = []
-        self._order_engine_waits: dict[str, _OrderEngineWait] = {}
+        self._placement_retries: dict[str, _PlacementRetryState] = {}
         self.run_id = 0
         self.run_started_ts = int(time.time())
         self.last_discovery = 0.0
@@ -449,6 +449,7 @@ class BotService:
         if not self.exchange:
             self.database.mark_orders(order_ids, "simulated_closed")
             return
+        self.database.mark_orders(order_ids, "cancel_requested")
         try:
             result = self.exchange.cancel_orders(order_ids)
         except Exception as exc:
@@ -460,7 +461,7 @@ class BotService:
             )
             return
         canceled_ids, terminal_unknown_ids = _classify_cancel_result(result)
-        self.database.mark_orders(canceled_ids, "cancel_requested")
+        self.database.mark_orders(canceled_ids, "cancelled")
         self.database.mark_orders(terminal_unknown_ids, "terminal_unknown")
         self.database.event(
             self.run_id,
@@ -568,6 +569,20 @@ class BotService:
         if not is_eligible(
             market, run_started_ts=self.run_started_ts, now_ts=now_ts
         ):
+            retry = self._placement_retries.pop(market.slug, None)
+            if retry is not None:
+                self.database.set_market_state(
+                    market.slug,
+                    "expired",
+                    "market ended before a complete order pair was accepted",
+                )
+                self.database.event(
+                    self.run_id,
+                    "WARNING",
+                    "placement_retry_expired",
+                    slug=market.slug,
+                    details={"placement_retry_attempts": retry.attempts},
+                )
             return True
         if not self.database.can_start_entry_plan(market.slug):
             return True
@@ -627,8 +642,8 @@ class BotService:
         trigger: str,
         trigger_details: dict | None = None,
     ) -> None:
-        engine_wait = self._order_engine_waits.get(market.slug)
-        if engine_wait is None:
+        placement_retry = self._placement_retries.get(market.slug)
+        if placement_retry is None:
             self.database.prepare_market(self.run_id, market)
         if not self.live:
             for outcome, token_id in (
@@ -656,39 +671,35 @@ class BotService:
 
         placement_started_ts_ms = int(time.time() * 1000)
         submission_error = None
+        reconciliation_error = None
         try:
             result = self.exchange.place_dual(
                 market,
                 price=self.plan.buy_price,
                 size=self.plan.order_size,
             )
-        except Exception as exc:
+        except AmbiguousPlacementError as exc:
             submission_error = f"{type(exc).__name__}: {exc}"
             try:
                 result = self.exchange.reconcile_ambiguous_dual(
                     market,
                     price=self.plan.buy_price,
                     size=self.plan.order_size,
+                    retryable_if_missing=exc.retryable,
                 )
             except Exception as reconcile_exc:
-                self._order_engine_waits.pop(market.slug, None)
-                error = (
+                reconciliation_error = (
                     f"submission={submission_error}; reconciliation="
                     f"{type(reconcile_exc).__name__}: {reconcile_exc}"
                 )
-                self.database.set_market_state(market.slug, "error", error)
-                self.database.event(
-                    self.run_id,
-                    "ERROR",
-                    "placement_ambiguous",
-                    slug=market.slug,
-                    details={
-                        "error": error,
-                        "trigger": trigger,
-                        **(trigger_details or {}),
-                    },
+                result = PlacementResult(
+                    (),
+                    reconciliation_error,
+                    retryable=exc.retryable,
                 )
-                return
+        except Exception as exc:
+            submission_error = f"{type(exc).__name__}: {exc}"
+            result = PlacementResult((), submission_error)
 
         placement_finished_ts_ms = int(time.time() * 1000)
         placement_details = {
@@ -699,25 +710,28 @@ class BotService:
         }
         if submission_error:
             placement_details["submission_error"] = submission_error
-        if engine_wait is not None:
+        if reconciliation_error:
+            placement_details["reconciliation_error"] = reconciliation_error
+        if placement_retry is not None:
             placement_details.update(
                 {
-                    "order_engine_not_ready_attempts": engine_wait.attempts,
-                    "order_engine_wait_started_ts_ms": (
-                        engine_wait.first_started_ts_ms
+                    "placement_retry_attempts": placement_retry.attempts,
+                    "placement_retry_started_ts_ms": (
+                        placement_retry.first_started_ts_ms
                     ),
-                    "order_engine_last_rejected_ts_ms": (
-                        engine_wait.last_finished_ts_ms
+                    "placement_retry_last_failed_ts_ms": (
+                        placement_retry.last_finished_ts_ms
                     ),
                     "local_gap_before_acceptance_ms": (
-                        placement_started_ts_ms - engine_wait.last_finished_ts_ms
+                        placement_started_ts_ms
+                        - placement_retry.last_finished_ts_ms
                     ),
                 }
             )
         for order in result.orders:
             self.database.add_order(self.run_id, market.slug, order)
         if result.complete:
-            self._order_engine_waits.pop(market.slug, None)
+            self._placement_retries.pop(market.slug, None)
             self.database.set_market_state(market.slug, "active")
             self.database.event(
                 self.run_id,
@@ -734,55 +748,17 @@ class BotService:
             )
             self.logger.info("LIVE %s: both orders accepted", market.slug)
         else:
-            discovered_ts_ms = (
-                trigger_details.get("market_discovered_ts_ms")
-                if trigger_details
-                else int(time.time() * 1000)
-            )
-            if (
-                result.retryable
-                and self.market_activation_worker
-                and trigger_details
+            if self._requeue_placement(
+                market,
+                result=result,
+                retry=placement_retry,
+                placement_started_ts_ms=placement_started_ts_ms,
+                placement_finished_ts_ms=placement_finished_ts_ms,
+                placement_details=placement_details,
+                trigger_details=trigger_details,
             ):
-                if engine_wait is None:
-                    engine_wait = _OrderEngineWait(
-                        attempts=1,
-                        first_started_ts_ms=placement_started_ts_ms,
-                        last_finished_ts_ms=placement_finished_ts_ms,
-                    )
-                    self._order_engine_waits[market.slug] = engine_wait
-                    self.database.set_market_state(
-                        market.slug, "waiting_for_order_engine", result.error
-                    )
-                    self.database.event(
-                        self.run_id,
-                        "INFO",
-                        "placement_waiting_for_engine",
-                        slug=market.slug,
-                        details={
-                            "error": result.error,
-                            **placement_details,
-                        },
-                    )
-                    self.logger.info(
-                        "LIVE %s: order engine not ready; retrying",
-                        market.slug,
-                    )
-                else:
-                    engine_wait.attempts += 1
-                    engine_wait.last_finished_ts_ms = placement_finished_ts_ms
-                self.activation_market_updates.append(
-                    MarketActivationUpdate(
-                        market=market,
-                        market_discovered_ts_ms=discovered_ts_ms,
-                        market_parameters_detected_ts_ms=trigger_details[
-                            "market_parameters_detected_ts_ms"
-                        ],
-                    )
-                )
-                self.wake_event.set()
                 return
-            self._order_engine_waits.pop(market.slug, None)
+            self._placement_retries.pop(market.slug, None)
             self.database.set_market_state(market.slug, "error", result.error)
             self.database.event(
                 self.run_id,
@@ -794,6 +770,62 @@ class BotService:
                     **placement_details,
                 },
             )
+
+    def _requeue_placement(
+        self,
+        market: Market,
+        *,
+        result: PlacementResult,
+        retry: _PlacementRetryState | None,
+        placement_started_ts_ms: int,
+        placement_finished_ts_ms: int,
+        placement_details: dict,
+        trigger_details: dict | None,
+    ) -> bool:
+        if not result.retryable or result.orders:
+            return False
+
+        if retry is None:
+            retry = _PlacementRetryState(
+                attempts=1,
+                first_started_ts_ms=placement_started_ts_ms,
+                last_finished_ts_ms=placement_finished_ts_ms,
+            )
+            self._placement_retries[market.slug] = retry
+            self.database.set_market_state(
+                market.slug, "placement_pending", result.error
+            )
+            self.database.event(
+                self.run_id,
+                "INFO",
+                "placement_retry_started",
+                slug=market.slug,
+                details={"error": result.error, **placement_details},
+            )
+            self.logger.info("LIVE %s: placement pending; retrying", market.slug)
+        else:
+            retry.attempts += 1
+            retry.last_finished_ts_ms = placement_finished_ts_ms
+
+        source_details = trigger_details or {}
+        self.activation_market_updates.append(
+            MarketActivationUpdate(
+                market=market,
+                market_discovered_ts_ms=int(
+                    source_details.get(
+                        "market_discovered_ts_ms", placement_started_ts_ms
+                    )
+                ),
+                market_parameters_detected_ts_ms=int(
+                    source_details.get(
+                        "market_parameters_detected_ts_ms",
+                        placement_started_ts_ms,
+                    )
+                ),
+            )
+        )
+        self.wake_event.set()
+        return True
 
     def _reconcile(self) -> None:
         now_ts = int(time.time())
@@ -832,6 +864,12 @@ class BotService:
                     raw = open_by_id.get(row["order_id"])
                     if raw is None:
                         raw = self.exchange.get_order(row["order_id"])
+                    if raw is None:
+                        raw = {
+                            "id": row["order_id"],
+                            "status": "terminal_unknown",
+                            "size_matched": "0",
+                        }
                     if not isinstance(raw, dict):
                         raise ValueError("exchange returned no order payload")
                     status, matched = normalize_order(raw)
@@ -1010,10 +1048,11 @@ class BotService:
         if not self.exchange:
             self.database.mark_orders(order_ids, "simulated_closed")
             return
+        self.database.mark_orders(order_ids, "cancel_requested")
         try:
             result = self.exchange.cancel_orders(order_ids)
             canceled_ids, terminal_unknown_ids = _classify_cancel_result(result)
-            self.database.mark_orders(canceled_ids, "cancel_requested")
+            self.database.mark_orders(canceled_ids, "cancelled")
             self.database.mark_orders(terminal_unknown_ids, "terminal_unknown")
             self.database.event(
                 self.run_id or None,

@@ -474,7 +474,7 @@ def test_existing_market_is_never_rearmed(tmp_path) -> None:
         assert not database.can_start_entry_plan(market.slug)
 
 
-def test_order_engine_wait_can_retry_only_without_orders(tmp_path) -> None:
+def test_pending_placement_can_retry_only_without_orders(tmp_path) -> None:
     market = Market(
         slug="btc-updown-5m-2000000000",
         condition_id="0xcondition",
@@ -488,7 +488,7 @@ def test_order_engine_wait_can_retry_only_without_orders(tmp_path) -> None:
     with BotDatabase(tmp_path / "bot.sqlite") as database:
         run_id = database.start_run("live")
         database.add_market(
-            run_id, market, state="waiting_for_order_engine"
+            run_id, market, state="placement_pending"
         )
 
         assert database.can_start_entry_plan(market.slug)

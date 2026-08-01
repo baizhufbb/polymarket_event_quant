@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-import time
 from decimal import Decimal
 
 import requests
@@ -32,11 +31,18 @@ ORDER_ENGINE_NOT_READY_ERRORS = {
     (400, "invalid token id"),
     (404, "market not found"),
 }
-TRANSIENT_RETRY_SECONDS = 0.03
 DUPLICATE_ORDER_PATTERN = re.compile(
     r"\border\s+(0x[0-9a-f]{64})\s+is invalid\.\s*duplicated\.",
     re.IGNORECASE,
 )
+
+
+class AmbiguousPlacementError(RuntimeError):
+    """The exchange may have received a batch whose response was lost."""
+
+    def __init__(self, message: str, *, retryable: bool = True):
+        super().__init__(message)
+        self.retryable = retryable
 
 
 def _duplicate_order_id(response: object) -> str | None:
@@ -205,19 +211,32 @@ class Exchange:
                 return PlacementResult((), not_ready_error, retryable=True)
             if not _transient_submission_error(exc):
                 submissions.pop(submission_key, None)
-                raise
-            time.sleep(TRANSIENT_RETRY_SECONDS)
+                return PlacementResult(
+                    (),
+                    f"{type(exc).__name__}: {exc}",
+                )
             try:
                 responses = self.client.post_orders(signed, post_only=True)
             except Exception as retry_exc:
+                retryable = True
                 if isinstance(retry_exc, PolyApiException):
                     not_ready_error = _order_engine_not_ready_error(retry_exc)
                     if not_ready_error:
                         return PlacementResult((), not_ready_error, retryable=True)
-                raise RuntimeError(
+                    retryable = _transient_submission_error(retry_exc)
+                raise AmbiguousPlacementError(
                     f"transient submission retry failed: "
-                    f"initial={exc}; retry={type(retry_exc).__name__}: {retry_exc}"
+                    f"initial={exc}; retry={type(retry_exc).__name__}: {retry_exc}",
+                    retryable=retryable,
                 ) from retry_exc
+        except Exception as exc:
+            raise AmbiguousPlacementError(
+                f"submission response unavailable: {type(exc).__name__}: {exc}"
+            ) from exc
+        if not isinstance(responses, (list, tuple)) or len(responses) != 2:
+            raise AmbiguousPlacementError(
+                "submission returned an incomplete dual-order response"
+            )
         accepted = []
         errors = []
         for (outcome, token_id), response in zip(
@@ -297,6 +316,7 @@ class Exchange:
         *,
         price: Decimal,
         size: Decimal,
+        retryable_if_missing: bool = True,
     ) -> PlacementResult:
         expected = {
             market.up_token_id: "up",
@@ -359,10 +379,12 @@ class Exchange:
                 (),
                 "ambiguous submission produced a partial or duplicate order set",
             )
+        if not retryable_if_missing:
+            self._forget_dual_submission(market, price=price, size=size)
         return PlacementResult(
             (),
             "ambiguous submission did not produce exactly two orders",
-            retryable=True,
+            retryable=retryable_if_missing,
         )
 
     def place_exit(

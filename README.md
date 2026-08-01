@@ -80,7 +80,9 @@ The live farthest-first path runs in this order:
    `market not found`, market not ready, or missing order books) preserves the
    signed pair and immediately retries from the main loop without another
    parameter request or an added delay. Ambiguous network failures are
-   reconciled before retrying. If exactly one side is accepted, it is canceled.
+   reconciled before retrying. If that read is temporarily unavailable, the
+   same signed pair remains pending and is reconciled again on the next attempt.
+   If exactly one side is accepted, it is canceled.
 5. Accepted market and order IDs are committed to SQLite. The user WebSocket
    and REST reconciliation then maintain fills and terminal states.
 6. In buy-only mode, matched shares are held through resolution. With
@@ -118,9 +120,11 @@ heartbeat. It does not change Polymarket's server-side cancellation deadline.
 
 - `run` is a dry-run unless `--live` is supplied.
 - Live mode also requires `POLYMARKET_LIVE_ACK=I_UNDERSTAND_REAL_ORDERS`.
-- A transient network or server failure retries the same signed Up/Down batch
-  once. If the result remains ambiguous, the bot reconciles exchange orders
-  before the market is queued for another placement attempt.
+- A transient network or server failure immediately retries the same signed
+  Up/Down batch once, without creating new order hashes. If the result remains
+  ambiguous, the bot reconciles exchange orders before the market is queued for
+  another placement attempt. A temporary reconciliation outage keeps the
+  market pending instead of permanently dropping it.
 - Up and Down are submitted in one batch. If only one is accepted, the bot
   immediately cancels it.
 - Entry and take-profit orders are ordinary GTC limits, so they do not depend on a
@@ -148,8 +152,9 @@ heartbeat. It does not change Polymarket's server-side cancellation deadline.
   including runtime failures and a completed `--hours` duration, leaves exchange
   orders open for the next run to reconcile.
 - Explicitly rejected or partially accepted entry batches are not retried.
-  Order-engine-not-ready and reconciled ambiguous submissions remain eligible
-  until a complete Up/Down pair is accepted or the market ends.
+  Engine-not-ready, confirmed-empty ambiguous submissions, and temporary
+  submission/reconciliation outages remain eligible until a complete Up/Down
+  pair is accepted or the market ends.
 - The bot checks Polymarket geoblocking before and during live operation.
 - A local process lock prevents two bot instances from placing duplicate orders.
 - Runtime geoblock checks run outside the main loop. A temporary network failure
