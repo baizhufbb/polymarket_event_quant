@@ -236,7 +236,7 @@ def test_placement_event_queued_during_http_submission_is_recorded(tmp_path) -> 
         def __init__(self, stream):
             self.stream = stream
 
-        def place_dual(self, market, *, price, size):
+        def place_dual(self, market, *, price, size, submission_interval_ms):
             received_ts_ms = time.time_ns() // 1_000_000
             self.stream.updates.extend(
                 UserOrderUpdate(

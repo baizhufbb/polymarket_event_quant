@@ -102,6 +102,7 @@ class PlacementResult:
     orders: tuple[PlacedOrder, ...]
     error: str | None = None
     retryable: bool = False
+    attempts: int = 1
 
     @property
     def complete(self) -> bool:

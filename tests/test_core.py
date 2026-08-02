@@ -70,6 +70,7 @@ def test_run_limits_are_optional_cli_parameters() -> None:
     assert args.max_daily_filled_cost is None
     assert args.lookahead_minutes == 40
     assert args.placement_order == "nearest-first"
+    assert args.placement_interval_ms == Decimal("20")
     assert args.cancel_before_end_seconds == 2
     assert args.heartbeat_seconds is None
 
@@ -101,12 +102,15 @@ def test_run_limits_are_optional_cli_parameters() -> None:
             "0",
             "--heartbeat-seconds",
             "5",
+            "--placement-interval-ms",
+            "12.5",
         ]
     )
     assert reverse.lookahead_minutes == 120
     assert reverse.placement_order == "farthest-first"
     assert reverse.cancel_before_end_seconds == 0
     assert reverse.heartbeat_seconds == Decimal("5")
+    assert reverse.placement_interval_ms == Decimal("12.5")
 
     next_market_only = _parser().parse_args(
         [

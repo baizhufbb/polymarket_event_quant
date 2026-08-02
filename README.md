@@ -27,6 +27,9 @@ until stopped.
   Set it to `0` to leave orders resting until Polymarket closes the market.
 - Polymarket's disconnect-cancels-orders heartbeat is disabled unless
   `--heartbeat-seconds SECONDS` is supplied.
+- Opening submissions use a configurable staggered cadence.
+  `--placement-interval-ms` defaults to 20 milliseconds between identical
+  signed Up/Down batches.
 - The bot does not submit redemption transactions. Resolved winnings are
   returned by Polymarket's account-side settlement service.
 
@@ -122,11 +125,14 @@ heartbeat. It does not change Polymarket's server-side cancellation deadline.
 - The ordinary dry-run checks discovery and order planning only. It does not
   model fills or profitability. Use `paper` for an execution-aware simulation.
 - Live mode also requires `POLYMARKET_LIVE_ACK=I_UNDERSTAND_REAL_ORDERS`.
-- A transient network or server failure immediately retries the same signed
-  Up/Down batch once, without creating new order hashes. If the result remains
-  ambiguous, the bot reconciles exchange orders before the market is queued for
-  another placement attempt. A temporary reconciliation outage keeps the
-  market pending instead of permanently dropping it.
+- During activation, the bot submits the same signed Up/Down batch at the
+  `--placement-interval-ms` cadence until both orders are accepted. The in-flight
+  request limit bounds concurrency but does not cap the total attempt count.
+  Overlapping requests reuse the original order hashes, so a duplicate response
+  identifies the original order instead of creating another position. If the
+  result remains ambiguous, the bot reconciles exchange orders. A temporary
+  reconciliation outage keeps the market pending instead of permanently
+  dropping it.
 - Up and Down are submitted in one batch. If only one is accepted, the bot
   immediately cancels it.
 - Entry and take-profit orders are ordinary GTC limits, so they do not depend on a
@@ -230,6 +236,7 @@ uv run bot.py paper-status
 # Run live continuously.
 uv run --env-file .env.trading bot.py run --live `
   --buy-price 0.01 --usd-per-side 1 `
+  --placement-interval-ms 20 `
   --take-profit 0.02:0.50 `
   --take-profit 0.10:0.10 `
   --take-profit 0.30:0.10

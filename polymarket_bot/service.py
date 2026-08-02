@@ -9,7 +9,12 @@ from threading import Event
 from .config import BotConfig
 from .database import BotDatabase
 from .discovery import MarketDiscovery, is_eligible
-from .exchange import AmbiguousPlacementError, Exchange, normalize_order
+from .exchange import (
+    DEFAULT_PLACEMENT_INTERVAL_MS,
+    AmbiguousPlacementError,
+    Exchange,
+    normalize_order,
+)
 from .geoblock import GeoblockWorker
 from .heartbeat import HeartbeatWorker
 from .market_activation import (
@@ -60,6 +65,8 @@ def _classify_cancel_result(result: object) -> tuple[list[str], list[str]]:
 
 
 class BotService:
+    placement_interval_ms = DEFAULT_PLACEMENT_INTERVAL_MS
+
     def __init__(
         self,
         config: BotConfig,
@@ -71,6 +78,7 @@ class BotService:
         max_daily_filled_cost: Decimal | None,
         lookahead_minutes: int,
         placement_order: str,
+        placement_interval_ms: Decimal,
         cancel_before_end_seconds: int,
         heartbeat_seconds: Decimal | None,
         live: bool,
@@ -84,6 +92,7 @@ class BotService:
         self.max_daily_filled_cost = max_daily_filled_cost
         self.lookahead_minutes = lookahead_minutes
         self.placement_order = placement_order
+        self.placement_interval_ms = placement_interval_ms
         self.cancel_before_end_seconds = cancel_before_end_seconds
         self.heartbeat_seconds = heartbeat_seconds
         self.live = live
@@ -143,6 +152,7 @@ class BotService:
             ),
             "lookahead_minutes": self.lookahead_minutes,
             "placement_order": self.placement_order,
+            "placement_interval_ms": str(self.placement_interval_ms),
             "cancel_before_end_seconds": self.cancel_before_end_seconds,
             "heartbeat_seconds": (
                 str(self.heartbeat_seconds)
@@ -677,6 +687,7 @@ class BotService:
                 market,
                 price=self.plan.buy_price,
                 size=self.plan.order_size,
+                submission_interval_ms=self.placement_interval_ms,
             )
         except AmbiguousPlacementError as exc:
             submission_error = f"{type(exc).__name__}: {exc}"
@@ -696,6 +707,14 @@ class BotService:
                     (),
                     reconciliation_error,
                     retryable=exc.retryable,
+                    attempts=exc.attempts,
+                )
+            else:
+                result = PlacementResult(
+                    result.orders,
+                    result.error,
+                    retryable=result.retryable,
+                    attempts=exc.attempts,
                 )
         except Exception as exc:
             submission_error = f"{type(exc).__name__}: {exc}"
@@ -706,6 +725,7 @@ class BotService:
             "trigger": trigger,
             "placement_started_ts_ms": placement_started_ts_ms,
             "placement_finished_ts_ms": placement_finished_ts_ms,
+            "submission_attempts": result.attempts,
             **(trigger_details or {}),
         }
         if submission_error:
@@ -787,7 +807,7 @@ class BotService:
 
         if retry is None:
             retry = _PlacementRetryState(
-                attempts=1,
+                attempts=result.attempts,
                 first_started_ts_ms=placement_started_ts_ms,
                 last_finished_ts_ms=placement_finished_ts_ms,
             )
@@ -804,7 +824,7 @@ class BotService:
             )
             self.logger.info("LIVE %s: placement pending; retrying", market.slug)
         else:
-            retry.attempts += 1
+            retry.attempts += result.attempts
             retry.last_finished_ts_ms = placement_finished_ts_ms
 
         source_details = trigger_details or {}

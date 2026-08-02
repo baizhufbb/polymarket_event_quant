@@ -89,7 +89,7 @@ class RetryPlacementExchange(FakeExchange):
         self.place_calls = 0
         self.failures = failures
 
-    def place_dual(self, market, *, price, size):
+    def place_dual(self, market, *, price, size, submission_interval_ms):
         self.place_calls += 1
         if self.place_calls <= self.failures:
             return PlacementResult(
@@ -122,11 +122,16 @@ class RetryPlacementExchange(FakeExchange):
 
 
 class AmbiguousRetryPlacementExchange(RetryPlacementExchange):
-    def place_dual(self, market, *, price, size):
+    def place_dual(self, market, *, price, size, submission_interval_ms):
         if self.place_calls == 0:
             self.place_calls = 1
             raise AmbiguousPlacementError("network interrupted")
-        return super().place_dual(market, price=price, size=size)
+        return super().place_dual(
+            market,
+            price=price,
+            size=size,
+            submission_interval_ms=submission_interval_ms,
+        )
 
     def reconcile_ambiguous_dual(
         self,

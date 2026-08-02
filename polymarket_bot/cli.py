@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .config import BotConfig, SetupConfig
 from .database import BotDatabase
-from .exchange import Exchange
+from .exchange import DEFAULT_PLACEMENT_INTERVAL_MS, Exchange
 from .lock import SingleInstance
 from .models import ExitTarget, TradePlan
 from .paper import PaperDatabase, PaperSimulator, paper_database_path
@@ -46,6 +46,13 @@ def _take_profit_arg(value: str) -> ExitTarget:
         price=_decimal_arg(price_text),
         fraction=_decimal_arg(fraction_text),
     )
+
+
+def _placement_interval_ms_arg(value: str) -> Decimal:
+    parsed = _decimal_arg(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("placement interval must be above 0 ms")
+    return parsed
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -111,6 +118,16 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "enable Polymarket's disconnect-cancels-orders heartbeat and send "
             "every SECONDS; omitted disables it"
+        ),
+    )
+    run.add_argument(
+        "--placement-interval-ms",
+        type=_placement_interval_ms_arg,
+        default=DEFAULT_PLACEMENT_INTERVAL_MS,
+        metavar="MILLISECONDS",
+        help=(
+            "delay between identical signed Up/Down batch submissions; "
+            f"default {DEFAULT_PLACEMENT_INTERVAL_MS} ms"
         ),
     )
     run.add_argument(
@@ -240,6 +257,7 @@ def main() -> None:
                 max_daily_filled_cost=args.max_daily_filled_cost,
                 lookahead_minutes=args.lookahead_minutes,
                 placement_order=args.placement_order,
+                placement_interval_ms=args.placement_interval_ms,
                 cancel_before_end_seconds=args.cancel_before_end_seconds,
                 heartbeat_seconds=args.heartbeat_seconds,
                 live=args.live,

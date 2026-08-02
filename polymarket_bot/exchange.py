@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from decimal import Decimal
 
 import requests
@@ -31,6 +33,8 @@ ORDER_ENGINE_NOT_READY_ERRORS = {
     (400, "invalid token id"),
     (404, "market not found"),
 }
+DEFAULT_PLACEMENT_INTERVAL_MS = Decimal("20")
+MAX_IN_FLIGHT_PLACEMENT_REQUESTS = 16
 DUPLICATE_ORDER_PATTERN = re.compile(
     r"\border\s+(0x[0-9a-f]{64})\s+is invalid\.\s*duplicated\.",
     re.IGNORECASE,
@@ -40,9 +44,16 @@ DUPLICATE_ORDER_PATTERN = re.compile(
 class AmbiguousPlacementError(RuntimeError):
     """The exchange may have received a batch whose response was lost."""
 
-    def __init__(self, message: str, *, retryable: bool = True):
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = True,
+        attempts: int = 1,
+    ):
         super().__init__(message)
         self.retryable = retryable
+        self.attempts = attempts
 
 
 def _duplicate_order_id(response: object) -> str | None:
@@ -83,7 +94,7 @@ def _order_engine_not_ready(response: object) -> bool:
 
 def _transient_submission_error(error: PolyApiException) -> bool:
     status = error.status_code
-    return status is None or 500 <= status < 600
+    return status is None or status == 429 or 500 <= status < 600
 
 
 def _order_engine_not_ready_error(error: PolyApiException) -> str | None:
@@ -104,6 +115,9 @@ def _heartbeat_id(payload: object) -> str | None:
 
 
 class Exchange:
+    _placement_executor: ThreadPoolExecutor | None = None
+    _next_placement_submission = 0.0
+
     def __init__(self, config: BotConfig):
         creds = None
         if config.api_key:
@@ -134,6 +148,11 @@ class Exchange:
         )
         self.heartbeat_id = ""
         self._dual_submissions: dict[tuple, list[PostOrdersV2Args]] = {}
+        self._placement_executor = ThreadPoolExecutor(
+            max_workers=MAX_IN_FLIGHT_PLACEMENT_REQUESTS,
+            thread_name_prefix="placement",
+        )
+        self._next_placement_submission = 0.0
 
     @staticmethod
     def geoblock() -> dict:
@@ -176,6 +195,7 @@ class Exchange:
         *,
         price: Decimal,
         size: Decimal,
+        submission_interval_ms: Decimal | None = None,
     ) -> PlacementResult:
         options = PartialCreateOrderOptions(
             tick_size=str(market.tick_size),
@@ -203,18 +223,37 @@ class Exchange:
                 signed.append(PostOrdersV2Args(order=order, orderType=OrderType.GTC))
             submissions[submission_key] = signed
 
+        if submission_interval_ms is not None:
+            if submission_interval_ms <= 0:
+                raise ValueError("submission_interval_ms must be above 0")
+            return self._place_dual_staggered(
+                specifications,
+                signed,
+                price=price,
+                size=size,
+                submission_interval_ms=submission_interval_ms,
+                market_end_ts=market.end_ts,
+                submission_key=submission_key,
+                submissions=submissions,
+            )
+
+        attempts = 1
         try:
             responses = self.client.post_orders(signed, post_only=True)
         except PolyApiException as exc:
             not_ready_error = _order_engine_not_ready_error(exc)
             if not_ready_error:
-                return PlacementResult((), not_ready_error, retryable=True)
+                return PlacementResult(
+                    (), not_ready_error, retryable=True, attempts=attempts
+                )
             if not _transient_submission_error(exc):
                 submissions.pop(submission_key, None)
                 return PlacementResult(
                     (),
                     f"{type(exc).__name__}: {exc}",
+                    attempts=attempts,
                 )
+            attempts += 1
             try:
                 responses = self.client.post_orders(signed, post_only=True)
             except Exception as retry_exc:
@@ -222,20 +261,216 @@ class Exchange:
                 if isinstance(retry_exc, PolyApiException):
                     not_ready_error = _order_engine_not_ready_error(retry_exc)
                     if not_ready_error:
-                        return PlacementResult((), not_ready_error, retryable=True)
+                        return PlacementResult(
+                            (),
+                            not_ready_error,
+                            retryable=True,
+                            attempts=attempts,
+                        )
                     retryable = _transient_submission_error(retry_exc)
                 raise AmbiguousPlacementError(
                     f"transient submission retry failed: "
                     f"initial={exc}; retry={type(retry_exc).__name__}: {retry_exc}",
                     retryable=retryable,
+                    attempts=attempts,
                 ) from retry_exc
         except Exception as exc:
             raise AmbiguousPlacementError(
-                f"submission response unavailable: {type(exc).__name__}: {exc}"
+                f"submission response unavailable: {type(exc).__name__}: {exc}",
+                attempts=attempts,
             ) from exc
+
+        result = self._parse_dual_responses(
+            specifications,
+            responses,
+            price=price,
+            size=size,
+            attempts=attempts,
+        )
+        return self._finalize_dual_result(
+            result,
+            submission_key=submission_key,
+            submissions=submissions,
+        )
+
+    def _place_dual_staggered(
+        self,
+        specifications: tuple[tuple[str, str], tuple[str, str]],
+        signed: list[PostOrdersV2Args],
+        *,
+        price: Decimal,
+        size: Decimal,
+        submission_interval_ms: Decimal,
+        market_end_ts: int,
+        submission_key: tuple,
+        submissions: dict[tuple, list[PostOrdersV2Args]],
+    ) -> PlacementResult:
+        """Submit one immutable signed pair at a fixed interval until accepted."""
+        interval = float(submission_interval_ms / Decimal("1000"))
+        pending: set[Future] = set()
+        accepted: dict[str, PlacedOrder] = {}
+        errors: list[str] = []
+        ambiguous_errors: list[str] = []
+        attempts = 0
+        next_submission = max(
+            time.monotonic(),
+            self._next_placement_submission,
+        )
+        stop_submitting = False
+
+        while pending or not stop_submitting:
+            now = time.monotonic()
+            if not stop_submitting and time.time() >= market_end_ts:
+                errors.append("market ended before both orders were accepted")
+                stop_submitting = True
+            if (
+                not stop_submitting
+                and len(pending) < MAX_IN_FLIGHT_PLACEMENT_REQUESTS
+                and now >= next_submission
+            ):
+                pending.add(
+                    self._placement_pool().submit(
+                        self.client.post_orders,
+                        signed,
+                        post_only=True,
+                    )
+                )
+                attempts += 1
+                next_submission = now + interval
+                self._next_placement_submission = next_submission
+                continue
+
+            timeout = (
+                None
+                if stop_submitting
+                or len(pending) >= MAX_IN_FLIGHT_PLACEMENT_REQUESTS
+                else max(0.0, next_submission - now)
+            )
+            if not pending:
+                if stop_submitting:
+                    break
+                if timeout is not None:
+                    time.sleep(timeout)
+                continue
+
+            completed, _ = wait(
+                pending,
+                timeout=timeout,
+                return_when=FIRST_COMPLETED,
+            )
+            if not completed:
+                continue
+            pending.difference_update(completed)
+
+            for future in completed:
+                try:
+                    responses = future.result()
+                except PolyApiException as exc:
+                    not_ready_error = _order_engine_not_ready_error(exc)
+                    if not_ready_error:
+                        errors.append(not_ready_error)
+                    elif _transient_submission_error(exc):
+                        ambiguous_errors.append(f"{type(exc).__name__}: {exc}")
+                    else:
+                        errors.append(f"{type(exc).__name__}: {exc}")
+                        stop_submitting = True
+                    continue
+                except Exception as exc:
+                    ambiguous_errors.append(f"{type(exc).__name__}: {exc}")
+                    stop_submitting = True
+                    continue
+
+                try:
+                    result = self._parse_dual_responses(
+                        specifications,
+                        responses,
+                        price=price,
+                        size=size,
+                        attempts=attempts,
+                    )
+                except AmbiguousPlacementError as exc:
+                    ambiguous_errors.append(str(exc))
+                    continue
+
+                errors.append(result.error or "")
+                for order in result.orders:
+                    existing = accepted.get(order.outcome)
+                    if existing is not None and existing.order_id != order.order_id:
+                        ambiguous_errors.append(
+                            f"conflicting {order.outcome} order ids: "
+                            f"{existing.order_id}, {order.order_id}"
+                        )
+                        stop_submitting = True
+                        continue
+                    accepted[order.outcome] = order
+
+                if len(accepted) == 2:
+                    for outstanding in pending:
+                        outstanding.cancel()
+                    ordered = tuple(accepted[outcome] for outcome, _ in specifications)
+                    return self._finalize_dual_result(
+                        PlacementResult(ordered, attempts=attempts),
+                        submission_key=submission_key,
+                        submissions=submissions,
+                    )
+
+                recoverable = (
+                    isinstance(responses, (list, tuple))
+                    and len(responses) == 2
+                    and all(
+                        _accepted(response) or _order_engine_not_ready(response)
+                        for response in responses
+                    )
+                )
+                if not recoverable:
+                    stop_submitting = True
+
+        if ambiguous_errors:
+            unique = "; ".join(dict.fromkeys(ambiguous_errors))
+            raise AmbiguousPlacementError(
+                f"staggered submission remained ambiguous: {unique}",
+                attempts=attempts,
+            )
+
+        meaningful_errors = [error for error in dict.fromkeys(errors) if error]
+        error = "; ".join(meaningful_errors) or "partial placement"
+        if accepted:
+            accepted_orders = tuple(
+                accepted[outcome]
+                for outcome, _ in specifications
+                if outcome in accepted
+            )
+            result = PlacementResult(
+                accepted_orders,
+                error,
+                attempts=attempts,
+            )
+        else:
+            result = PlacementResult(
+                (),
+                error,
+                retryable=not stop_submitting,
+                attempts=attempts,
+            )
+        return self._finalize_dual_result(
+            result,
+            submission_key=submission_key,
+            submissions=submissions,
+        )
+
+    @staticmethod
+    def _parse_dual_responses(
+        specifications: tuple[tuple[str, str], tuple[str, str]],
+        responses: object,
+        *,
+        price: Decimal,
+        size: Decimal,
+        attempts: int,
+    ) -> PlacementResult:
         if not isinstance(responses, (list, tuple)) or len(responses) != 2:
             raise AmbiguousPlacementError(
-                "submission returned an incomplete dual-order response"
+                "submission returned an incomplete dual-order response",
+                attempts=attempts,
             )
         accepted = []
         errors = []
@@ -260,23 +495,43 @@ class Exchange:
                 errors.append(str(response))
 
         if len(accepted) == 2:
-            submissions.pop(submission_key, None)
-            return PlacementResult(tuple(accepted))
-        if accepted:
-            self.client.cancel_orders([order.order_id for order in accepted])
-            submissions.pop(submission_key, None)
+            return PlacementResult(tuple(accepted), attempts=attempts)
         retryable = (
             not accepted
             and len(responses) == 2
             and all(_order_engine_not_ready(response) for response in responses)
         )
-        if not retryable:
-            submissions.pop(submission_key, None)
         return PlacementResult(
             tuple(accepted),
             "; ".join(errors) or "partial placement",
             retryable=retryable,
+            attempts=attempts,
         )
+
+    def _finalize_dual_result(
+        self,
+        result: PlacementResult,
+        *,
+        submission_key: tuple,
+        submissions: dict[tuple, list[PostOrdersV2Args]],
+    ) -> PlacementResult:
+        if result.complete:
+            submissions.pop(submission_key, None)
+            return result
+        if result.orders:
+            self.client.cancel_orders([order.order_id for order in result.orders])
+            submissions.pop(submission_key, None)
+        elif not result.retryable:
+            submissions.pop(submission_key, None)
+        return result
+
+    def _placement_pool(self) -> ThreadPoolExecutor:
+        if self._placement_executor is None:
+            self._placement_executor = ThreadPoolExecutor(
+                max_workers=MAX_IN_FLIGHT_PLACEMENT_REQUESTS,
+                thread_name_prefix="placement",
+            )
+        return self._placement_executor
 
     @staticmethod
     def _dual_submission_key(
