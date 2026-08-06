@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import re
 import time
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, wait
 from decimal import Decimal
+from threading import Thread
 
 import requests
 from py_clob_client_v2 import (
@@ -34,7 +35,6 @@ ORDER_ENGINE_NOT_READY_ERRORS = {
     (404, "market not found"),
 }
 DEFAULT_PLACEMENT_INTERVAL_MS = Decimal("20")
-MAX_IN_FLIGHT_PLACEMENT_REQUESTS = 16
 DUPLICATE_ORDER_PATTERN = re.compile(
     r"\border\s+(0x[0-9a-f]{64})\s+is invalid\.\s*duplicated\.",
     re.IGNORECASE,
@@ -115,7 +115,6 @@ def _heartbeat_id(payload: object) -> str | None:
 
 
 class Exchange:
-    _placement_executor: ThreadPoolExecutor | None = None
     _next_placement_submission = 0.0
 
     def __init__(self, config: BotConfig):
@@ -148,10 +147,6 @@ class Exchange:
         )
         self.heartbeat_id = ""
         self._dual_submissions: dict[tuple, list[PostOrdersV2Args]] = {}
-        self._placement_executor = ThreadPoolExecutor(
-            max_workers=MAX_IN_FLIGHT_PLACEMENT_REQUESTS,
-            thread_name_prefix="placement",
-        )
         self._next_placement_submission = 0.0
 
     @staticmethod
@@ -323,18 +318,8 @@ class Exchange:
             if not stop_submitting and time.time() >= market_end_ts:
                 errors.append("market ended before both orders were accepted")
                 stop_submitting = True
-            if (
-                not stop_submitting
-                and len(pending) < MAX_IN_FLIGHT_PLACEMENT_REQUESTS
-                and now >= next_submission
-            ):
-                pending.add(
-                    self._placement_pool().submit(
-                        self.client.post_orders,
-                        signed,
-                        post_only=True,
-                    )
-                )
+            if not stop_submitting and now >= next_submission:
+                pending.add(self._submit_placement_request(signed))
                 attempts += 1
                 next_submission = now + interval
                 self._next_placement_submission = next_submission
@@ -343,7 +328,6 @@ class Exchange:
             timeout = (
                 None
                 if stop_submitting
-                or len(pending) >= MAX_IN_FLIGHT_PLACEMENT_REQUESTS
                 else max(0.0, next_submission - now)
             )
             if not pending:
@@ -525,13 +509,24 @@ class Exchange:
             submissions.pop(submission_key, None)
         return result
 
-    def _placement_pool(self) -> ThreadPoolExecutor:
-        if self._placement_executor is None:
-            self._placement_executor = ThreadPoolExecutor(
-                max_workers=MAX_IN_FLIGHT_PLACEMENT_REQUESTS,
-                thread_name_prefix="placement",
-            )
-        return self._placement_executor
+    def _submit_placement_request(
+        self,
+        signed: list[PostOrdersV2Args],
+    ) -> Future:
+        future: Future = Future()
+
+        def submit() -> None:
+            if not future.set_running_or_notify_cancel():
+                return
+            try:
+                response = self.client.post_orders(signed, post_only=True)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(response)
+
+        Thread(target=submit, name="placement", daemon=True).start()
+        return future
 
     @staticmethod
     def _dual_submission_key(

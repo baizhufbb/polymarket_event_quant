@@ -126,9 +126,9 @@ heartbeat. It does not change Polymarket's server-side cancellation deadline.
   model fills or profitability. Use `paper` for an execution-aware simulation.
 - Live mode also requires `POLYMARKET_LIVE_ACK=I_UNDERSTAND_REAL_ORDERS`.
 - During activation, the bot submits the same signed Up/Down batch at the
-  `--placement-interval-ms` cadence until both orders are accepted. The in-flight
-  request limit bounds concurrency but does not cap the total attempt count.
-  Overlapping requests reuse the original order hashes, so a duplicate response
+  `--placement-interval-ms` cadence until both orders are accepted. Each cadence
+  tick starts its submission immediately. Overlapping requests reuse the
+  original order hashes, so a duplicate response
   identifies the original order instead of creating another position. If the
   result remains ambiguous, the bot reconciles exchange orders. A temporary
   reconciliation outage keeps the market pending instead of permanently

@@ -1,6 +1,6 @@
 import time
 from decimal import Decimal
-from threading import Lock
+from threading import Event, Lock
 
 import httpx
 import pytest
@@ -128,16 +128,35 @@ class StaggeredClient(FakeClient):
                 self.active -= 1
 
 
-class LateAcceptanceClient(FakeClient):
-    def __init__(self, accept_on_call: int):
+class UncappedInFlightClient(FakeClient):
+    def __init__(self):
         super().__init__([])
-        self.accept_on_call = accept_on_call
-        self.posted_batches = []
+        self.lock = Lock()
+        self.release = Event()
+        self.calls = 0
+        self.active = 0
+        self.max_active = 0
 
     def post_orders(self, signed, post_only=False):
         assert post_only is True
-        self.posted_batches.append(tuple(signed))
-        if len(self.posted_batches) < self.accept_on_call:
+        with self.lock:
+            self.calls += 1
+            call_number = self.calls
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            if self.active >= 17:
+                self.release.set()
+        try:
+            self.release.wait(timeout=1)
+            if call_number == 17:
+                return [
+                    {"success": True, "orderID": "up-order", "status": "live"},
+                    {
+                        "success": True,
+                        "orderID": "down-order",
+                        "status": "live",
+                    },
+                ]
             return [
                 {
                     "success": False,
@@ -150,10 +169,9 @@ class LateAcceptanceClient(FakeClient):
                     "errorMsg": "the market is not yet ready to process new orders",
                 },
             ]
-        return [
-            {"success": True, "orderID": "up-order", "status": "live"},
-            {"success": True, "orderID": "down-order", "status": "live"},
-        ]
+        finally:
+            with self.lock:
+                self.active -= 1
 
 
 def api_error(status_code: int, message: str) -> PolyApiException:
@@ -164,17 +182,13 @@ def api_error(status_code: int, message: str) -> PolyApiException:
 def test_staggered_submission_overlaps_identical_signed_batches() -> None:
     exchange = Exchange.__new__(Exchange)
     exchange.client = StaggeredClient()
-    exchange._placement_executor = None
 
-    try:
-        result = exchange.place_dual(
-            MARKET,
-            price=Decimal("0.01"),
-            size=Decimal("100"),
-            submission_interval_ms=Decimal("20"),
-        )
-    finally:
-        exchange._placement_pool().shutdown(wait=True)
+    result = exchange.place_dual(
+        MARKET,
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        submission_interval_ms=Decimal("20"),
+    )
 
     assert result.complete
     assert result.attempts >= 2
@@ -185,23 +199,19 @@ def test_staggered_submission_overlaps_identical_signed_batches() -> None:
     assert all(batch[1] is first[1] for batch in exchange.client.posted_batches)
 
 
-def test_staggered_submission_is_not_limited_to_sixteen_attempts() -> None:
+def test_staggered_submission_has_no_fixed_in_flight_limit() -> None:
     exchange = Exchange.__new__(Exchange)
-    exchange.client = LateAcceptanceClient(accept_on_call=18)
-    exchange._placement_executor = None
+    exchange.client = UncappedInFlightClient()
 
-    try:
-        result = exchange.place_dual(
-            MARKET,
-            price=Decimal("0.01"),
-            size=Decimal("100"),
-            submission_interval_ms=Decimal("1"),
-        )
-    finally:
-        exchange._placement_pool().shutdown(wait=True)
+    result = exchange.place_dual(
+        MARKET,
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        submission_interval_ms=Decimal("1"),
+    )
 
     assert result.complete
-    assert result.attempts == 18
+    assert exchange.client.max_active >= 17
 
 
 def test_transient_batch_failure_immediately_reuses_the_same_signed_orders() -> None:
