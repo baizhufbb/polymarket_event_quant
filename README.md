@@ -27,9 +27,10 @@ until stopped.
   Set it to `0` to leave orders resting until Polymarket closes the market.
 - Polymarket's disconnect-cancels-orders heartbeat is disabled unless
   `--heartbeat-seconds SECONDS` is supplied.
-- Opening submissions use a configurable staggered cadence.
-  `--placement-interval-ms` defaults to 20 milliseconds between identical
-  signed Up/Down batches.
+- Live entries wait for the market's first public order-book event, then
+  submit the pre-signed batch in a burst. Probing the order endpoint while
+  the book is closed only burns the rate-limit budget. `--placement-interval-ms`
+  sets the burst cadence and defaults to 5 milliseconds.
 - The bot does not submit redemption transactions. Resolved winnings are
   returned by Polymarket's account-side settlement service.
 
@@ -47,8 +48,9 @@ once, then the predictable next five-minute slug is queried every second. These
 requests include a unique cache buster because Gamma otherwise advertises a
 five-minute public cache. Each newly discovered condition is checked against
 `GET /clob-markets/{condition_id}` every 250 milliseconds. As soon as CLOB
-returns both real token IDs, the main loop is woken and submits the post-only
-pair.
+returns both real token IDs, the main loop is woken; the service then waits
+for the market's first public order-book event and submits the post-only pair
+in a burst.
 
 ## Runtime sequence and interfaces
 
@@ -125,7 +127,8 @@ heartbeat. It does not change Polymarket's server-side cancellation deadline.
 - The ordinary dry-run checks discovery and order planning only. It does not
   model fills or profitability. Use `paper` for an execution-aware simulation.
 - Live mode also requires `POLYMARKET_LIVE_ACK=I_UNDERSTAND_REAL_ORDERS`.
-- During activation, the bot submits the same signed Up/Down batch at the
+- During activation, the bot holds fire until the market's first public book
+  event, then submits the same signed Up/Down batch at the
   `--placement-interval-ms` cadence until both orders are accepted. Each cadence
   tick starts its submission immediately. Overlapping requests reuse the
   original order hashes, so a duplicate response

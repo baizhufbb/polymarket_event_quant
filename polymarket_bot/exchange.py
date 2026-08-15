@@ -34,7 +34,7 @@ ORDER_ENGINE_NOT_READY_ERRORS = {
     (400, "invalid token id"),
     (404, "market not found"),
 }
-DEFAULT_PLACEMENT_INTERVAL_MS = Decimal("20")
+DEFAULT_PLACEMENT_INTERVAL_MS = Decimal("5")
 DUPLICATE_ORDER_PATTERN = re.compile(
     r"\border\s+(0x[0-9a-f]{64})\s+is invalid\.\s*duplicated\.",
     re.IGNORECASE,

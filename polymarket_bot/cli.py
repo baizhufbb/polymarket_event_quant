@@ -126,7 +126,8 @@ def _parser() -> argparse.ArgumentParser:
         default=DEFAULT_PLACEMENT_INTERVAL_MS,
         metavar="MILLISECONDS",
         help=(
-            "delay between identical signed Up/Down batch submissions; "
+            "delay between identical signed Up/Down batch submissions in the "
+            "burst that follows the book-open signal; "
             f"default {DEFAULT_PLACEMENT_INTERVAL_MS} ms"
         ),
     )

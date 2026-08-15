@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from threading import Event
 
+from .book_signal import BookOpenSignal
 from .config import BotConfig
 from .database import BotDatabase
 from .discovery import MarketDiscovery, is_eligible
@@ -39,6 +40,8 @@ TERMINAL_ORDER_STATES = {
     "terminal_unknown",
 }
 
+BOOK_SIGNAL_TIMEOUT_SECONDS = 240.0
+
 
 @dataclass
 class _PlacementRetryState:
@@ -66,6 +69,7 @@ def _classify_cancel_result(result: object) -> tuple[list[str], list[str]]:
 
 class BotService:
     placement_interval_ms = DEFAULT_PLACEMENT_INTERVAL_MS
+    book_signal_factory = None
 
     def __init__(
         self,
@@ -100,6 +104,7 @@ class BotService:
         self.wake_event = Event()
         self.discovery = MarketDiscovery()
         self.exchange = Exchange(config) if live else None
+        self.book_signal_factory = BookOpenSignal if live else None
         self.heartbeat_worker = (
             HeartbeatWorker(self.exchange, float(heartbeat_seconds))
             if self.exchange and heartbeat_seconds is not None
@@ -679,6 +684,12 @@ class BotService:
             self.logger.info("DRY-RUN %s: Up/Down bids prepared", market.slug)
             return
 
+        book_signal = None
+        if self.book_signal_factory is not None:
+            book_signal = self._await_book_open(market)
+            if book_signal is None:
+                return
+
         placement_started_ts_ms = int(time.time() * 1000)
         submission_error = None
         reconciliation_error = None
@@ -726,6 +737,7 @@ class BotService:
             "placement_started_ts_ms": placement_started_ts_ms,
             "placement_finished_ts_ms": placement_finished_ts_ms,
             "submission_attempts": result.attempts,
+            **(book_signal or {}),
             **(trigger_details or {}),
         }
         if submission_error:
@@ -790,6 +802,51 @@ class BotService:
                     **placement_details,
                 },
             )
+
+    def _await_book_open(self, market: Market) -> dict | None:
+        """Hold submissions until the market's first public book event.
+
+        Probing the order endpoint while the book is closed burns the
+        rate-limit budget exactly when it is needed; the burst must start
+        with a clean budget the moment the book opens.
+        """
+        wait_started_ts_ms = int(time.time() * 1000)
+        watcher = self.book_signal_factory(
+            market.up_token_id, market.down_token_id
+        )
+        try:
+            timeout = min(
+                BOOK_SIGNAL_TIMEOUT_SECONDS,
+                max(0.0, market.end_ts - time.time()),
+            )
+            opened = watcher.wait(timeout)
+        finally:
+            watcher.close()
+        if not opened:
+            self._placement_retries.pop(market.slug, None)
+            reason = watcher.error or "book-open signal timed out"
+            self.database.set_market_state(market.slug, "error", reason)
+            self.database.event(
+                self.run_id,
+                "WARNING",
+                "book_signal_timeout",
+                slug=market.slug,
+                details={
+                    "wait_started_ts_ms": wait_started_ts_ms,
+                    "waited_ms": int(time.time() * 1000) - wait_started_ts_ms,
+                    "error": watcher.error,
+                },
+            )
+            self.logger.warning(
+                "LIVE %s: book-open signal not received; market skipped",
+                market.slug,
+            )
+            return None
+        signal_ts_ms = watcher.signal_ts_ms or int(time.time() * 1000)
+        return {
+            "book_signal_ts_ms": signal_ts_ms,
+            "book_signal_wait_ms": signal_ts_ms - wait_started_ts_ms,
+        }
 
     def _requeue_placement(
         self,
