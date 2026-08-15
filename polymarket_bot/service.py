@@ -814,6 +814,7 @@ class BotService:
         watcher = self.book_signal_factory(
             market.up_token_id, market.down_token_id
         )
+        opened = False
         try:
             timeout = min(
                 BOOK_SIGNAL_TIMEOUT_SECONDS,
@@ -821,7 +822,12 @@ class BotService:
             )
             opened = watcher.wait(timeout)
         finally:
-            watcher.close()
+            # Closing joins the watcher threads and the websocket close
+            # handshake can hang for seconds (measured: three markets entered
+            # five seconds late because of it). After a signal the threads
+            # exit on their own, so the burst must start without closing.
+            if not opened:
+                watcher.close()
         if not opened:
             self._placement_retries.pop(market.slug, None)
             reason = watcher.error or "book-open signal timed out"
@@ -846,6 +852,7 @@ class BotService:
         return {
             "book_signal_ts_ms": signal_ts_ms,
             "book_signal_wait_ms": signal_ts_ms - wait_started_ts_ms,
+            "book_signal_source": getattr(watcher, "signal_source", None),
         }
 
     def _requeue_placement(

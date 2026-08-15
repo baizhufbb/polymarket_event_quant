@@ -27,10 +27,12 @@ until stopped.
   Set it to `0` to leave orders resting until Polymarket closes the market.
 - Polymarket's disconnect-cancels-orders heartbeat is disabled unless
   `--heartbeat-seconds SECONDS` is supplied.
-- Live entries wait for the market's first public order-book event, then
+- Live entries wait for the earliest public evidence that the book exists —
+  a REST books poll and the market WebSocket feed race each other — then
   submit the pre-signed batch in a burst. Probing the order endpoint while
   the book is closed only burns the rate-limit budget. `--placement-interval-ms`
-  sets the burst cadence and defaults to 5 milliseconds.
+  sets the burst cadence and defaults to 40 milliseconds, roughly the
+  sustained rate the order endpoint accepts without rejections.
 - The bot does not submit redemption transactions. Resolved winnings are
   returned by Polymarket's account-side settlement service.
 

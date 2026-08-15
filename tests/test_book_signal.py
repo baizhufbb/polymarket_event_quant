@@ -3,7 +3,11 @@ import logging
 import time
 from decimal import Decimal
 
-from polymarket_bot.book_signal import BookOpenSignal, payload_mentions_assets
+from polymarket_bot.book_signal import (
+    BookOpenSignal,
+    books_mention_assets,
+    payload_mentions_assets,
+)
 from polymarket_bot.database import BotDatabase
 from polymarket_bot.models import Market, PlacedOrder, PlacementResult, TradePlan
 from polymarket_bot.service import BotService
@@ -57,10 +61,21 @@ class FakeSocket:
         raise TimeoutError
 
 
+def test_books_matching_requires_listed_book() -> None:
+    assert books_mention_assets([{"asset_id": "11", "bids": []}], ASSETS)
+    assert not books_mention_assets([{"asset_id": "99"}], ASSETS)
+    assert not books_mention_assets({"asset_id": "11"}, ASSETS)
+    assert not books_mention_assets([], ASSETS)
+
+
 def test_signal_fires_on_first_matching_event() -> None:
     sock = FakeSocket([json.dumps({"event_type": "book", "asset_id": "11"})])
     signal = BookOpenSignal(
-        "11", "22", url="ws://test", connect_fn=lambda url, **kw: sock
+        "11",
+        "22",
+        url="ws://test",
+        connect_fn=lambda url, **kw: sock,
+        rest_poll_ms=None,
     )
     try:
         assert signal.wait(2.0)
@@ -93,7 +108,9 @@ def test_signal_ignores_noise_and_reconnects_after_failure() -> None:
             ]
         )
 
-    signal = BookOpenSignal("11", "22", url="ws://test", connect_fn=connect_fn)
+    signal = BookOpenSignal(
+        "11", "22", url="ws://test", connect_fn=connect_fn, rest_poll_ms=None
+    )
     try:
         assert signal.wait(3.0)
     finally:
@@ -103,11 +120,57 @@ def test_signal_ignores_noise_and_reconnects_after_failure() -> None:
 
 def test_close_stops_watcher_without_signal() -> None:
     signal = BookOpenSignal(
-        "11", "22", url="ws://test", connect_fn=lambda url, **kw: FakeSocket([])
+        "11",
+        "22",
+        url="ws://test",
+        connect_fn=lambda url, **kw: FakeSocket([]),
+        rest_poll_ms=None,
     )
     assert not signal.wait(0.2)
     signal.close()
     assert signal.signal_ts_ms is None
+
+
+def test_rest_probe_wins_the_signal_race() -> None:
+    signal = BookOpenSignal(
+        "11",
+        "22",
+        url="ws://test",
+        connect_fn=lambda url, **kw: FakeSocket([]),
+        rest_poll_ms=5,
+        books_fn=lambda: True,
+    )
+    try:
+        assert signal.wait(2.0)
+        assert signal.signal_source == "rest"
+        assert signal.signal_ts_ms is not None
+    finally:
+        signal.close()
+
+
+def test_rest_probe_survives_errors_until_book_appears() -> None:
+    calls = {"n": 0}
+
+    def probe():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("books endpoint hiccup")
+        return calls["n"] >= 3
+
+    signal = BookOpenSignal(
+        "11",
+        "22",
+        url="ws://test",
+        connect_fn=lambda url, **kw: FakeSocket([]),
+        rest_poll_ms=5,
+        books_fn=probe,
+    )
+    try:
+        assert signal.wait(2.0)
+        assert signal.signal_source == "rest"
+    finally:
+        signal.close()
+    assert calls["n"] >= 3
 
 
 class RecordingExchange:
