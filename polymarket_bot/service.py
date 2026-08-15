@@ -70,6 +70,7 @@ def _classify_cancel_result(result: object) -> tuple[list[str], list[str]]:
 class BotService:
     placement_interval_ms = DEFAULT_PLACEMENT_INTERVAL_MS
     book_signal_factory = None
+    entry_submission = "batch"
 
     def __init__(
         self,
@@ -83,6 +84,7 @@ class BotService:
         lookahead_minutes: int,
         placement_order: str,
         placement_interval_ms: Decimal,
+        entry_submission: str = "batch",
         cancel_before_end_seconds: int,
         heartbeat_seconds: Decimal | None,
         live: bool,
@@ -101,9 +103,12 @@ class BotService:
         self.heartbeat_seconds = heartbeat_seconds
         self.live = live
         self.logger = logger
+        self.entry_submission = entry_submission
         self.wake_event = Event()
         self.discovery = MarketDiscovery()
         self.exchange = Exchange(config) if live else None
+        if self.exchange:
+            self.exchange.entry_submission = entry_submission
         self.book_signal_factory = BookOpenSignal if live else None
         self.heartbeat_worker = (
             HeartbeatWorker(self.exchange, float(heartbeat_seconds))
@@ -158,6 +163,7 @@ class BotService:
             "lookahead_minutes": self.lookahead_minutes,
             "placement_order": self.placement_order,
             "placement_interval_ms": str(self.placement_interval_ms),
+            "entry_submission": self.entry_submission,
             "cancel_before_end_seconds": self.cancel_before_end_seconds,
             "heartbeat_seconds": (
                 str(self.heartbeat_seconds)

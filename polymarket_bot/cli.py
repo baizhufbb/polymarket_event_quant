@@ -136,6 +136,15 @@ def _parser() -> argparse.ArgumentParser:
         choices=("nearest-first", "farthest-first"),
         default="nearest-first",
     )
+    run.add_argument(
+        "--entry-submission",
+        choices=("batch", "single"),
+        default="batch",
+        help=(
+            "submit the entry pair as one batch request or as two parallel "
+            "single-order requests; default batch"
+        ),
+    )
     return parser
 
 
@@ -259,6 +268,7 @@ def main() -> None:
                 lookahead_minutes=args.lookahead_minutes,
                 placement_order=args.placement_order,
                 placement_interval_ms=args.placement_interval_ms,
+                entry_submission=args.entry_submission,
                 cancel_before_end_seconds=args.cancel_before_end_seconds,
                 heartbeat_seconds=args.heartbeat_seconds,
                 live=args.live,

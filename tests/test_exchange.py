@@ -710,3 +710,98 @@ def test_heartbeat_retries_once_with_server_id() -> None:
 
     assert exchange.client.calls == ["expired", "replacement"]
     assert exchange.heartbeat_id == "current"
+
+
+class SingleModeClient(FakeClient):
+    def __init__(self, leg_responses=None):
+        super().__init__([])
+        self.single_posts = []
+        self.leg_responses = leg_responses or {}
+        self.raised = {"up-token": 0, "down-token": 0}
+
+    def post_orders(self, signed, post_only=False):
+        raise AssertionError("single mode must not use the batch endpoint")
+
+    def post_order(self, signed, order_type, post_only=False):
+        assert post_only is True
+        token = signed["token_id"]
+        self.single_posts.append(token)
+        plan = self.leg_responses.get(token)
+        if plan:
+            action = plan.pop(0)
+            if isinstance(action, Exception):
+                raise action
+            return action
+        return {"success": True, "orderID": f"{token}-id", "status": "live"}
+
+
+def _not_ready_error():
+    error = PolyApiException(
+        error_msg={"error": "the market is not yet ready to process new orders"}
+    )
+    error.status_code = 400
+    return error
+
+
+def test_single_mode_places_each_leg_individually():
+    client = SingleModeClient()
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = client
+    exchange.entry_submission = "single"
+
+    result = exchange.place_dual(
+        MARKET,
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        submission_interval_ms=Decimal("1"),
+    )
+
+    assert result.complete
+    assert {order.order_id for order in result.orders} == {
+        "up-token-id",
+        "down-token-id",
+    }
+    assert set(client.single_posts) == {"up-token", "down-token"}
+
+
+def test_single_mode_treats_not_ready_as_recoverable():
+    client = SingleModeClient(
+        leg_responses={
+            "up-token": [_not_ready_error()],
+            "down-token": [_not_ready_error()],
+        }
+    )
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = client
+    exchange.entry_submission = "single"
+
+    result = exchange.place_dual(
+        MARKET,
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        submission_interval_ms=Decimal("1"),
+    )
+
+    assert result.complete
+    assert result.attempts >= 2
+
+
+def test_single_mode_recovers_after_transient_error():
+    client = SingleModeClient(
+        leg_responses={
+            "up-token": [PolyApiException(error_msg="Request exception!")],
+        }
+    )
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = client
+    exchange.entry_submission = "single"
+
+    result = exchange.place_dual(
+        MARKET,
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        submission_interval_ms=Decimal("1"),
+    )
+
+    assert result.complete
+    assert result.attempts >= 2

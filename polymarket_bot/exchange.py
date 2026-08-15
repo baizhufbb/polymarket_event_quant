@@ -86,9 +86,13 @@ def _order_engine_not_ready(response: object) -> bool:
     if not isinstance(response, dict) or _order_id(response):
         return False
     error = str(response.get("errorMsg") or "").lower()
-    return error == MARKET_NOT_READY or (
-        error.startswith(ORDERBOOK_MISSING_PREFIX)
-        and error.endswith(ORDERBOOK_MISSING_SUFFIX)
+    return (
+        error == MARKET_NOT_READY
+        or error in {"invalid token id", "market not found"}
+        or (
+            error.startswith(ORDERBOOK_MISSING_PREFIX)
+            and error.endswith(ORDERBOOK_MISSING_SUFFIX)
+        )
     )
 
 
@@ -116,6 +120,7 @@ def _heartbeat_id(payload: object) -> str | None:
 
 class Exchange:
     _next_placement_submission = 0.0
+    entry_submission = "batch"
 
     def __init__(self, config: BotConfig):
         creds = None
@@ -519,7 +524,10 @@ class Exchange:
             if not future.set_running_or_notify_cancel():
                 return
             try:
-                response = self.client.post_orders(signed, post_only=True)
+                if self.entry_submission == "single":
+                    response = self._post_dual_singles(signed)
+                else:
+                    response = self.client.post_orders(signed, post_only=True)
             except BaseException as exc:
                 future.set_exception(exc)
             else:
@@ -527,6 +535,47 @@ class Exchange:
 
         Thread(target=submit, name="placement", daemon=True).start()
         return future
+
+    def _post_dual_singles(self, signed: list[PostOrdersV2Args]) -> list[object]:
+        """Submit each leg as its own single-order request, in parallel.
+
+        The batch endpoint keeps answering "not ready" for a while after the
+        book is publicly live; this probes whether the single-order path
+        opens earlier. A leg whose response is lost is recovered on the next
+        tick through the duplicate-order recognition.
+        """
+        results: list[object] = [None] * len(signed)
+        failures: list[BaseException] = []
+
+        def run(index: int) -> None:
+            try:
+                results[index] = self._post_single(signed[index])
+            except BaseException as exc:
+                failures.append(exc)
+
+        threads = [
+            Thread(target=run, args=(index,), daemon=True)
+            for index in range(len(signed))
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        if failures:
+            raise failures[0]
+        return results
+
+    def _post_single(self, args: PostOrdersV2Args) -> object:
+        try:
+            return self.client.post_order(
+                args.order, args.orderType, post_only=True
+            )
+        except PolyApiException as exc:
+            if _transient_submission_error(exc):
+                raise
+            payload = exc.error_msg if isinstance(exc.error_msg, dict) else {}
+            message = str(payload.get("error") or exc.error_msg or exc)
+            return {"errorMsg": message, "success": False}
 
     @staticmethod
     def _dual_submission_key(
