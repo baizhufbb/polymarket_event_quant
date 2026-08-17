@@ -30,10 +30,9 @@ until stopped.
 - Live entries start submitting as soon as CLOB exposes the market's token
   ids and keep resubmitting the same pre-signed orders until both are
   accepted. `--placement-interval-ms` sets the tick cadence and defaults to
-  25 milliseconds; in single-submission mode each tick sends one pending
-  leg (about 40 rate-limit tokens per second, matching the Standard tier's
-  40 per second refill), and a leg stops consuming budget once the
-  exchange registers it.
+  20 milliseconds. In single-submission mode each tick sends one pending
+  leg, and a leg stops consuming budget once the exchange registers it;
+  a 25 ms tick matches the Standard tier's 40 tokens per second refill.
 - The bot does not submit redemption transactions. Resolved winnings are
   returned by Polymarket's account-side settlement service.
 
