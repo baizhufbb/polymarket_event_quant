@@ -70,7 +70,7 @@ def test_run_limits_are_optional_cli_parameters() -> None:
     assert args.max_daily_filled_cost is None
     assert args.lookahead_minutes == 40
     assert args.placement_order == "nearest-first"
-    assert args.placement_interval_ms == Decimal("40")
+    assert args.placement_interval_ms == Decimal("28")
     assert args.cancel_before_end_seconds == 2
     assert args.heartbeat_seconds is None
 

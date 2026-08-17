@@ -27,12 +27,13 @@ until stopped.
   Set it to `0` to leave orders resting until Polymarket closes the market.
 - Polymarket's disconnect-cancels-orders heartbeat is disabled unless
   `--heartbeat-seconds SECONDS` is supplied.
-- Live entries wait for the earliest public evidence that the book exists —
-  a REST books poll and the market WebSocket feed race each other — then
-  submit the pre-signed batch in a burst. Probing the order endpoint while
-  the book is closed only burns the rate-limit budget. `--placement-interval-ms`
-  sets the burst cadence and defaults to 40 milliseconds, roughly the
-  sustained rate the order endpoint accepts without rejections.
+- Live entries start submitting as soon as CLOB exposes the market's token
+  ids and keep resubmitting the same pre-signed orders until both are
+  accepted. `--placement-interval-ms` sets the tick cadence and defaults to
+  28 milliseconds; in single-submission mode each tick sends one pending
+  leg (about 36 rate-limit tokens per second against the Standard tier's
+  40 per second refill), and a leg stops consuming budget once the
+  exchange registers it.
 - The bot does not submit redemption transactions. Resolved winnings are
   returned by Polymarket's account-side settlement service.
 
@@ -50,9 +51,8 @@ once, then the predictable next five-minute slug is queried every second. These
 requests include a unique cache buster because Gamma otherwise advertises a
 five-minute public cache. Each newly discovered condition is checked against
 `GET /clob-markets/{condition_id}` every 250 milliseconds. As soon as CLOB
-returns both real token IDs, the main loop is woken; the service then waits
-for the market's first public order-book event and submits the post-only pair
-in a burst.
+returns both real token IDs, the main loop is woken and submits the
+post-only pair.
 
 ## Runtime sequence and interfaces
 
@@ -129,8 +129,7 @@ heartbeat. It does not change Polymarket's server-side cancellation deadline.
 - The ordinary dry-run checks discovery and order planning only. It does not
   model fills or profitability. Use `paper` for an execution-aware simulation.
 - Live mode also requires `POLYMARKET_LIVE_ACK=I_UNDERSTAND_REAL_ORDERS`.
-- During activation, the bot holds fire until the market's first public book
-  event, then submits the same signed Up/Down batch at the
+- During activation, the bot submits the same signed Up/Down entries at the
   `--placement-interval-ms` cadence until both orders are accepted. Each cadence
   tick starts its submission immediately. Overlapping requests reuse the
   original order hashes, so a duplicate response

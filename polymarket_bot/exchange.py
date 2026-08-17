@@ -34,7 +34,7 @@ ORDER_ENGINE_NOT_READY_ERRORS = {
     (400, "invalid token id"),
     (404, "market not found"),
 }
-DEFAULT_PLACEMENT_INTERVAL_MS = Decimal("40")
+DEFAULT_PLACEMENT_INTERVAL_MS = Decimal("28")
 DUPLICATE_ORDER_PATTERN = re.compile(
     r"\border\s+(0x[0-9a-f]{64})\s+is invalid\.\s*duplicated\.",
     re.IGNORECASE,
@@ -307,7 +307,7 @@ class Exchange:
     ) -> PlacementResult:
         """Submit one immutable signed pair at a fixed interval until accepted."""
         interval = float(submission_interval_ms / Decimal("1000"))
-        pending: set[Future] = set()
+        pending: dict[Future, tuple[tuple[str, str], ...]] = {}
         accepted: dict[str, PlacedOrder] = {}
         errors: list[str] = []
         ambiguous_errors: list[str] = []
@@ -324,7 +324,10 @@ class Exchange:
                 errors.append("market ended before both orders were accepted")
                 stop_submitting = True
             if not stop_submitting and now >= next_submission:
-                pending.add(self._submit_placement_request(signed))
+                submit_specs, payload = self._next_submission(
+                    specifications, signed, accepted, attempts
+                )
+                pending[self._submit_placement_request(payload)] = submit_specs
                 attempts += 1
                 next_submission = now + interval
                 self._next_placement_submission = next_submission
@@ -343,15 +346,15 @@ class Exchange:
                 continue
 
             completed, _ = wait(
-                pending,
+                set(pending),
                 timeout=timeout,
                 return_when=FIRST_COMPLETED,
             )
             if not completed:
                 continue
-            pending.difference_update(completed)
 
             for future in completed:
+                submit_specs = pending.pop(future)
                 try:
                     responses = future.result()
                 except PolyApiException as exc:
@@ -371,7 +374,7 @@ class Exchange:
 
                 try:
                     result = self._parse_dual_responses(
-                        specifications,
+                        submit_specs,
                         responses,
                         price=price,
                         size=size,
@@ -405,7 +408,7 @@ class Exchange:
 
                 recoverable = (
                     isinstance(responses, (list, tuple))
-                    and len(responses) == 2
+                    and len(responses) == len(submit_specs)
                     and all(
                         _accepted(response) or _order_engine_not_ready(response)
                         for response in responses
@@ -456,7 +459,9 @@ class Exchange:
         size: Decimal,
         attempts: int,
     ) -> PlacementResult:
-        if not isinstance(responses, (list, tuple)) or len(responses) != 2:
+        if not isinstance(responses, (list, tuple)) or len(responses) != len(
+            specifications
+        ):
             raise AmbiguousPlacementError(
                 "submission returned an incomplete dual-order response",
                 attempts=attempts,
@@ -485,10 +490,8 @@ class Exchange:
 
         if len(accepted) == 2:
             return PlacementResult(tuple(accepted), attempts=attempts)
-        retryable = (
-            not accepted
-            and len(responses) == 2
-            and all(_order_engine_not_ready(response) for response in responses)
+        retryable = not accepted and all(
+            _order_engine_not_ready(response) for response in responses
         )
         return PlacementResult(
             tuple(accepted),
@@ -535,6 +538,32 @@ class Exchange:
 
         Thread(target=submit, name="placement", daemon=True).start()
         return future
+
+    def _next_submission(
+        self,
+        specifications: tuple[tuple[str, str], ...],
+        signed: list[PostOrdersV2Args],
+        accepted: dict[str, PlacedOrder],
+        attempts: int,
+    ) -> tuple[tuple[tuple[str, str], ...], list[PostOrdersV2Args]]:
+        """Pick the payload for one cadence tick.
+
+        Batch mode always submits the full pair. Single mode submits one
+        leg per tick, rotating over the legs that are not registered yet:
+        one rate-limit token per tick, and a registered leg stops
+        consuming budget while the remaining leg inherits every tick.
+        """
+        if self.entry_submission != "single":
+            return specifications, signed
+        remaining = [
+            (spec, args)
+            for spec, args in zip(specifications, signed, strict=True)
+            if spec[0] not in accepted
+        ]
+        if not remaining:
+            return specifications, signed
+        spec, args = remaining[attempts % len(remaining)]
+        return (spec,), [args]
 
     def _post_dual_singles(self, signed: list[PostOrdersV2Args]) -> list[object]:
         """Submit each leg as its own single-order request, in parallel.

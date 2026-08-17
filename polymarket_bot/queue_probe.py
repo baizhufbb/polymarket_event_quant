@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import logging
@@ -99,6 +100,7 @@ async def _heartbeat(socket) -> None:
 async def _monitor_market(
     update: MarketActivationUpdate,
     output,
+    opening_window_seconds: float = OPENING_WINDOW_SECONDS,
 ) -> None:
     market = update.market
     token_outcomes = {
@@ -150,7 +152,7 @@ async def _monitor_market(
                     if changed and len(queues) == 2:
                         if opening_deadline is None:
                             opening_deadline = (
-                                loop.time() + OPENING_WINDOW_SECONDS
+                                loop.time() + opening_window_seconds
                             )
                         _record(
                             output,
@@ -163,7 +165,9 @@ async def _monitor_market(
             await asyncio.gather(heartbeat, return_exceptions=True)
 
 
-async def _run() -> None:
+async def _run(
+    opening_window_seconds: float = OPENING_WINDOW_SECONDS,
+) -> None:
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     worker = MarketActivationWorker(window_minutes=0, farthest_first=True)
     tasks: set[asyncio.Task] = set()
@@ -175,7 +179,7 @@ async def _run() -> None:
                     if not isinstance(update, MarketActivationUpdate):
                         continue
                     task = asyncio.create_task(
-                        _monitor_market(update, output),
+                        _monitor_market(update, output, opening_window_seconds),
                         name=f"queue-probe-{update.market.slug}",
                     )
                     tasks.add(task)
@@ -189,11 +193,24 @@ async def _run() -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Record the public 0.01 queue around each market's opening"
+    )
+    parser.add_argument(
+        "--opening-window-seconds",
+        type=float,
+        default=OPENING_WINDOW_SECONDS,
+        help=(
+            "keep recording this long after the first observed queue change; "
+            f"default {OPENING_WINDOW_SECONDS}"
+        ),
+    )
+    args = parser.parse_args()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
-    asyncio.run(_run())
+    asyncio.run(_run(args.opening_window_seconds))
 
 
 if __name__ == "__main__":
