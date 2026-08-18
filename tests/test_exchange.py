@@ -877,7 +877,7 @@ def test_solo_reconcile_recognizes_the_single_open_order():
     assert exchange.client.canceled == []
 
 
-def test_placement_records_round_trip_timing():
+def test_placement_records_send_and_return_time():
     class SlowSingleClient(SingleModeClient):
         def post_order(self, signed, order_type, post_only=False):
             time.sleep(0.05)
@@ -896,12 +896,6 @@ def test_placement_records_round_trip_timing():
     )
 
     assert result.complete
-    timing = result.timing
-    assert timing is not None
-    assert timing["round_trip_samples"] >= 1
-    assert timing["round_trip_ms_min"] >= 40
-    assert timing["round_trip_ms_max"] >= timing["round_trip_ms_min"]
-    leg = timing["accepted_legs"]["up"]
-    assert leg["round_trip_ms"] >= 40
+    leg = result.timing["up"]
     assert leg["sent_ts_ms"] > 0
-    assert leg["attempt"] >= 1
+    assert leg["returned_ts_ms"] - leg["sent_ts_ms"] >= 40
