@@ -201,10 +201,7 @@ class Exchange:
             tick_size=str(market.tick_size),
             neg_risk=False,
         )
-        specifications = (
-            ("up", market.up_token_id),
-            ("down", market.down_token_id),
-        )
+        specifications = self._entry_specifications(market)
         submission_key = self._dual_submission_key(market, price=price, size=size)
         submissions = self._dual_submission_cache()
         signed = submissions.get(submission_key)
@@ -396,12 +393,16 @@ class Exchange:
                         continue
                     accepted[order.outcome] = order
 
-                if len(accepted) == 2:
+                if len(accepted) == len(specifications):
                     for outstanding in pending:
                         outstanding.cancel()
                     ordered = tuple(accepted[outcome] for outcome, _ in specifications)
                     return self._finalize_dual_result(
-                        PlacementResult(ordered, attempts=attempts),
+                        PlacementResult(
+                            ordered,
+                            attempts=attempts,
+                            expected=len(specifications),
+                        ),
                         submission_key=submission_key,
                         submissions=submissions,
                     )
@@ -436,6 +437,7 @@ class Exchange:
                 accepted_orders,
                 error,
                 attempts=attempts,
+                expected=len(specifications),
             )
         else:
             result = PlacementResult(
@@ -443,6 +445,7 @@ class Exchange:
                 error,
                 retryable=not stop_submitting,
                 attempts=attempts,
+                expected=len(specifications),
             )
         return self._finalize_dual_result(
             result,
@@ -488,8 +491,10 @@ class Exchange:
             else:
                 errors.append(str(response))
 
-        if len(accepted) == 2:
-            return PlacementResult(tuple(accepted), attempts=attempts)
+        if len(accepted) == len(specifications):
+            return PlacementResult(
+                tuple(accepted), attempts=attempts, expected=len(specifications)
+            )
         retryable = not accepted and all(
             _order_engine_not_ready(response) for response in responses
         )
@@ -498,6 +503,7 @@ class Exchange:
             "; ".join(errors) or "partial placement",
             retryable=retryable,
             attempts=attempts,
+            expected=len(specifications),
         )
 
     def _finalize_dual_result(
@@ -527,10 +533,10 @@ class Exchange:
             if not future.set_running_or_notify_cancel():
                 return
             try:
-                if self.entry_submission == "single":
-                    response = self._post_dual_singles(signed)
-                else:
+                if self.entry_submission == "batch":
                     response = self.client.post_orders(signed, post_only=True)
+                else:
+                    response = self._post_dual_singles(signed)
             except BaseException as exc:
                 future.set_exception(exc)
             else:
@@ -538,6 +544,19 @@ class Exchange:
 
         Thread(target=submit, name="placement", daemon=True).start()
         return future
+
+    def _entry_specifications(
+        self, market: Market
+    ) -> tuple[tuple[str, str], ...]:
+        """Solo modes trade one deliberate leg; paired modes trade both."""
+        if self.entry_submission == "solo-up":
+            return (("up", market.up_token_id),)
+        if self.entry_submission == "solo-down":
+            return (("down", market.down_token_id),)
+        return (
+            ("up", market.up_token_id),
+            ("down", market.down_token_id),
+        )
 
     def _next_submission(
         self,
@@ -646,10 +665,8 @@ class Exchange:
         size: Decimal,
         retryable_if_missing: bool = True,
     ) -> PlacementResult:
-        expected = {
-            market.up_token_id: "up",
-            market.down_token_id: "down",
-        }
+        specifications = self._entry_specifications(market)
+        expected = {token_id: outcome for outcome, token_id in specifications}
         matches: dict[str, list[dict]] = {token_id: [] for token_id in expected}
         for raw in self.open_orders(market.condition_id):
             token_id = str(raw.get("asset_id") or raw.get("assetId") or "")
@@ -692,7 +709,7 @@ class Exchange:
                     )
                 )
             self._forget_dual_submission(market, price=price, size=size)
-            return PlacementResult(tuple(orders))
+            return PlacementResult(tuple(orders), expected=len(specifications))
 
         found_ids = [
             str(_order_id(raw) or raw.get("id"))

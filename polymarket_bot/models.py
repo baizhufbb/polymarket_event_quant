@@ -103,7 +103,8 @@ class PlacementResult:
     error: str | None = None
     retryable: bool = False
     attempts: int = 1
+    expected: int = 2
 
     @property
     def complete(self) -> bool:
-        return self.error is None and len(self.orders) == 2
+        return self.error is None and len(self.orders) == self.expected

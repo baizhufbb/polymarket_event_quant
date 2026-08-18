@@ -136,8 +136,10 @@ heartbeat. It does not change Polymarket's server-side cancellation deadline.
   result remains ambiguous, the bot reconciles exchange orders. A temporary
   reconciliation outage keeps the market pending instead of permanently
   dropping it.
-- Up and Down are submitted in one batch. If only one is accepted, the bot
-  immediately cancels it.
+- In the paired modes, Up and Down are submitted together and a lone
+  accepted side is immediately canceled. The solo modes
+  (`--entry-submission solo-up`/`solo-down`) deliberately trade one leg and
+  keep it.
 - Entry and take-profit orders are ordinary GTC limits, so they do not depend on a
   minimum GTD lifetime. Entries are post-only. A marketable exit target can
   execute at the target price or better. Only the matched entry quantity is

@@ -138,11 +138,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--entry-submission",
-        choices=("batch", "single"),
+        choices=("batch", "single", "solo-up", "solo-down"),
         default="batch",
         help=(
-            "submit the entry pair as one batch request or as two parallel "
-            "single-order requests; default batch"
+            "batch submits the pair in one request, single rotates both legs "
+            "through single-order requests, solo-up/solo-down trade only that "
+            "leg; default batch"
         ),
     )
     return parser

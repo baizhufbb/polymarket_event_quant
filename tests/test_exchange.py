@@ -805,3 +805,73 @@ def test_single_mode_recovers_after_transient_error():
 
     assert result.complete
     assert result.attempts >= 2
+
+
+def test_solo_mode_places_only_the_chosen_leg_and_never_cancels_it():
+    client = SingleModeClient()
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = client
+    exchange.entry_submission = "solo-up"
+
+    result = exchange.place_dual(
+        MARKET,
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        submission_interval_ms=Decimal("1"),
+    )
+
+    assert result.complete
+    assert len(result.orders) == 1
+    assert result.orders[0].outcome == "up"
+    assert set(client.single_posts) == {"up-token"}
+    assert client.canceled == []
+
+
+def test_solo_mode_recovers_from_not_ready_then_completes():
+    client = SingleModeClient(
+        leg_responses={"down-token": [_not_ready_error(), _not_ready_error()]}
+    )
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = client
+    exchange.entry_submission = "solo-down"
+
+    result = exchange.place_dual(
+        MARKET,
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        submission_interval_ms=Decimal("1"),
+    )
+
+    assert result.complete
+    assert len(result.orders) == 1
+    assert result.orders[0].outcome == "down"
+    assert result.attempts >= 3
+    assert client.canceled == []
+
+
+def test_solo_reconcile_recognizes_the_single_open_order():
+    class SoloReconcileClient(FakeClient):
+        def get_open_orders(self, params=None):
+            return [
+                {
+                    "id": "0x" + "9" * 64,
+                    "asset_id": "down-token",
+                    "side": "BUY",
+                    "price": "0.01",
+                    "original_size": "100",
+                    "status": "LIVE",
+                }
+            ]
+
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = SoloReconcileClient([])
+    exchange.entry_submission = "solo-down"
+
+    result = exchange.reconcile_ambiguous_dual(
+        MARKET, price=Decimal("0.01"), size=Decimal("100")
+    )
+
+    assert result.complete
+    assert len(result.orders) == 1
+    assert result.orders[0].outcome == "down"
+    assert exchange.client.canceled == []

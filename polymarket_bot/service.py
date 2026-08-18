@@ -662,10 +662,16 @@ class BotService:
         if placement_retry is None:
             self.database.prepare_market(self.run_id, market)
         if not self.live:
-            for outcome, token_id in (
-                ("up", market.up_token_id),
-                ("down", market.down_token_id),
-            ):
+            if self.entry_submission == "solo-up":
+                legs = (("up", market.up_token_id),)
+            elif self.entry_submission == "solo-down":
+                legs = (("down", market.down_token_id),)
+            else:
+                legs = (
+                    ("up", market.up_token_id),
+                    ("down", market.down_token_id),
+                )
+            for outcome, token_id in legs:
                 self.database.add_order(
                     self.run_id,
                     market.slug,
