@@ -111,6 +111,23 @@ def _order_engine_not_ready_error(error: PolyApiException) -> str | None:
     return message
 
 
+def _submission_timing(
+    round_trips: list[int],
+    accepted: dict[str, dict],
+) -> dict | None:
+    """Summarise per-request round trips for the placement telemetry."""
+    if not round_trips:
+        return None
+    ordered = sorted(round_trips)
+    return {
+        "round_trip_ms_min": ordered[0],
+        "round_trip_ms_median": ordered[len(ordered) // 2],
+        "round_trip_ms_max": ordered[-1],
+        "round_trip_samples": len(ordered),
+        "accepted_legs": accepted,
+    }
+
+
 def _heartbeat_id(payload: object) -> str | None:
     if not isinstance(payload, dict):
         return None
@@ -304,7 +321,9 @@ class Exchange:
     ) -> PlacementResult:
         """Submit one immutable signed pair at a fixed interval until accepted."""
         interval = float(submission_interval_ms / Decimal("1000"))
-        pending: dict[Future, tuple[tuple[str, str], ...]] = {}
+        pending: dict[Future, tuple[tuple[tuple[str, str], ...], int]] = {}
+        round_trips: list[int] = []
+        accepted_timing: dict[str, dict] = {}
         accepted: dict[str, PlacedOrder] = {}
         errors: list[str] = []
         ambiguous_errors: list[str] = []
@@ -324,7 +343,10 @@ class Exchange:
                 submit_specs, payload = self._next_submission(
                     specifications, signed, accepted, attempts
                 )
-                pending[self._submit_placement_request(payload)] = submit_specs
+                pending[self._submit_placement_request(payload)] = (
+                    submit_specs,
+                    int(time.time() * 1000),
+                )
                 attempts += 1
                 next_submission = now + interval
                 self._next_placement_submission = next_submission
@@ -351,7 +373,9 @@ class Exchange:
                 continue
 
             for future in completed:
-                submit_specs = pending.pop(future)
+                submit_specs, sent_ts_ms = pending.pop(future)
+                round_trip_ms = int(time.time() * 1000) - sent_ts_ms
+                round_trips.append(round_trip_ms)
                 try:
                     responses = future.result()
                 except PolyApiException as exc:
@@ -392,6 +416,14 @@ class Exchange:
                         stop_submitting = True
                         continue
                     accepted[order.outcome] = order
+                    accepted_timing.setdefault(
+                        order.outcome,
+                        {
+                            "sent_ts_ms": sent_ts_ms,
+                            "round_trip_ms": round_trip_ms,
+                            "attempt": attempts,
+                        },
+                    )
 
                 if len(accepted) == len(specifications):
                     for outstanding in pending:
@@ -402,6 +434,7 @@ class Exchange:
                             ordered,
                             attempts=attempts,
                             expected=len(specifications),
+                            timing=_submission_timing(round_trips, accepted_timing),
                         ),
                         submission_key=submission_key,
                         submissions=submissions,
@@ -438,6 +471,7 @@ class Exchange:
                 error,
                 attempts=attempts,
                 expected=len(specifications),
+                timing=_submission_timing(round_trips, accepted_timing),
             )
         else:
             result = PlacementResult(
@@ -446,6 +480,7 @@ class Exchange:
                 retryable=not stop_submitting,
                 attempts=attempts,
                 expected=len(specifications),
+                timing=_submission_timing(round_trips, accepted_timing),
             )
         return self._finalize_dual_result(
             result,

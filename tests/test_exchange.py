@@ -875,3 +875,33 @@ def test_solo_reconcile_recognizes_the_single_open_order():
     assert len(result.orders) == 1
     assert result.orders[0].outcome == "down"
     assert exchange.client.canceled == []
+
+
+def test_placement_records_round_trip_timing():
+    class SlowSingleClient(SingleModeClient):
+        def post_order(self, signed, order_type, post_only=False):
+            time.sleep(0.05)
+            return super().post_order(signed, order_type, post_only=post_only)
+
+    client = SlowSingleClient()
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = client
+    exchange.entry_submission = "solo-up"
+
+    result = exchange.place_dual(
+        MARKET,
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        submission_interval_ms=Decimal("1"),
+    )
+
+    assert result.complete
+    timing = result.timing
+    assert timing is not None
+    assert timing["round_trip_samples"] >= 1
+    assert timing["round_trip_ms_min"] >= 40
+    assert timing["round_trip_ms_max"] >= timing["round_trip_ms_min"]
+    leg = timing["accepted_legs"]["up"]
+    assert leg["round_trip_ms"] >= 40
+    assert leg["sent_ts_ms"] > 0
+    assert leg["attempt"] >= 1
