@@ -17,14 +17,6 @@ from .service import BotService
 from .setup import setup_wallet
 
 
-class _ExpectedOrderEngineFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        if record.name != "py_clob_client_v2.http_helpers.helpers":
-            return True
-        message = record.getMessage().lower()
-        return "invalid token id" not in message and "market not found" not in message
-
-
 def _decimal_arg(value: str) -> Decimal:
     try:
         parsed = Decimal(value)
@@ -137,14 +129,6 @@ def _parser() -> argparse.ArgumentParser:
         default="nearest-first",
     )
     run.add_argument(
-        "--trace-attempts",
-        action="store_true",
-        help=(
-            "append every submission attempt (send time, return time, reply "
-            "kind) to logs/attempts.jsonl for latency measurement"
-        ),
-    )
-    run.add_argument(
         "--entry-submission",
         choices=("batch", "single", "solo-up", "solo-down"),
         default="batch",
@@ -157,14 +141,8 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _logger(config: BotConfig, *, trace_attempts: bool = False) -> logging.Logger:
-    logger = _rotating_logger("polymarket_bot", config.log_path)
-    if not trace_attempts:
-        # The trace records every reply itself; keeping the filter would hide
-        # exactly the engine-not-ready replies the trace exists to capture.
-        clob_logger = logging.getLogger("py_clob_client_v2.http_helpers.helpers")
-        clob_logger.addFilter(_ExpectedOrderEngineFilter())
-    return logger
+def _logger(config: BotConfig) -> logging.Logger:
+    return _rotating_logger("polymarket_bot", config.log_path)
 
 
 def _rotating_logger(name: str, path: Path) -> logging.Logger:
@@ -285,9 +263,9 @@ def main() -> None:
                 cancel_before_end_seconds=args.cancel_before_end_seconds,
                 heartbeat_seconds=args.heartbeat_seconds,
                 live=args.live,
-                logger=_logger(config, trace_attempts=args.trace_attempts),
+                logger=_logger(config),
             )
-            if args.trace_attempts and service.exchange:
+            if service.exchange:
                 trace_path.parent.mkdir(parents=True, exist_ok=True)
                 trace_file = trace_path.open("a", encoding="utf-8", buffering=1)
                 service.exchange.attempt_trace = lambda row: trace_file.write(

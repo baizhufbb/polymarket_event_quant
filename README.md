@@ -33,10 +33,9 @@ until stopped.
   20 milliseconds. In single-submission mode each tick sends one pending
   leg, and a leg stops consuming budget once the exchange registers it;
   a 25 ms tick matches the Standard tier's 40 tokens per second refill.
-- `--trace-attempts` appends every submission attempt to
-  `logs/attempts.jsonl` (attempt number, send and return time, reply kind per
-  leg) and stops filtering engine-not-ready replies out of the log, so a
-  session can show exactly when the book began accepting orders.
+- Live runs append every submission attempt to `logs/attempts.jsonl`
+  (attempt number, send and return time, reply kind per leg) so a session can
+  show exactly when the book began accepting orders.
 - The bot does not submit redemption transactions. Resolved winnings are
   returned by Polymarket's account-side settlement service.
 
