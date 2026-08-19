@@ -118,9 +118,26 @@ def _heartbeat_id(payload: object) -> str | None:
     return str(value) if value else None
 
 
+def classify_response(response: object) -> str:
+    """Bucket one submission response for the attempt trace."""
+    if isinstance(response, BaseException):
+        status = getattr(response, "status_code", None)
+        if status == 429:
+            return "rate_limited"
+        return f"error_{status}" if status else "transport_error"
+    if _duplicate_order_id(response):
+        return "duplicate"
+    if _accepted(response):
+        return "accepted"
+    if _order_engine_not_ready(response):
+        return "not_ready"
+    return "rejected"
+
+
 class Exchange:
     _next_placement_submission = 0.0
     entry_submission = "batch"
+    attempt_trace = None
 
     def __init__(self, config: BotConfig):
         creds = None
@@ -304,7 +321,7 @@ class Exchange:
     ) -> PlacementResult:
         """Submit one immutable signed pair at a fixed interval until accepted."""
         interval = float(submission_interval_ms / Decimal("1000"))
-        pending: dict[Future, tuple[tuple[tuple[str, str], ...], int]] = {}
+        pending: dict[Future, tuple[tuple[tuple[str, str], ...], int, int]] = {}
         accepted_timing: dict[str, dict] = {}
         accepted: dict[str, PlacedOrder] = {}
         errors: list[str] = []
@@ -328,6 +345,7 @@ class Exchange:
                 pending[self._submit_placement_request(payload)] = (
                     submit_specs,
                     int(time.time() * 1000),
+                    attempts + 1,
                 )
                 attempts += 1
                 next_submission = now + interval
@@ -355,11 +373,17 @@ class Exchange:
                 continue
 
             for future in completed:
-                submit_specs, sent_ts_ms = pending.pop(future)
+                submit_specs, sent_ts_ms, attempt_no = pending.pop(future)
                 returned_ts_ms = int(time.time() * 1000)
                 try:
                     responses = future.result()
+                    self._trace(
+                        submit_specs, attempt_no, sent_ts_ms, returned_ts_ms, responses
+                    )
                 except PolyApiException as exc:
+                    self._trace(
+                        submit_specs, attempt_no, sent_ts_ms, returned_ts_ms, exc
+                    )
                     not_ready_error = _order_engine_not_ready_error(exc)
                     if not_ready_error:
                         errors.append(not_ready_error)
@@ -370,6 +394,9 @@ class Exchange:
                         stop_submitting = True
                     continue
                 except Exception as exc:
+                    self._trace(
+                        submit_specs, attempt_no, sent_ts_ms, returned_ts_ms, exc
+                    )
                     ambiguous_errors.append(f"{type(exc).__name__}: {exc}")
                     stop_submitting = True
                     continue
@@ -397,9 +424,17 @@ class Exchange:
                         stop_submitting = True
                         continue
                     accepted[order.outcome] = order
+                    # sent_ts_ms/returned_ts_ms belong to the request whose
+                    # response is being handled right now, not to whichever
+                    # tick the loop has reached: responses come back out of
+                    # order and dozens of ticks later.
                     accepted_timing.setdefault(
                         order.outcome,
-                        {"sent_ts_ms": sent_ts_ms, "returned_ts_ms": returned_ts_ms},
+                        {
+                            "sent_ts_ms": sent_ts_ms,
+                            "returned_ts_ms": returned_ts_ms,
+                            "attempt": attempt_no,
+                        },
                     )
 
                 if len(accepted) == len(specifications):
@@ -556,6 +591,38 @@ class Exchange:
 
         Thread(target=submit, name="placement", daemon=True).start()
         return future
+
+    def _trace(
+        self,
+        specs: tuple[tuple[str, str], ...],
+        attempt_no: int,
+        sent_ts_ms: int,
+        returned_ts_ms: int,
+        responses: object,
+    ) -> None:
+        """Record one attempt: which legs, when it left, when it came back.
+
+        The engine-not-ready replies are filtered out of the console log, so
+        without this trace a session cannot show when the book actually
+        started accepting our orders.
+        """
+        if self.attempt_trace is None:
+            return
+        if isinstance(responses, BaseException):
+            outcomes = [classify_response(responses)] * len(specs)
+        elif isinstance(responses, (list, tuple)):
+            outcomes = [classify_response(item) for item in responses]
+        else:
+            outcomes = [classify_response(responses)]
+        self.attempt_trace(
+            {
+                "attempt": attempt_no,
+                "legs": [outcome for outcome, _ in specs],
+                "sent_ts_ms": sent_ts_ms,
+                "returned_ts_ms": returned_ts_ms,
+                "results": outcomes,
+            }
+        )
 
     def _entry_specifications(
         self, market: Market

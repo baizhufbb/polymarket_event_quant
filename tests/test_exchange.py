@@ -899,3 +899,49 @@ def test_placement_records_send_and_return_time():
     leg = result.timing["up"]
     assert leg["sent_ts_ms"] > 0
     assert leg["returned_ts_ms"] - leg["sent_ts_ms"] >= 40
+
+
+def test_accepted_timing_belongs_to_the_request_that_registered():
+    """A slow first reply must not be credited to a later, faster tick."""
+    order_id = "0x" + "a" * 64
+    state = {"n": 0}
+
+    class OutOfOrderClient(FakeClient):
+        def post_orders(self, signed, post_only=False):
+            state["n"] += 1
+            mine = state["n"]
+            if mine == 1:
+                time.sleep(0.30)          # the winner: sent first, replies last
+                return [
+                    {"success": True, "orderID": order_id, "status": "live"},
+                    {"success": True, "orderID": "0x" + "b" * 64, "status": "live"},
+                ]
+            time.sleep(0.01)
+            return [
+                {"errorMsg": "the market is not yet ready to process new orders"},
+                {"errorMsg": "the market is not yet ready to process new orders"},
+            ]
+
+    trace = []
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = OutOfOrderClient([])
+    exchange.entry_submission = "batch"
+    exchange.attempt_trace = trace.append
+
+    result = exchange.place_dual(
+        MARKET,
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        submission_interval_ms=Decimal("20"),
+    )
+
+    assert result.complete
+    leg = result.timing["up"]
+    # the winning reply came from attempt 1, not from whichever tick the loop
+    # had reached by the time it arrived
+    assert leg["attempt"] == 1
+    assert leg["returned_ts_ms"] - leg["sent_ts_ms"] >= 250
+    assert result.attempts > 1
+    kinds = [row["results"][0] for row in trace]
+    assert "accepted" in kinds and "not_ready" in kinds
+    assert all(row["returned_ts_ms"] >= row["sent_ts_ms"] for row in trace)
