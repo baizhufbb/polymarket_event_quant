@@ -35,7 +35,10 @@ until stopped.
   a 25 ms tick matches the Standard tier's 40 tokens per second refill.
 - Live runs append every submission attempt to `logs/attempts.jsonl`
   (attempt number, send and return time, reply kind per leg) so a session can
-  show exactly when the book began accepting orders.
+  show exactly when the book began accepting orders. This trace is temporary
+  measurement scaffolding and is meant to be removed once the queue-position
+  question is settled; the entry modes themselves, including the solo modes,
+  are permanent trading behaviour.
 - The bot does not submit redemption transactions. Resolved winnings are
   returned by Polymarket's account-side settlement service.
 
