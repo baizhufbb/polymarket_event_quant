@@ -141,8 +141,27 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+class _ExpectedOrderEngineFilter(logging.Filter):
+    """Keep the human log readable during the pre-open hammering.
+
+    These replies are expected thousands of times per market. They stay in
+    logs/attempts.jsonl, which records every attempt regardless.
+    """
+
+    EXPECTED = ("invalid token id", "market not found", "trading is disabled")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name != "py_clob_client_v2.http_helpers.helpers":
+            return True
+        message = record.getMessage().lower()
+        return not any(expected in message for expected in self.EXPECTED)
+
+
 def _logger(config: BotConfig) -> logging.Logger:
-    return _rotating_logger("polymarket_bot", config.log_path)
+    logger = _rotating_logger("polymarket_bot", config.log_path)
+    clob_logger = logging.getLogger("py_clob_client_v2.http_helpers.helpers")
+    clob_logger.addFilter(_ExpectedOrderEngineFilter())
+    return logger
 
 
 def _rotating_logger(name: str, path: Path) -> logging.Logger:
