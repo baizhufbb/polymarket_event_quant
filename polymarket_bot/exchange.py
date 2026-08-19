@@ -323,7 +323,6 @@ class Exchange:
         """Submit one immutable signed pair at a fixed interval until accepted."""
         interval = float(submission_interval_ms / Decimal("1000"))
         pending: dict[Future, tuple[tuple[tuple[str, str], ...], int, int]] = {}
-        accepted_timing: dict[str, dict] = {}
         accepted: dict[str, PlacedOrder] = {}
         errors: list[str] = []
         ambiguous_errors: list[str] = []
@@ -434,13 +433,6 @@ class Exchange:
                     # response is being handled right now, not to whichever
                     # tick the loop has reached: responses come back out of
                     # order and dozens of ticks later.
-                    previous = accepted_timing.get(order.outcome)
-                    if previous is None or attempt_no < previous["attempt"]:
-                        accepted_timing[order.outcome] = {
-                            "sent_ts_ms": sent_ts_ms,
-                            "returned_ts_ms": returned_ts_ms,
-                            "attempt": attempt_no,
-                        }
 
                 if len(accepted) == len(specifications):
                     # Stop sending, but drain the replies still in flight: the
@@ -477,7 +469,6 @@ class Exchange:
                     ordered,
                     attempts=attempts,
                     expected=len(specifications),
-                    timing=accepted_timing or None,
                 ),
                 submission_key=submission_key,
                 submissions=submissions,
@@ -496,7 +487,6 @@ class Exchange:
                 error,
                 attempts=attempts,
                 expected=len(specifications),
-                timing=accepted_timing or None,
             )
         else:
             result = PlacementResult(
@@ -505,7 +495,6 @@ class Exchange:
                 retryable=not stop_submitting,
                 attempts=attempts,
                 expected=len(specifications),
-                timing=accepted_timing or None,
             )
         return self._finalize_dual_result(
             result,

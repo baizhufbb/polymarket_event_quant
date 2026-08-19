@@ -104,7 +104,6 @@ class PlacementResult:
     retryable: bool = False
     attempts: int = 1
     expected: int = 2
-    timing: dict | None = None
 
     @property
     def complete(self) -> bool:
