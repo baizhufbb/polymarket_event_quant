@@ -35,6 +35,7 @@ ORDER_ENGINE_NOT_READY_ERRORS = {
     (404, "market not found"),
 }
 DEFAULT_PLACEMENT_INTERVAL_MS = Decimal("20")
+DRAIN_TIMEOUT_SECONDS = 3.0
 DUPLICATE_ORDER_PATTERN = re.compile(
     r"\border\s+(0x[0-9a-f]{64})\s+is invalid\.\s*duplicated\.",
     re.IGNORECASE,
@@ -332,6 +333,7 @@ class Exchange:
             self._next_placement_submission,
         )
         stop_submitting = False
+        drain_deadline: float | None = None
 
         while pending or not stop_submitting:
             now = time.monotonic()
@@ -352,11 +354,14 @@ class Exchange:
                 self._next_placement_submission = next_submission
                 continue
 
-            timeout = (
-                None
-                if stop_submitting
-                else max(0.0, next_submission - now)
-            )
+            if not stop_submitting:
+                timeout = max(0.0, next_submission - now)
+            elif drain_deadline is None:
+                timeout = None
+            else:
+                timeout = max(0.0, drain_deadline - now)
+                if timeout <= 0:
+                    break
             if not pending:
                 if stop_submitting:
                     break
@@ -392,6 +397,7 @@ class Exchange:
                     else:
                         errors.append(f"{type(exc).__name__}: {exc}")
                         stop_submitting = True
+                    drain_deadline = time.monotonic() + DRAIN_TIMEOUT_SECONDS
                     continue
                 except Exception as exc:
                     self._trace(
@@ -428,29 +434,21 @@ class Exchange:
                     # response is being handled right now, not to whichever
                     # tick the loop has reached: responses come back out of
                     # order and dozens of ticks later.
-                    accepted_timing.setdefault(
-                        order.outcome,
-                        {
+                    previous = accepted_timing.get(order.outcome)
+                    if previous is None or attempt_no < previous["attempt"]:
+                        accepted_timing[order.outcome] = {
                             "sent_ts_ms": sent_ts_ms,
                             "returned_ts_ms": returned_ts_ms,
                             "attempt": attempt_no,
-                        },
-                    )
+                        }
 
                 if len(accepted) == len(specifications):
-                    for outstanding in pending:
-                        outstanding.cancel()
-                    ordered = tuple(accepted[outcome] for outcome, _ in specifications)
-                    return self._finalize_dual_result(
-                        PlacementResult(
-                            ordered,
-                            attempts=attempts,
-                            expected=len(specifications),
-                            timing=accepted_timing or None,
-                        ),
-                        submission_key=submission_key,
-                        submissions=submissions,
-                    )
+                    # Stop sending, but drain the replies still in flight: the
+                    # request that actually registered the order is usually an
+                    # earlier one whose reply has not arrived yet, and dropping
+                    # it here hides which attempt won the queue slot.
+                    stop_submitting = True
+                    continue
 
                 recoverable = (
                     isinstance(responses, (list, tuple))
@@ -463,11 +461,26 @@ class Exchange:
                 if not recoverable:
                     stop_submitting = True
 
-        if ambiguous_errors:
+        if ambiguous_errors and not accepted:
             unique = "; ".join(dict.fromkeys(ambiguous_errors))
             raise AmbiguousPlacementError(
                 f"staggered submission remained ambiguous: {unique}",
                 attempts=attempts,
+            )
+
+        if len(accepted) == len(specifications):
+            # Every leg registered; replies gathered while draining (repeat
+            # duplicates, late not-ready) are expected and not failures.
+            ordered = tuple(accepted[outcome] for outcome, _ in specifications)
+            return self._finalize_dual_result(
+                PlacementResult(
+                    ordered,
+                    attempts=attempts,
+                    expected=len(specifications),
+                    timing=accepted_timing or None,
+                ),
+                submission_key=submission_key,
+                submissions=submissions,
             )
 
         meaningful_errors = [error for error in dict.fromkeys(errors) if error]

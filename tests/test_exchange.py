@@ -945,3 +945,42 @@ def test_accepted_timing_belongs_to_the_request_that_registered():
     kinds = [row["results"][0] for row in trace]
     assert "accepted" in kinds and "not_ready" in kinds
     assert all(row["returned_ts_ms"] >= row["sent_ts_ms"] for row in trace)
+
+
+def test_drains_in_flight_replies_and_credits_the_earliest_winner():
+    """The request that registers the order usually replies last."""
+    order_id = "0x" + "c" * 64
+    state = {"n": 0}
+
+    class LateWinnerClient(FakeClient):
+        def post_order(self, signed, order_type, post_only=False):
+            state["n"] += 1
+            mine = state["n"]
+            if mine == 1:
+                time.sleep(0.25)          # registered first, replies last
+                return {"success": True, "orderID": order_id, "status": "live"}
+            time.sleep(0.12)              # later ticks reply sooner
+            return {
+                "errorMsg": f"order {order_id} is invalid. Duplicated.",
+                "success": False,
+            }
+
+    trace = []
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = LateWinnerClient([])
+    exchange.entry_submission = "solo-up"
+    exchange.attempt_trace = trace.append
+
+    result = exchange.place_dual(
+        MARKET,
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        submission_interval_ms=Decimal("20"),
+    )
+
+    assert result.complete
+    # the duplicate reply arrives first, but attempt 1 is the real winner
+    assert result.timing["up"]["attempt"] == 1
+    assert result.timing["up"]["returned_ts_ms"] - result.timing["up"]["sent_ts_ms"] >= 200
+    # and its reply was still recorded rather than abandoned
+    assert any(row["attempt"] == 1 and "accepted" in row["results"] for row in trace)
