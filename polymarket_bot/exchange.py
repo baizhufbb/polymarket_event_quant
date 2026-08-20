@@ -22,6 +22,7 @@ from py_clob_client_v2.exceptions import PolyApiException
 
 from .config import BotConfig
 from .models import Market, PlacedOrder, PlacementResult
+from .transport import install_parallel_transport, warm_connections
 
 
 CLOB_HOST = "https://clob.polymarket.com"
@@ -141,6 +142,7 @@ class Exchange:
     attempt_trace = None
 
     def __init__(self, config: BotConfig):
+        install_parallel_transport()
         creds = None
         if config.api_key:
             creds = ApiCreds(
@@ -215,6 +217,7 @@ class Exchange:
         size: Decimal,
         submission_interval_ms: Decimal | None = None,
     ) -> PlacementResult:
+        warm_connections()
         options = PartialCreateOrderOptions(
             tick_size=str(market.tick_size),
             neg_risk=False,

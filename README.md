@@ -51,6 +51,13 @@ Authenticated CLOB traffic uses `py-clob-client-v2 -> httpx -> httpcore`.
 `httpcore` is pinned to commit
 `35ddb373e13be5940e5137798d5a63d67e10f3e2` from
 `baizhufbb/httpcore`, which contains the proxy TLS zombie-connection fix.
+At startup `polymarket_bot/transport.py` replaces the library's shared
+`httpx.Client(http2=True)` with an HTTP/1.1 pool (64 connections): on the
+single multiplexed connection, httpcore serializes socket reads behind a
+lock, so the one slow reply at the open (300-1000ms exchange-side) held
+back every other in-flight reply and could stall outgoing writes. Each
+placement loop warms the pool before hammering so the open-moment burst
+does not pay per-connection TLS handshakes.
 Public discovery continues to use `requests`. Gamma fills the existing window
 once, then the predictable next five-minute slug is queried every second. These
 requests include a unique cache buster because Gamma otherwise advertises a
