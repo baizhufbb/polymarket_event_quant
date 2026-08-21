@@ -163,7 +163,16 @@ def main() -> None:
     config_a = BotConfig.load(live=True)
     config_b = _config_b(args.env_b, config_a.project_root)
     exchange_a = Exchange(config_a)
-    exchange_b = Exchange(config_b)
+    try:
+        exchange_b = Exchange(config_b)
+    except PolyApiException as exc:
+        print("=" * 47)
+        print("VERDICT: the venue REFUSED credentials for the fresh key.")
+        print("Unregistered keys are gated; fleet accounts must be created")
+        print(f"through the site. Venue reply: {exc}")
+        print("=" * 47)
+        raise SystemExit(2)
+    print("fresh key B obtained API credentials - no registration gate")
     discovery = MarketDiscovery()
 
     for round_no in range(1, args.markets + 1):
