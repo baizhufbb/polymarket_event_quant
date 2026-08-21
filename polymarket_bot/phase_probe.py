@@ -71,8 +71,13 @@ def _tokens_live(session: requests.Session, market: Market) -> bool:
 
 
 def _wait_for_next_market(discovery: MarketDiscovery) -> Market:
-    """Return the newest announced market whose CLOB parameters are not yet live."""
-    session = requests.Session()
+    """Return the next newly announced market.
+
+    Tokens go live essentially at announcement and the book opens roughly
+    ninety seconds later, so the catchable signal is a fresh slug, not a
+    not-yet-live token set: remember the newest market at entry and return
+    the first different one.
+    """
     known = None
     while True:
         markets = discovery.discover(
@@ -80,10 +85,10 @@ def _wait_for_next_market(discovery: MarketDiscovery) -> Market:
         )
         if markets:
             candidate = markets[0]
-            if candidate.slug != known:
+            if known is None:
                 known = candidate.slug
-                if not _tokens_live(session, candidate):
-                    return candidate
+            elif candidate.slug != known:
+                return candidate
         time.sleep(1.0)
 
 
