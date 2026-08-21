@@ -66,6 +66,24 @@ five-minute public cache. Each newly discovered condition is checked against
 returns both real token IDs, the main loop is woken and submits the
 post-only pair.
 
+## Fleet (phased multi-account entry)
+
+The venue meters orders per signer (about 40/s sustained) and the queue
+slot is decided by the millisecond the first accepted request reaches the
+engine, so one account on a 25 ms cadence arrives on average 12.5 ms after
+the book opens. `--fleet-env FILE` (repeatable) adds accounts from
+`KEY=VALUE` files (`POLYMARKET_PRIVATE_KEY`, `POLYMARKET_FUNDER_ADDRESS`,
+`POLYMARKET_SIGNATURE_TYPE`, optional CLOB credentials). All members run
+the same cadence with phases offset by interval/N, each with a distinct
+order size (`--fleet-size-step`, default +0.024 USD per member) so the
+public depth stream can tell their orders apart. After the open the fleet
+keeps the order that registered first (`PlacementResult.registered_ts_ms`,
+the earliest reply that carried the order id) and cancels the others, so
+exposure stays at one order per market. Orders carry an `account` column;
+cancellation and reconciliation route by it. Fleet mode currently supports
+buy-only plans and no heartbeat; the per-address Cloudflare limit (200
+order requests/s sustained) bounds one server to five members at 25 ms.
+
 ## Runtime sequence and interfaces
 
 The scheduled five-minute slot, Gamma metadata creation time, CLOB parameter

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
@@ -10,6 +11,7 @@ from pathlib import Path
 from .config import BotConfig, SetupConfig
 from .database import BotDatabase
 from .exchange import DEFAULT_PLACEMENT_INTERVAL_MS, Exchange
+from .fleet import Fleet, evenly_phased
 from .lock import SingleInstance
 from .models import ExitTarget, TradePlan
 from .paper import PaperDatabase, PaperSimulator, paper_database_path
@@ -136,6 +138,28 @@ def _parser() -> argparse.ArgumentParser:
             "batch submits the pair in one request, single rotates both legs "
             "through single-order requests, solo-up/solo-down trade only that "
             "leg; default batch"
+        ),
+    )
+    run.add_argument(
+        "--fleet-env",
+        action="append",
+        default=[],
+        metavar="ENV_FILE",
+        help=(
+            "extra account env file (repeatable); every account runs the "
+            "same cadence with its phase offset by interval/N and a distinct "
+            "order size, and only the earliest registered order per market "
+            "is kept"
+        ),
+    )
+    run.add_argument(
+        "--fleet-size-step",
+        type=_decimal_arg,
+        default=Decimal("0.024"),
+        metavar="USD",
+        help=(
+            "per-member increase of --usd-per-side so each member's order "
+            "carries a distinct fingerprint size; default 0.024"
         ),
     )
     return parser
@@ -266,6 +290,26 @@ def main() -> None:
             raise SystemExit(
                 "--max-reserved-usd must cover both sides of at least one market"
             )
+        if args.fleet_env and args.take_profit:
+            raise SystemExit("--fleet-env supports buy-only plans for now")
+        if args.fleet_env and args.heartbeat_seconds is not None:
+            raise SystemExit("--fleet-env does not support --heartbeat-seconds yet")
+        fleet = None
+        if live and args.fleet_env:
+            members = [("primary", Exchange(config), plan.order_size)]
+            for index, env_path in enumerate(args.fleet_env, start=1):
+                member_config = BotConfig.from_env_file(
+                    Path(env_path), project_root=config.project_root
+                )
+                member_plan = replace(
+                    plan,
+                    usd_per_side=plan.usd_per_side + args.fleet_size_step * index,
+                )
+                member_plan.validate()
+                members.append(
+                    (f"m{index}", Exchange(member_config), member_plan.order_size)
+                )
+            fleet = Fleet(evenly_phased(members, args.placement_interval_ms))
         trace_path = config.project_root / "logs" / "attempts.jsonl"
         with SingleInstance():
             service = BotService(
@@ -279,6 +323,7 @@ def main() -> None:
                 placement_order=args.placement_order,
                 placement_interval_ms=args.placement_interval_ms,
                 entry_submission=args.entry_submission,
+                fleet=fleet,
                 cancel_before_end_seconds=args.cancel_before_end_seconds,
                 heartbeat_seconds=args.heartbeat_seconds,
                 live=args.live,
@@ -287,7 +332,16 @@ def main() -> None:
             if service.exchange:
                 trace_path.parent.mkdir(parents=True, exist_ok=True)
                 trace_file = trace_path.open("a", encoding="utf-8", buffering=1)
-                service.exchange.attempt_trace = lambda row: trace_file.write(
-                    json.dumps(row, separators=(",", ":")) + "\n"
-                )
+
+                def _tracer(account: str):
+                    return lambda row: trace_file.write(
+                        json.dumps({"account": account, **row}, separators=(",", ":"))
+                        + "\n"
+                    )
+
+                if service.fleet:
+                    for member in service.fleet.members:
+                        member.exchange.attempt_trace = _tracer(member.name)
+                else:
+                    service.exchange.attempt_trace = _tracer("primary")
             service.run()

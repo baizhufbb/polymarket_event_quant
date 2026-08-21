@@ -95,6 +95,7 @@ class PlacedOrder:
     raw: object
     side: str = "buy"
     role: str = "entry"
+    account: str = ""
 
 
 @dataclass(frozen=True)
@@ -104,6 +105,7 @@ class PlacementResult:
     retryable: bool = False
     attempts: int = 1
     expected: int = 2
+    registered_ts_ms: int | None = None
 
     @property
     def complete(self) -> bool:

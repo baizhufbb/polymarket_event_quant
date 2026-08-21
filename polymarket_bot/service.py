@@ -22,6 +22,7 @@ from .market_activation import (
     MarketActivationUpdate,
     MarketActivationWorker,
 )
+from .fleet import Fleet
 from .models import Market, PlacedOrder, PlacementResult, TradePlan
 from .reconciliation import ReconciliationWorker
 from .user_stream import UserStreamState, UserStreamWorker, UserTradeUpdate
@@ -67,6 +68,7 @@ def _classify_cancel_result(result: object) -> tuple[list[str], list[str]]:
 class BotService:
     placement_interval_ms = DEFAULT_PLACEMENT_INTERVAL_MS
     entry_submission = "batch"
+    fleet: Fleet | None = None
 
     def __init__(
         self,
@@ -81,6 +83,7 @@ class BotService:
         placement_order: str,
         placement_interval_ms: Decimal,
         entry_submission: str = "batch",
+        fleet: Fleet | None = None,
         cancel_before_end_seconds: int,
         heartbeat_seconds: Decimal | None,
         live: bool,
@@ -102,9 +105,19 @@ class BotService:
         self.entry_submission = entry_submission
         self.wake_event = Event()
         self.discovery = MarketDiscovery()
-        self.exchange = Exchange(config) if live else None
-        if self.exchange:
-            self.exchange.entry_submission = entry_submission
+        self.fleet = fleet if live else None
+        if self.fleet:
+            if not plan.buy_only:
+                raise ValueError("fleet mode supports buy-only plans for now")
+            if heartbeat_seconds is not None:
+                raise ValueError("fleet mode does not support the heartbeat yet")
+            self.exchange = self.fleet.primary.exchange
+            for member in self.fleet.members:
+                member.exchange.entry_submission = entry_submission
+        else:
+            self.exchange = Exchange(config) if live else None
+            if self.exchange:
+                self.exchange.entry_submission = entry_submission
         self.heartbeat_worker = (
             HeartbeatWorker(self.exchange, float(heartbeat_seconds))
             if self.exchange and heartbeat_seconds is not None
@@ -132,7 +145,7 @@ class BotService:
             else None
         )
         self.reconciliation_worker = (
-            ReconciliationWorker(self.exchange) if self.exchange else None
+            ReconciliationWorker(self._order_view()) if self.exchange else None
         )
         self.activation_market_updates: list[MarketActivationUpdate] = []
         self._placement_retries: dict[str, _PlacementRetryState] = {}
@@ -467,7 +480,7 @@ class BotService:
             return
         self.database.mark_orders(order_ids, "cancel_requested")
         try:
-            result = self.exchange.cancel_orders(order_ids)
+            canceled_ids, terminal_unknown_ids, result = self._cancel_rows(due)
         except Exception as exc:
             self.database.event(
                 self.run_id,
@@ -476,7 +489,6 @@ class BotService:
                 details={"order_ids": order_ids, "error": str(exc)},
             )
             return
-        canceled_ids, terminal_unknown_ids = _classify_cancel_result(result)
         self.database.mark_orders(canceled_ids, "cancelled")
         self.database.mark_orders(terminal_unknown_ids, "terminal_unknown")
         self.database.event(
@@ -691,6 +703,15 @@ class BotService:
             self.logger.info("DRY-RUN %s: Up/Down bids prepared", market.slug)
             return
 
+        if self.fleet:
+            self._place_with_fleet(
+                market,
+                trigger=trigger,
+                trigger_details=trigger_details,
+                placement_retry=placement_retry,
+            )
+            return
+
         placement_started_ts_ms = int(time.time() * 1000)
         submission_error = None
         reconciliation_error = None
@@ -803,6 +824,121 @@ class BotService:
                 },
             )
 
+    def _order_view(self):
+        return self.fleet.order_view if self.fleet else self.exchange
+
+    def _cancel_rows(self, rows) -> tuple[list[str], list[str], object]:
+        """Cancel tracked rows, routing each order to the account that owns it."""
+        if not self.fleet:
+            result = self.exchange.cancel_orders([row["order_id"] for row in rows])
+            canceled_ids, terminal_unknown_ids = _classify_cancel_result(result)
+            return canceled_ids, terminal_unknown_ids, result
+        grouped: dict[str, list[str]] = {}
+        for row in rows:
+            account = row["account"] or self.fleet.primary.name
+            grouped.setdefault(account, []).append(row["order_id"])
+        canceled_ids: list[str] = []
+        terminal_unknown_ids: list[str] = []
+        results: dict[str, object] = {}
+        for account, order_ids in grouped.items():
+            result = self.fleet.member(account).exchange.cancel_orders(order_ids)
+            canceled, terminal = _classify_cancel_result(result)
+            canceled_ids.extend(canceled)
+            terminal_unknown_ids.extend(terminal)
+            results[account] = result
+        return canceled_ids, terminal_unknown_ids, results
+
+    def _place_with_fleet(
+        self,
+        market: Market,
+        *,
+        trigger: str,
+        trigger_details: dict | None,
+        placement_retry: _PlacementRetryState | None,
+    ) -> None:
+        placement_started_ts_ms = int(time.time() * 1000)
+        placement = None
+        error = None
+        try:
+            placement = self.fleet.place(
+                market,
+                price=self.plan.buy_price,
+                submission_interval_ms=self.placement_interval_ms,
+            )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        placement_finished_ts_ms = int(time.time() * 1000)
+        placement_details = {
+            "trigger": trigger,
+            "placement_started_ts_ms": placement_started_ts_ms,
+            "placement_finished_ts_ms": placement_finished_ts_ms,
+            **(trigger_details or {}),
+        }
+        if placement is None:
+            self._placement_retries.pop(market.slug, None)
+            self.database.set_market_state(market.slug, "error", error)
+            self.database.event(
+                self.run_id,
+                "ERROR",
+                "placement_failed",
+                slug=market.slug,
+                details={"error": error, **placement_details},
+            )
+            return
+
+        for order in placement.orders:
+            self.database.add_order(self.run_id, market.slug, order)
+        placement_details.update(
+            {"submission_attempts": placement.attempts, "fleet": placement.details()}
+        )
+        if placement.kept is not None:
+            self._placement_retries.pop(market.slug, None)
+            self.database.set_market_state(market.slug, "active")
+            self.database.event(
+                self.run_id,
+                "INFO",
+                "dual_orders_placed",
+                slug=market.slug,
+                details={
+                    "order_ids": placement.kept_order_ids(),
+                    "placement_ms": placement_finished_ts_ms - placement_started_ts_ms,
+                    **placement_details,
+                },
+            )
+            self.logger.info(
+                "LIVE %s: fleet kept %s, cancelled %d laggard order(s)",
+                market.slug,
+                placement.kept,
+                len(placement.cancelled_order_ids),
+            )
+            return
+
+        result = PlacementResult(
+            (),
+            placement.error,
+            retryable=placement.retryable,
+            attempts=placement.attempts,
+        )
+        if self._requeue_placement(
+            market,
+            result=result,
+            retry=placement_retry,
+            placement_started_ts_ms=placement_started_ts_ms,
+            placement_finished_ts_ms=placement_finished_ts_ms,
+            placement_details=placement_details,
+            trigger_details=trigger_details,
+        ):
+            return
+        self._placement_retries.pop(market.slug, None)
+        self.database.set_market_state(market.slug, "error", placement.error)
+        self.database.event(
+            self.run_id,
+            "ERROR",
+            "placement_failed",
+            slug=market.slug,
+            details={"error": placement.error, **placement_details},
+        )
+
     def _requeue_placement(
         self,
         market: Market,
@@ -878,7 +1014,7 @@ class BotService:
         if live_rows and self.exchange:
             try:
                 open_by_id = {}
-                for raw in self.exchange.open_orders():
+                for raw in self._order_view().open_orders():
                     order_id = raw.get("id") or raw.get("orderID") or raw.get("orderId")
                     if order_id:
                         open_by_id[str(order_id)] = raw
@@ -895,7 +1031,7 @@ class BotService:
                 try:
                     raw = open_by_id.get(row["order_id"])
                     if raw is None:
-                        raw = self.exchange.get_order(row["order_id"])
+                        raw = self._order_view().get_order(row["order_id"])
                     if raw is None:
                         raw = {
                             "id": row["order_id"],
@@ -1082,8 +1218,7 @@ class BotService:
             return
         self.database.mark_orders(order_ids, "cancel_requested")
         try:
-            result = self.exchange.cancel_orders(order_ids)
-            canceled_ids, terminal_unknown_ids = _classify_cancel_result(result)
+            canceled_ids, terminal_unknown_ids, result = self._cancel_rows(tracked)
             self.database.mark_orders(canceled_ids, "cancelled")
             self.database.mark_orders(terminal_unknown_ids, "terminal_unknown")
             self.database.event(

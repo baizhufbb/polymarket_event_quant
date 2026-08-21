@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS orders (
     token_id TEXT NOT NULL,
     side TEXT NOT NULL DEFAULT 'buy',
     role TEXT NOT NULL DEFAULT 'entry',
+    account TEXT NOT NULL DEFAULT '',
     price TEXT NOT NULL,
     size TEXT NOT NULL,
     matched_size TEXT NOT NULL DEFAULT '0',
@@ -101,6 +102,7 @@ class BotDatabase:
             "orders": {
                 "side": "TEXT NOT NULL DEFAULT 'buy'",
                 "role": "TEXT NOT NULL DEFAULT 'entry'",
+                "account": "TEXT NOT NULL DEFAULT ''",
             },
         }
         for table, columns in required.items():
@@ -265,9 +267,9 @@ class BotDatabase:
         self.connection.execute(
             """
             INSERT OR REPLACE INTO orders(
-                order_id, run_id, slug, outcome, token_id, side, role, price, size,
-                matched_size, status, raw_json, created_ts, updated_ts
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                order_id, run_id, slug, outcome, token_id, side, role, account,
+                price, size, matched_size, status, raw_json, created_ts, updated_ts
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 order.order_id,
@@ -277,6 +279,7 @@ class BotDatabase:
                 order.token_id,
                 order.side,
                 order.role,
+                order.account,
                 str(order.price),
                 str(order.size),
                 str(initial_matched),

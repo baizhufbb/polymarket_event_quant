@@ -330,6 +330,7 @@ class Exchange:
         errors: list[str] = []
         ambiguous_errors: list[str] = []
         attempts = 0
+        registered_ts_ms: int | None = None
         next_submission = max(
             time.monotonic(),
             self._next_placement_submission,
@@ -352,7 +353,12 @@ class Exchange:
                     attempts + 1,
                 )
                 attempts += 1
-                next_submission = now + interval
+                # Stay on an absolute grid so the phase relative to other
+                # fleet members holds; after a whole-tick stall resume on a
+                # fresh grid instead of bursting to catch up.
+                next_submission += interval
+                if next_submission <= now:
+                    next_submission = now + interval
                 self._next_placement_submission = next_submission
                 continue
 
@@ -432,6 +438,8 @@ class Exchange:
                         stop_submitting = True
                         continue
                     accepted[order.outcome] = order
+                    if registered_ts_ms is None or returned_ts_ms < registered_ts_ms:
+                        registered_ts_ms = returned_ts_ms
                     # sent_ts_ms/returned_ts_ms belong to the request whose
                     # response is being handled right now, not to whichever
                     # tick the loop has reached: responses come back out of
@@ -472,6 +480,7 @@ class Exchange:
                     ordered,
                     attempts=attempts,
                     expected=len(specifications),
+                    registered_ts_ms=registered_ts_ms,
                 ),
                 submission_key=submission_key,
                 submissions=submissions,
@@ -490,6 +499,7 @@ class Exchange:
                 error,
                 attempts=attempts,
                 expected=len(specifications),
+                registered_ts_ms=registered_ts_ms,
             )
         else:
             result = PlacementResult(

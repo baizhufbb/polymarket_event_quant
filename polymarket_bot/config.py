@@ -61,6 +61,39 @@ class BotConfig:
         config.validate(live=live, authenticated=authenticated)
         return config
 
+    @classmethod
+    def from_env_file(cls, path: Path, *, project_root: Path) -> "BotConfig":
+        """Load one extra fleet account from a KEY=VALUE file."""
+        values: dict[str, str] = {}
+        for line in Path(path).read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            values[key.strip()] = value.strip()
+        credentials = tuple(
+            values.get(name) or None
+            for name in (
+                "POLYMARKET_CLOB_API_KEY",
+                "POLYMARKET_CLOB_API_SECRET",
+                "POLYMARKET_CLOB_API_PASSPHRASE",
+            )
+        )
+        if any(credentials) and not all(credentials):
+            raise ValueError(f"{path}: CLOB API credentials must be all present or all absent")
+        config = cls(
+            project_root=project_root,
+            private_key=values.get("POLYMARKET_PRIVATE_KEY", ""),
+            funder_address=values.get("POLYMARKET_FUNDER_ADDRESS", ""),
+            signature_type=int(values.get("POLYMARKET_SIGNATURE_TYPE", "0")),
+            api_key=credentials[0],
+            api_secret=credentials[1],
+            api_passphrase=credentials[2],
+        )
+        if not config.private_key or not config.funder_address:
+            raise ValueError(f"{path}: private key and funder address are required")
+        return config
+
     def validate(self, *, live: bool, authenticated: bool = False) -> None:
         if live or authenticated:
             if not self.private_key or not self.funder_address:
