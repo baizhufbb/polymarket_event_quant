@@ -106,15 +106,6 @@ def _parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--cancel-before-end-seconds", type=int, default=2)
     run.add_argument(
-        "--heartbeat-seconds",
-        type=_decimal_arg,
-        metavar="SECONDS",
-        help=(
-            "enable Polymarket's disconnect-cancels-orders heartbeat and send "
-            "every SECONDS; omitted disables it"
-        ),
-    )
-    run.add_argument(
         "--placement-interval-ms",
         type=_placement_interval_ms_arg,
         default=DEFAULT_PLACEMENT_INTERVAL_MS,
@@ -279,10 +270,6 @@ def main() -> None:
             )
         if args.cancel_before_end_seconds < 0:
             raise SystemExit("--cancel-before-end-seconds cannot be negative")
-        if args.heartbeat_seconds is not None and not (
-            Decimal("0") < args.heartbeat_seconds < Decimal("10")
-        ):
-            raise SystemExit("--heartbeat-seconds must be above 0 and below 10")
         if (
             args.max_reserved_usd is not None
             and args.max_reserved_usd < plan.market_reserve
@@ -292,8 +279,6 @@ def main() -> None:
             )
         if args.fleet_env and args.take_profit:
             raise SystemExit("--fleet-env supports buy-only plans for now")
-        if args.fleet_env and args.heartbeat_seconds is not None:
-            raise SystemExit("--fleet-env does not support --heartbeat-seconds yet")
         fleet = None
         if live and args.fleet_env:
             members = [("primary", Exchange(config), plan.order_size)]
@@ -325,7 +310,6 @@ def main() -> None:
                 entry_submission=args.entry_submission,
                 fleet=fleet,
                 cancel_before_end_seconds=args.cancel_before_end_seconds,
-                heartbeat_seconds=args.heartbeat_seconds,
                 live=args.live,
                 logger=_logger(config),
             )

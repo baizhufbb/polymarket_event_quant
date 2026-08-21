@@ -72,7 +72,6 @@ def test_run_limits_are_optional_cli_parameters() -> None:
     assert args.placement_order == "nearest-first"
     assert args.placement_interval_ms == Decimal("20")
     assert args.cancel_before_end_seconds == 2
-    assert args.heartbeat_seconds is None
 
     buy_only = _parser().parse_args(
         [
@@ -100,8 +99,6 @@ def test_run_limits_are_optional_cli_parameters() -> None:
             "farthest-first",
             "--cancel-before-end-seconds",
             "0",
-            "--heartbeat-seconds",
-            "5",
             "--placement-interval-ms",
             "12.5",
         ]
@@ -109,7 +106,6 @@ def test_run_limits_are_optional_cli_parameters() -> None:
     assert reverse.lookahead_minutes == 120
     assert reverse.placement_order == "farthest-first"
     assert reverse.cancel_before_end_seconds == 0
-    assert reverse.heartbeat_seconds == Decimal("5")
     assert reverse.placement_interval_ms == Decimal("12.5")
 
     next_market_only = _parser().parse_args(

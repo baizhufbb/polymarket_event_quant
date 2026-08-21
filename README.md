@@ -25,8 +25,6 @@ until stopped.
 - Cancel remaining entry and exit orders before the market cutoff; the lead time
   is controlled by `--cancel-before-end-seconds` and defaults to two seconds.
   Set it to `0` to leave orders resting until Polymarket closes the market.
-- Polymarket's disconnect-cancels-orders heartbeat is disabled unless
-  `--heartbeat-seconds SECONDS` is supplied.
 - Live entries start submitting as soon as CLOB exposes the market's token
   ids and keep resubmitting the same pre-signed orders until both are
   accepted. `--placement-interval-ms` sets the tick cadence and defaults to
@@ -35,10 +33,9 @@ until stopped.
   a 25 ms tick matches the Standard tier's 40 tokens per second refill.
 - Live runs append every submission attempt to `logs/attempts.jsonl`
   (attempt number, send and return time, reply kind per leg) so a session can
-  show exactly when the book began accepting orders. This trace is temporary
-  measurement scaffolding and is meant to be removed once the queue-position
-  question is settled; the entry modes themselves, including the solo modes,
-  are permanent trading behaviour.
+  show exactly when the book began accepting orders. The trace stays: it is
+  the record every queue-position analysis is built on. The entry modes,
+  including the solo modes, are permanent trading behaviour.
 - The bot does not submit redemption transactions. Resolved winnings are
   returned by Polymarket's account-side settlement service.
 
@@ -81,7 +78,7 @@ keeps the order that registered first (`PlacementResult.registered_ts_ms`,
 the earliest reply that carried the order id) and cancels the others, so
 exposure stays at one order per market. Orders carry an `account` column;
 cancellation and reconciliation route by it. Fleet mode currently supports
-buy-only plans and no heartbeat; the per-address Cloudflare limit (200
+buy-only plans; the per-address Cloudflare limit (200
 order requests/s sustained) bounds one server to five members at 25 ms.
 
 ## Runtime sequence and interfaces
@@ -148,10 +145,9 @@ to the matched entry size, including incremental partial fills.
 Omitting `--take-profit` selects buy-only mode. Matched shares are not offered
 for sale; they remain held through resolution.
 
-Omitting `--heartbeat-seconds` leaves GTC orders on the exchange during a
-network or process outage. Supplying a value above zero and below ten enables
-Polymarket's dead-man switch and controls how often this client sends a
-heartbeat. It does not change Polymarket's server-side cancellation deadline.
+GTC orders stay on the exchange through a network or process outage by
+design: the queue slot is the strategy's asset, so Polymarket's
+disconnect-cancels-orders heartbeat is deliberately not used.
 
 ## Safety
 
@@ -181,14 +177,8 @@ heartbeat. It does not change Polymarket's server-side cancellation deadline.
   balance, so off-chain matches are never treated as already settled inventory.
 - An ambiguous exit submission is reconciled against the exchange. If it cannot
   be identified exactly, it is recorded as failed and is not blindly repeated.
-- When `--heartbeat-seconds` is enabled, a dedicated thread sends independently
-  of discovery and reconciliation. A failed heartbeat pauses new orders and
-  Polymarket may cancel every open order for the account.
 - Farthest-first live runs record Gamma discovery, CLOB parameter detection, and
   order-submission timestamps.
-- When enabled, an expired heartbeat ID is replaced from the protocol's `400`
-  response and retried once. Recovery triggers an immediate open-order
-  reconciliation.
 - Open orders are synchronized in one batch; only orders missing from that
   response require an individual terminal-status lookup. Exchange reads run in
   a background worker so reconciliation cannot delay a new-market placement.
@@ -209,8 +199,8 @@ heartbeat. It does not change Polymarket's server-side cancellation deadline.
 
 Live and ordinary dry-run state use `data/bot.sqlite`:
 
-- `runs`: every start and stop, mode, fixed trading parameters, optional
-  heartbeat status, and terminal error.
+- `runs`: every start and stop, mode, fixed trading parameters, and terminal
+  error.
 - `markets`: each market considered by the bot and its state.
 - `orders`: entry and exit order IDs, side, price, size, matched size, and status.
 - `events`: operational audit log.
@@ -276,11 +266,6 @@ uv run --env-file .env.trading bot.py run --live `
   --take-profit 0.02:0.50 `
   --take-profit 0.10:0.10 `
   --take-profit 0.30:0.10
-
-# Opt into disconnect-triggered order cancellation with a five-second heartbeat.
-uv run --env-file .env.trading bot.py run --live `
-  --buy-price 0.01 --usd-per-side 1 `
-  --heartbeat-seconds 5
 
 # Select 40 minutes from the currently farthest market and place backward.
 uv run --env-file .env.trading bot.py run --live `

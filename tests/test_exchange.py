@@ -683,35 +683,6 @@ def test_ambiguous_exit_adopts_one_exact_open_sell() -> None:
     assert order.side == "sell"
 
 
-def test_heartbeat_retries_once_with_server_id() -> None:
-    class HeartbeatClient:
-        def __init__(self):
-            self.calls = []
-
-        def post_heartbeat(self, heartbeat_id):
-            self.calls.append(heartbeat_id)
-            if len(self.calls) == 1:
-                request = httpx.Request(
-                    "POST", "https://clob.polymarket.com/v1/heartbeats"
-                )
-                response = httpx.Response(
-                    400,
-                    json={"heartbeat_id": "replacement"},
-                    request=request,
-                )
-                raise PolyApiException(response)
-            return {"status": "ok", "heartbeat_id": "current"}
-
-    exchange = Exchange.__new__(Exchange)
-    exchange.client = HeartbeatClient()
-    exchange.heartbeat_id = "expired"
-
-    exchange.heartbeat()
-
-    assert exchange.client.calls == ["expired", "replacement"]
-    assert exchange.heartbeat_id == "current"
-
-
 class SingleModeClient(FakeClient):
     def __init__(self, leg_responses=None):
         super().__init__([])

@@ -16,7 +16,6 @@ from .exchange import (
     normalize_order,
 )
 from .geoblock import GeoblockWorker
-from .heartbeat import HeartbeatWorker
 from .market_activation import (
     MarketActivationState,
     MarketActivationUpdate,
@@ -85,7 +84,6 @@ class BotService:
         entry_submission: str = "batch",
         fleet: Fleet | None = None,
         cancel_before_end_seconds: int,
-        heartbeat_seconds: Decimal | None,
         live: bool,
         logger: logging.Logger,
     ):
@@ -99,7 +97,6 @@ class BotService:
         self.placement_order = placement_order
         self.placement_interval_ms = placement_interval_ms
         self.cancel_before_end_seconds = cancel_before_end_seconds
-        self.heartbeat_seconds = heartbeat_seconds
         self.live = live
         self.logger = logger
         self.entry_submission = entry_submission
@@ -109,8 +106,6 @@ class BotService:
         if self.fleet:
             if not plan.buy_only:
                 raise ValueError("fleet mode supports buy-only plans for now")
-            if heartbeat_seconds is not None:
-                raise ValueError("fleet mode does not support the heartbeat yet")
             self.exchange = self.fleet.primary.exchange
             for member in self.fleet.members:
                 member.exchange.entry_submission = entry_submission
@@ -118,11 +113,6 @@ class BotService:
             self.exchange = Exchange(config) if live else None
             if self.exchange:
                 self.exchange.entry_submission = entry_submission
-        self.heartbeat_worker = (
-            HeartbeatWorker(self.exchange, float(heartbeat_seconds))
-            if self.exchange and heartbeat_seconds is not None
-            else None
-        )
         self.geoblock_worker = (
             GeoblockWorker(
                 self.exchange,
@@ -173,11 +163,6 @@ class BotService:
             "placement_interval_ms": str(self.placement_interval_ms),
             "entry_submission": self.entry_submission,
             "cancel_before_end_seconds": self.cancel_before_end_seconds,
-            "heartbeat_seconds": (
-                str(self.heartbeat_seconds)
-                if self.heartbeat_seconds is not None
-                else None
-            ),
             "early_activation_probe": self.market_activation_worker is not None,
         }
         self.run_id = self.database.start_run(mode, run_config)
@@ -187,8 +172,6 @@ class BotService:
             else None
         )
         self.database.event(self.run_id, "INFO", "run_started", details={"mode": mode})
-        if self.heartbeat_worker:
-            self.heartbeat_worker.start()
         if self.geoblock_worker:
             self.geoblock_worker.start()
         if self.user_stream_worker:
@@ -229,8 +212,6 @@ class BotService:
             if self.user_stream_worker:
                 self.user_stream_worker.stop()
                 self._drain_user_stream_updates()
-            if self.heartbeat_worker:
-                self.heartbeat_worker.stop()
             if self.geoblock_worker:
                 self.geoblock_worker.stop()
             if cancel_on_shutdown:
@@ -246,12 +227,10 @@ class BotService:
         self._drain_market_activation_updates()
         self._drain_reconciliation_updates()
         stream_recovered = self._drain_user_stream_updates()
-        recovered = self._drain_heartbeat_updates()
         self._drain_geoblock_updates()
         self._cancel_due_orders(time.time())
         if (
-            recovered
-            or stream_recovered
+            stream_recovered
             or now - self.last_reconcile >= self.config.order_poll_seconds
         ):
             if self.reconciliation_worker:
@@ -262,15 +241,11 @@ class BotService:
             else:
                 self._reconcile()
                 self.last_reconcile = now
-        heartbeat_healthy = (
-            self.heartbeat_worker is None or self.heartbeat_worker.healthy
-        )
         geoblock_healthy = (
             self.geoblock_worker is None or self.geoblock_worker.healthy
         )
         healthy = not self.live or bool(
             geoblock_healthy
-            and heartbeat_healthy
             and self.user_stream_worker
             and self.user_stream_worker.healthy
         )
@@ -502,31 +477,6 @@ class BotService:
                 "result": result,
             },
         )
-
-    def _drain_heartbeat_updates(self) -> bool:
-        if not self.heartbeat_worker:
-            return False
-        recovered = False
-        for update in self.heartbeat_worker.drain():
-            if update.success:
-                self.database.heartbeat(self.run_id)
-                if update.recovered:
-                    recovered = True
-                    self.database.event(self.run_id, "INFO", "heartbeat_recovered")
-                    self.logger.info("heartbeat recovered; reconciling open orders")
-            else:
-                self.database.run_error(self.run_id, update.error or "heartbeat failed")
-                if update.changed:
-                    self.database.event(
-                        self.run_id,
-                        "ERROR",
-                        "heartbeat_failed",
-                        details={"error": update.error},
-                    )
-                    self.logger.error(
-                        "heartbeat failed; new placements paused: %s", update.error
-                    )
-        return recovered
 
     def _drain_geoblock_updates(self) -> None:
         if not self.geoblock_worker:

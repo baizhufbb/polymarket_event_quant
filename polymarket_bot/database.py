@@ -144,19 +144,6 @@ class BotDatabase:
         )
         self.connection.commit()
 
-    def heartbeat(self, run_id: int) -> None:
-        self.connection.execute(
-            "UPDATE runs SET heartbeat_ts=?, last_error=NULL WHERE id=?",
-            (_now(), run_id),
-        )
-        self.connection.commit()
-
-    def run_error(self, run_id: int, error: str) -> None:
-        self.connection.execute(
-            "UPDATE runs SET last_error=? WHERE id=?", (error, run_id)
-        )
-        self.connection.commit()
-
     def event(
         self,
         run_id: int | None,

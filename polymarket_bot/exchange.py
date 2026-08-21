@@ -113,13 +113,6 @@ def _order_engine_not_ready_error(error: PolyApiException) -> str | None:
     return message
 
 
-def _heartbeat_id(payload: object) -> str | None:
-    if not isinstance(payload, dict):
-        return None
-    value = payload.get("heartbeat_id") or payload.get("heartbeatId")
-    return str(value) if value else None
-
-
 def classify_response(response: object) -> str:
     """Bucket one submission response for the attempt trace."""
     if isinstance(response, BaseException):
@@ -170,7 +163,6 @@ class Exchange:
             funder=config.funder_address,
             retry_on_error=False,
         )
-        self.heartbeat_id = ""
         self._dual_submissions: dict[tuple, list[PostOrdersV2Args]] = {}
         self._next_placement_submission = 0.0
 
@@ -179,22 +171,6 @@ class Exchange:
         response = requests.get(GEOBLOCK_URL, timeout=20)
         response.raise_for_status()
         return response.json()
-
-    def heartbeat(self) -> dict:
-        try:
-            response = self.client.post_heartbeat(self.heartbeat_id)
-        except PolyApiException as exc:
-            replacement = (
-                _heartbeat_id(exc.error_msg) if exc.status_code == 400 else None
-            )
-            if replacement is None:
-                raise
-            self.heartbeat_id = replacement
-            response = self.client.post_heartbeat(self.heartbeat_id)
-        heartbeat_id = response.get("heartbeat_id") or response.get("heartbeatId")
-        if heartbeat_id:
-            self.heartbeat_id = str(heartbeat_id)
-        return response
 
     def doctor(self, signature_type: int) -> dict:
         return {
