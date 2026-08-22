@@ -124,3 +124,36 @@ def test_fetch_pauses_once_per_round_and_skips_the_reread_when_stopping(monkeypa
 
     assert exchange.calls == 3
     assert update.orders == ()
+
+
+def test_fetch_stops_retiring_when_stop_lands_during_the_reread(monkeypatch) -> None:
+    import polymarket_bot.reconciliation as module
+
+    monkeypatch.setattr(module, "MISSING_ORDER_RECHECK_SECONDS", 0.0)
+    worker = None
+
+    class AbsentExchange:
+        def __init__(self):
+            self.calls = 0
+
+        def open_orders(self):
+            return []
+
+        def get_order(self, order_id):
+            self.calls += 1
+            if self.calls == 4:  # first re-read of the second pass
+                worker.stop()
+            return None
+
+    exchange = AbsentExchange()
+    worker = module.ReconciliationWorker(exchange)
+    snapshots = tuple(
+        module.TrackedOrderSnapshot(f"order-{i}", "slug", "100") for i in range(3)
+    )
+
+    update = worker._fetch(snapshots)
+
+    # the order whose re-read completed is retired; the rest are left alone
+    assert exchange.calls == 4
+    assert [o.snapshot.order_id for o in update.orders] == ["order-0"]
+    assert update.orders[0].raw["status"] == "terminal_unknown"

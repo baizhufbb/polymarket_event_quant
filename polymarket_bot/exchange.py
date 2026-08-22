@@ -40,9 +40,12 @@ DEFAULT_PLACEMENT_INTERVAL_MS = Decimal("20")
 # freshly announced market answers 404 "market not found" for its first tens
 # of milliseconds. Run 14 lost 17 of 72 markets to that reply being fatal.
 # Signing runs on the service loop (or a fleet member thread the loop joins),
-# so the in-place wait is short; past it the market is handed back to the
-# loop as a retryable placement, the same path the submission loop uses.
-SIGNING_NOT_READY_RETRY_SECONDS = 3.0
+# and that loop is also what cancels resting orders before a market ends
+# (default margin 2 s), so the in-place wait must stay well below that
+# margin; past it the market is handed back to the loop as a retryable
+# placement, the same path the submission loop uses, and re-enters on the
+# next 0.2 s tick.
+SIGNING_NOT_READY_RETRY_SECONDS = 0.5
 SIGNING_NOT_READY_POLL_SECONDS = 0.1
 DRAIN_TIMEOUT_SECONDS = 3.0
 DUPLICATE_ORDER_PATTERN = re.compile(
@@ -230,7 +233,7 @@ class Exchange:
                     market_end_ts=market.end_ts,
                 )
             except _SigningNotReady as exc:
-                return PlacementResult((), str(exc), retryable=True, attempts=0)
+                return PlacementResult((), str(exc), retryable=True, attempts=1)
             submissions[submission_key] = signed
 
         if submission_interval_ms is not None:
@@ -725,9 +728,10 @@ class Exchange:
         Signing is local, but the client first asks the venue for the tick
         size, and a market announced moments ago still answers 404 "market
         not found"; transient transport failures (429, 5xx, no status) are
-        treated the same way, as the submission loop already does. Polls run
-        on an absolute grid so the wait does not disturb fleet phase offsets.
-        Past the short in-place budget the market is handed back as
+        treated the same way, as the submission loop already does. Polls are
+        paced so the retry does not spin, and the exit is the wall clock, so
+        the loop is held for at most the budget plus one reply however slow
+        the venue answers. Past the budget the market is handed back as
         _SigningNotReady; anything else is raised as before.
         """
         start = time.monotonic()
@@ -755,12 +759,15 @@ class Exchange:
                     raise
                 if time.time() >= market_end_ts:
                     raise
-                next_poll += SIGNING_NOT_READY_POLL_SECONDS
-                if next_poll >= deadline:
+                now = time.monotonic()
+                # Clamp the next slot to now: a slow reply must not turn the
+                # slots it overran into a zero-delay burst (against 429 too).
+                next_poll = max(next_poll + SIGNING_NOT_READY_POLL_SECONDS, now)
+                if now >= deadline or next_poll >= deadline:
                     raise _SigningNotReady(
                         f"signing not ready after {SIGNING_NOT_READY_RETRY_SECONDS:g}s: {exc}"
                     )
-                time.sleep(max(0.0, next_poll - time.monotonic()))
+                time.sleep(next_poll - now)
 
     @staticmethod
     def _dual_submission_key(

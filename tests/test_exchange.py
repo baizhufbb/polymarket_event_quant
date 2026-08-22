@@ -858,9 +858,76 @@ def test_signing_hands_the_market_back_after_the_in_place_budget(monkeypatch) ->
 
     assert result.orders == ()
     assert result.retryable
+    assert result.attempts == 1
     assert "signing not ready" in result.error
-    # absolute 50 ms grid inside a 300 ms budget: a handful of polls, not one, not hundreds
+    # 50 ms pacing inside a 300 ms budget: a handful of polls, not one, not hundreds
     assert 4 <= exchange.client.create_calls <= 8
+
+
+def test_signing_budget_is_wall_clock_even_when_replies_are_slow(monkeypatch) -> None:
+    import time
+
+    import polymarket_bot.exchange as exchange_module
+
+    monkeypatch.setattr(exchange_module, "SIGNING_NOT_READY_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(exchange_module, "SIGNING_NOT_READY_RETRY_SECONDS", 0.25)
+
+    class SlowNotReadyClient(_NotReadyThenSigningClient):
+        def create_order(self, order_args, options):
+            time.sleep(0.1)  # the venue's open-moment latency, far above the poll pace
+            return super().create_order(order_args, options)
+
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = SlowNotReadyClient(failures=100)
+
+    started = time.monotonic()
+    result = exchange.place_dual(
+        MARKET,
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        submission_interval_ms=Decimal("20"),
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.orders == ()
+    assert result.retryable
+    # bounded by the budget plus one reply, not by a poll count (25 slots here)
+    assert elapsed < 0.8
+    assert exchange.client.create_calls <= 4
+
+
+def test_signing_retries_transient_transport_failures(monkeypatch) -> None:
+    import polymarket_bot.exchange as exchange_module
+
+    monkeypatch.setattr(exchange_module, "SIGNING_NOT_READY_POLL_SECONDS", 0.0)
+
+    class TransientThenSigningClient(_NotReadyThenSigningClient):
+        def __init__(self, failure):
+            super().__init__(failures=1)
+            self.failure = failure
+
+        def create_order(self, order_args, options):
+            self.create_calls += 1
+            if self.create_calls <= self.failures:
+                raise self.failure
+            return {"token_id": order_args.token_id, "side": order_args.side}
+
+    failures = [
+        PolyApiException(httpx.Response(429, json={"error": "too many requests"})),
+        PolyApiException(httpx.Response(503, json={"error": "trading is disabled"})),
+        PolyApiException(error_msg="ReadTimeout: timed out"),
+    ]
+    for failure in failures:
+        exchange = Exchange.__new__(Exchange)
+        exchange.client = TransientThenSigningClient(failure)
+        result = exchange.place_dual(
+            MARKET,
+            price=Decimal("0.01"),
+            size=Decimal("100"),
+            submission_interval_ms=Decimal("20"),
+        )
+        assert result.complete, failure
+        assert exchange.client.create_calls == 3
 
 
 class _RejectingClient(_NotReadyThenSigningClient):

@@ -16,6 +16,7 @@ every call, so replacing the module attribute redirects all traffic.
 
 from __future__ import annotations
 
+import time
 from concurrent.futures import ThreadPoolExecutor, wait
 
 import httpx
@@ -26,8 +27,13 @@ CLOB_TIME_URL = "https://clob.polymarket.com/time"
 # so about 40 requests can be in flight at once; keep headroom above that.
 MAX_CONNECTIONS = 64
 WARM_CONNECTIONS = 48
+# A market handed back by signing re-enters place_dual every loop tick, and
+# each entry asks to warm the pool; the pool is process-wide, so one warm-up
+# per window serves every member and every re-entry of that market.
+WARM_INTERVAL_SECONDS = 60.0
 
 _installed = False
+_last_warm_monotonic: float | None = None
 
 
 def install_parallel_transport() -> None:
@@ -67,8 +73,16 @@ def warm_connections(count: int = WARM_CONNECTIONS) -> None:
     cheap concurrent requests forces the dials now. Failures are ignored;
     a connection that failed to warm is simply dialed on demand later.
     """
+    global _last_warm_monotonic
     if not _installed:
         return
+    now = time.monotonic()
+    if (
+        _last_warm_monotonic is not None
+        and now - _last_warm_monotonic < WARM_INTERVAL_SECONDS
+    ):
+        return
+    _last_warm_monotonic = now
     client = _helpers._http_client
     with ThreadPoolExecutor(max_workers=count) as pool:
         futures = [pool.submit(client.get, CLOB_TIME_URL) for _ in range(count)]

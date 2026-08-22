@@ -140,6 +140,8 @@ class ReconciliationWorker:
         # that is shutting down retires nothing on a single missed read.
         if missing and not self._stop.wait(MISSING_ORDER_RECHECK_SECONDS):
             for snapshot in missing:
+                if self._stop.is_set():
+                    break
                 try:
                     raw = self.exchange.get_order(snapshot.order_id)
                     if raw is None:

@@ -44,6 +44,7 @@ def test_warm_connections_noop_before_install(monkeypatch):
 
 def test_warm_connections_dials_count_requests(monkeypatch):
     monkeypatch.setattr(transport, "_installed", True)
+    monkeypatch.setattr(transport, "_last_warm_monotonic", None)
     calls = []
 
     class Fake:
@@ -53,3 +54,23 @@ def test_warm_connections_dials_count_requests(monkeypatch):
     monkeypatch.setattr(helpers, "_http_client", Fake())
     transport.warm_connections(count=5)
     assert len(calls) == 5
+
+
+def test_warm_connections_runs_once_per_window(monkeypatch):
+    monkeypatch.setattr(transport, "_installed", True)
+    monkeypatch.setattr(transport, "_last_warm_monotonic", None)
+    monkeypatch.setattr(transport, "WARM_INTERVAL_SECONDS", 60.0)
+    calls = []
+
+    class Fake:
+        def get(self, url):
+            calls.append(url)
+
+    monkeypatch.setattr(helpers, "_http_client", Fake())
+    transport.warm_connections(count=5)
+    transport.warm_connections(count=5)  # a handed-back market re-entering
+    assert len(calls) == 5
+
+    monkeypatch.setattr(transport, "WARM_INTERVAL_SECONDS", 0.0)
+    transport.warm_connections(count=5)  # next market, window elapsed
+    assert len(calls) == 10
