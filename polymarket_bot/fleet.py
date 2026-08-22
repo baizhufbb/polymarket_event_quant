@@ -89,6 +89,7 @@ class FleetPlacement:
                 "registered": placement.registered,
                 "attempts": result.attempts if result else 0,
                 "registered_ts_ms": result.registered_ts_ms if result else None,
+                "held_back": result.held_back if result else None,
                 "order_ids": [order.order_id for order in result.orders] if result else [],
                 "error": placement.error or (result.error if result else None),
             }

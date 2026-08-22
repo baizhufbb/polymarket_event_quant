@@ -720,6 +720,7 @@ class BotService:
             "placement_started_ts_ms": placement_started_ts_ms,
             "placement_finished_ts_ms": placement_finished_ts_ms,
             "submission_attempts": result.attempts,
+            "slots_held_back": result.held_back,
             **(trigger_details or {}),
         }
         if submission_error:

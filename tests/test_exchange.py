@@ -1,6 +1,6 @@
 import time
 from decimal import Decimal
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 
 import httpx
 import pytest
@@ -292,6 +292,88 @@ def test_advancing_the_timetable_never_skips_a_slot() -> None:
                     f"origin={origin} phase={phase} jumped {step} slots"
                 )
                 slot = nxt
+
+
+class _StuckClient(FakeClient):
+    """A venue that answers nothing until it is released."""
+
+    def __init__(self, release):
+        super().__init__([])
+        self.release = release
+        self.lock = Lock()
+        self.calls = 0
+
+    def post_orders(self, signed, post_only=False):
+        with self.lock:
+            self.calls += 1
+        self.release.wait(timeout=10)
+        up_id = "0x" + "1" * 64
+        down_id = "0x" + "2" * 64
+        return [
+            {"success": True, "orderID": up_id, "status": "live"},
+            {"success": True, "orderID": down_id, "status": "live"},
+        ]
+
+
+def test_the_loop_stops_outrunning_a_venue_that_has_gone_quiet(monkeypatch) -> None:
+    """Sending past the pool's share of connections only deepens its queue.
+
+    In the live run replies went from 55 ms to a 14 s median; the loop kept
+    sending every 25 ms regardless, every send carrying its own thread, and
+    the process ran out of threads and lost that market.
+    """
+    import polymarket_bot.exchange as exchange_module
+
+    monkeypatch.setattr(exchange_module, "MAX_REQUESTS_IN_FLIGHT", 6)
+    release = Event()
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = _StuckClient(release)
+
+    def run():
+        return exchange.place_dual(
+            MARKET,
+            price=Decimal("0.01"),
+            size=Decimal("100"),
+            submission_interval_ms=Decimal("5"),
+        )
+
+    outcome = {}
+    worker = Thread(target=lambda: outcome.update(result=run()), daemon=True)
+    worker.start()
+    try:
+        # Far more slots pass than the cap allows, and the loop must not send
+        # on them: 0.4 s at a 5 ms cadence is 80 slots against a cap of 6.
+        time.sleep(0.4)
+        assert exchange.client.calls <= 6, (
+            f"loop sent {exchange.client.calls} requests with none answered"
+        )
+    finally:
+        release.set()
+    worker.join(timeout=10)
+
+    result = outcome["result"]
+    assert result.complete
+    # The slots it gave up are reported, not silently dropped.
+    assert result.held_back > 20, result.held_back
+
+
+def test_the_loop_resumes_once_the_venue_answers() -> None:
+    """Holding back is backpressure, not a stop: replies free the slots again."""
+    release = Event()
+    release.set()
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = _SlowFirstReplyClient(stall=0.0, budget=30)
+
+    result = exchange.place_dual(
+        MARKET,
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        submission_interval_ms=Decimal("5"),
+    )
+
+    assert result.complete
+    assert result.attempts >= 30
+    assert result.held_back == 0, "a venue answering promptly should not be held back"
 
 
 class _SlowFirstReplyClient(FakeClient):

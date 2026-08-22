@@ -23,7 +23,12 @@ from py_clob_client_v2.exceptions import PolyApiException
 
 from .config import BotConfig
 from .models import Market, PlacedOrder, PlacementResult
-from .transport import install_parallel_transport, warm_connections
+from .transport import (
+    FLEET_ACCOUNTS,
+    MAX_CONNECTIONS,
+    install_parallel_transport,
+    warm_connections,
+)
 
 
 CLOB_HOST = "https://clob.polymarket.com"
@@ -49,6 +54,10 @@ DEFAULT_PLACEMENT_INTERVAL_MS = Decimal("20")
 SIGNING_NOT_READY_RETRY_SECONDS = 0.5
 SIGNING_NOT_READY_POLL_SECONDS = 0.1
 DRAIN_TIMEOUT_SECONDS = 3.0
+# The pool holds MAX_CONNECTIONS for the whole process; past its share of them
+# an account's extra requests only queue inside it, which is the latency they
+# were sent to beat, and each one is holding a thread while it waits.
+MAX_REQUESTS_IN_FLIGHT = max(4, MAX_CONNECTIONS // FLEET_ACCOUNTS)
 # A moment this close after a slot still counts as that slot. The monotonic
 # clock reads in the millions of seconds, where a double carries about a
 # nanosecond of noise, so without slack the arithmetic below rounds up at
@@ -375,6 +384,7 @@ class Exchange:
         errors: list[str] = []
         ambiguous_errors: list[str] = []
         attempts = 0
+        held_back = 0
         registered_ts_ms: int | None = None
         next_submission = slot_at_or_after(
             max(started, self._next_placement_submission)
@@ -387,6 +397,21 @@ class Exchange:
             if not stop_submitting and time.time() >= market_end_ts:
                 errors.append("market ended before both orders were accepted")
                 stop_submitting = True
+            if (
+                not stop_submitting
+                and now >= next_submission
+                and len(pending) >= MAX_REQUESTS_IN_FLIGHT
+            ):
+                # The venue is answering slower than this cadence sends. Give
+                # up this slot rather than deepen the queue, and stay on the
+                # timetable so the offset from the other members survives.
+                held_back += 1
+                next_submission = slot_at_or_after(
+                    max(next_submission + interval, time.monotonic())
+                )
+                self._next_placement_submission = next_submission
+                continue
+
             if not stop_submitting and now >= next_submission:
                 submit_specs, payload = self._next_submission(
                     specifications, signed, accepted, attempts
@@ -523,6 +548,7 @@ class Exchange:
                 PlacementResult(
                     ordered,
                     attempts=attempts,
+                    held_back=held_back,
                     expected=len(specifications),
                     registered_ts_ms=registered_ts_ms,
                 ),
@@ -542,6 +568,7 @@ class Exchange:
                 accepted_orders,
                 error,
                 attempts=attempts,
+                held_back=held_back,
                 expected=len(specifications),
                 registered_ts_ms=registered_ts_ms,
             )
