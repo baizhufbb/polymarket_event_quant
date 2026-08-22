@@ -390,6 +390,16 @@ class Exchange:
                 moment, origin=origin, phase=phase, interval=interval
             )
 
+        def slot_after(scheduled: float) -> float:
+            """The slot that follows `scheduled`, never one already gone.
+
+            Both the send and the give-up path move the timetable on, and
+            they have to move it the same way: a member that re-based on
+            "now" would drift off the offsets the fleet depends on. One
+            function so they cannot come apart.
+            """
+            return slot_at_or_after(max(scheduled + interval, time.monotonic()))
+
         pending: dict[Future, tuple[tuple[tuple[str, str], ...], int, int]] = {}
         accepted: dict[str, PlacedOrder] = {}
         errors: list[str] = []
@@ -418,9 +428,7 @@ class Exchange:
                 # up this slot rather than deepen the queue, and stay on the
                 # timetable so the offset from the other members survives.
                 held_back += 1
-                next_submission = slot_at_or_after(
-                    max(next_submission + interval, time.monotonic())
-                )
+                next_submission = slot_after(next_submission)
                 self._next_placement_submission = next_submission
                 continue
 
@@ -437,9 +445,7 @@ class Exchange:
                 # Next slot on this member's own timetable. A stall skips the
                 # slots it ate rather than re-basing the timetable, so the
                 # offset from the other members survives it.
-                next_submission = slot_at_or_after(
-                    max(next_submission + interval, time.monotonic())
-                )
+                next_submission = slot_after(next_submission)
                 self._next_placement_submission = next_submission
                 continue
 
