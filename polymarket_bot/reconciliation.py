@@ -118,47 +118,51 @@ class ReconciliationWorker:
         results = []
         missing = []
         for snapshot in snapshots:
-            try:
-                raw = open_by_id.get(snapshot.order_id)
-                if raw is None:
-                    raw = self.exchange.get_order(snapshot.order_id)
-                if raw is None:
-                    missing.append(snapshot)
-                    continue
-                if not isinstance(raw, dict):
-                    raise ValueError("exchange returned no order payload")
-                results.append(ReconciledOrder(snapshot=snapshot, raw=raw))
-            except Exception as exc:
-                results.append(
-                    ReconciledOrder(
-                        snapshot=snapshot,
-                        raw=None,
-                        error=f"{type(exc).__name__}: {exc}",
-                    )
-                )
+            resolved = self._resolve(
+                snapshot, open_by_id.get(snapshot.order_id), retire_if_missing=False
+            )
+            if resolved is None:
+                missing.append(snapshot)
+            else:
+                results.append(resolved)
         # One pause for the whole round, interruptible by stop(): a worker
         # that is shutting down retires nothing on a single missed read.
         if missing and not self._stop.wait(MISSING_ORDER_RECHECK_SECONDS):
             for snapshot in missing:
                 if self._stop.is_set():
                     break
-                try:
-                    raw = self.exchange.get_order(snapshot.order_id)
-                    if raw is None:
-                        raw = {
-                            "id": snapshot.order_id,
-                            "status": "terminal_unknown",
-                            "size_matched": "0",
-                        }
-                    if not isinstance(raw, dict):
-                        raise ValueError("exchange returned no order payload")
-                    results.append(ReconciledOrder(snapshot=snapshot, raw=raw))
-                except Exception as exc:
-                    results.append(
-                        ReconciledOrder(
-                            snapshot=snapshot,
-                            raw=None,
-                            error=f"{type(exc).__name__}: {exc}",
-                        )
-                    )
+                results.append(self._resolve(snapshot, None, retire_if_missing=True))
         return ReconciliationUpdate(tuple(results))
+
+    def _resolve(
+        self,
+        snapshot: TrackedOrderSnapshot,
+        raw: dict | None,
+        *,
+        retire_if_missing: bool,
+    ) -> ReconciledOrder | None:
+        """Resolve one order from the open-orders payload or a direct read.
+
+        Returns None for an order the venue does not know yet, unless
+        `retire_if_missing`, in which case it is reported as terminal_unknown.
+        """
+        try:
+            if raw is None:
+                raw = self.exchange.get_order(snapshot.order_id)
+            if raw is None:
+                if not retire_if_missing:
+                    return None
+                raw = {
+                    "id": snapshot.order_id,
+                    "status": "terminal_unknown",
+                    "size_matched": "0",
+                }
+            if not isinstance(raw, dict):
+                raise ValueError("exchange returned no order payload")
+            return ReconciledOrder(snapshot=snapshot, raw=raw)
+        except Exception as exc:
+            return ReconciledOrder(
+                snapshot=snapshot,
+                raw=None,
+                error=f"{type(exc).__name__}: {exc}",
+            )
