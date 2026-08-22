@@ -324,7 +324,7 @@ def test_the_loop_stops_outrunning_a_venue_that_has_gone_quiet(monkeypatch) -> N
     """
     import polymarket_bot.exchange as exchange_module
 
-    monkeypatch.setattr(exchange_module, "MAX_REQUESTS_IN_FLIGHT", 6)
+    monkeypatch.setattr(exchange_module, "in_flight_budget", lambda accounts: 6)
     release = Event()
     exchange = Exchange.__new__(Exchange)
     exchange.client = _StuckClient(release)
@@ -368,7 +368,7 @@ def test_held_back_slots_are_reported_when_nothing_registers(monkeypatch) -> Non
     """
     import polymarket_bot.exchange as exchange_module
 
-    monkeypatch.setattr(exchange_module, "MAX_REQUESTS_IN_FLIGHT", 4)
+    monkeypatch.setattr(exchange_module, "in_flight_budget", lambda accounts: 4)
     release = Event()
 
     class _NeverAccepts(_StuckClient):

@@ -175,6 +175,10 @@ class Fleet:
         self.members = members
         self.keep_best = keep_best
         self.order_view = FleetOrderView(members)
+        # Every member's requests come out of one process-wide pool, so each
+        # one may only hold its share of it.
+        for member in members:
+            member.exchange.accounts_sharing_the_pool = len(members)
 
     @property
     def primary(self) -> FleetMember:

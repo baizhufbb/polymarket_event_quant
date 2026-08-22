@@ -409,3 +409,44 @@ def test_place_dual_reports_registration_time():
     assert result.complete
     assert result.registered_ts_ms is not None
     assert before <= result.registered_ts_ms <= int(time.time() * 1000)
+
+def test_every_member_is_told_how_many_share_the_pool():
+    """The cap has to come from the fleet running, not from a constant.
+
+    One pool serves the whole process. Divided by a fixed number instead, a
+    solo account was held to half the pool it owned, and a fleet larger than
+    that number was promised more connections than the pool has.
+    """
+    from polymarket_bot.transport import in_flight_budget
+
+    for size in (1, 2, 3, 5):
+        members = [
+            (f"m{index}", _recording_exchange(0.0), Decimal("103.7"))
+            for index in range(size)
+        ]
+        fleet = Fleet(evenly_phased(members, Decimal("25")))
+        for member in fleet.members:
+            assert member.exchange.accounts_sharing_the_pool == size
+            assert member.exchange.max_requests_in_flight == in_flight_budget(size)
+
+    # A single Exchange with no fleet around it still owns the whole pool.
+    alone = _recording_exchange(0.0)
+    assert alone.accounts_sharing_the_pool == 1
+    assert alone.max_requests_in_flight == in_flight_budget(1)
+
+
+def test_a_single_leg_mode_halves_the_cap():
+    """Outside batch mode each request is carried by two threads, not one.
+
+    Threads, not requests, are what ran out in the field, so the budget has to
+    be counted in the resource that ran out.
+    """
+    from polymarket_bot.transport import in_flight_budget
+
+    batch = _recording_exchange(0.0)
+    batch.entry_submission = "batch"
+    solo = _recording_exchange(0.0)
+    solo.entry_submission = "solo-up"
+
+    assert batch.max_requests_in_flight == in_flight_budget(1)
+    assert solo.max_requests_in_flight == in_flight_budget(1) // 2

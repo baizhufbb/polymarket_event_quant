@@ -24,8 +24,7 @@ from py_clob_client_v2.exceptions import PolyApiException
 from .config import BotConfig
 from .models import Market, PlacedOrder, PlacementResult
 from .transport import (
-    FLEET_ACCOUNTS,
-    MAX_CONNECTIONS,
+    in_flight_budget,
     install_parallel_transport,
     warm_connections,
 )
@@ -54,10 +53,6 @@ DEFAULT_PLACEMENT_INTERVAL_MS = Decimal("20")
 SIGNING_NOT_READY_RETRY_SECONDS = 0.5
 SIGNING_NOT_READY_POLL_SECONDS = 0.1
 DRAIN_TIMEOUT_SECONDS = 3.0
-# The pool holds MAX_CONNECTIONS for the whole process; past its share of them
-# an account's extra requests only queue inside it, which is the latency they
-# were sent to beat, and each one is holding a thread while it waits.
-MAX_REQUESTS_IN_FLIGHT = max(4, MAX_CONNECTIONS // FLEET_ACCOUNTS)
 # A moment this close after a slot still counts as that slot. The monotonic
 # clock reads in the millions of seconds, where a double carries about a
 # nanosecond of noise, so without slack the arithmetic below rounds up at
@@ -189,6 +184,22 @@ class Exchange:
     _next_placement_submission = 0.0
     entry_submission = "batch"
     attempt_trace = None
+    # An account alone in the process owns the whole pool; Fleet narrows this
+    # to a share when it builds its members.
+    accounts_sharing_the_pool = 1
+
+    @property
+    def max_requests_in_flight(self) -> int:
+        """Outstanding requests this account may hold at once.
+
+        Its share of the pool, halved outside batch mode: there each request
+        is carried by a dispatch thread that waits on a second thread per leg,
+        and threads, not requests, are what ran out in the field.
+        """
+        budget = in_flight_budget(self.accounts_sharing_the_pool)
+        if self.entry_submission != "batch":
+            budget = max(2, budget // 2)
+        return budget
 
     def __init__(self, config: BotConfig):
         install_parallel_transport()
@@ -385,6 +396,7 @@ class Exchange:
         ambiguous_errors: list[str] = []
         attempts = 0
         held_back = 0
+        in_flight_cap = self.max_requests_in_flight
         registered_ts_ms: int | None = None
         next_submission = slot_at_or_after(
             max(started, self._next_placement_submission)
@@ -400,7 +412,7 @@ class Exchange:
             if (
                 not stop_submitting
                 and now >= next_submission
-                and len(pending) >= MAX_REQUESTS_IN_FLIGHT
+                and len(pending) >= in_flight_cap
             ):
                 # The venue is answering slower than this cadence sends. Give
                 # up this slot rather than deepen the queue, and stay on the

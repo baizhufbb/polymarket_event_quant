@@ -123,17 +123,34 @@ def test_warm_connections_runs_once_per_window(monkeypatch):
     assert _wait_for(lambda: len(calls) == 10)
 
 
-def test_the_pool_covers_every_account_at_the_open():
-    """The client keeps one pool for the whole process, fleet or not.
+def test_the_pool_covers_the_warm_up_and_every_account_at_the_open():
+    """One pool serves the whole process: the warm-up and every account.
 
-    It was sized for a single account, and holding a true 25 ms cadence on two
-    accounts doubled the demand past it - so requests queued inside the pool
-    at the open, which is the one moment the strategy is entirely about.
+    It was sized for a single account. Two things then grew past it at once -
+    a true 25 ms cadence on two accounts, and a warm-up that now dials while
+    the accounts send - so requests queued inside the pool at the one moment
+    the strategy is entirely about.
     """
-    in_flight = (
-        transport.FLEET_ACCOUNTS
-        * transport.WORST_REPLY_SECONDS
-        / transport.FASTEST_INTERVAL_SECONDS
-    )
-    assert transport.MAX_CONNECTIONS >= in_flight
-    assert transport.WARM_CONNECTIONS <= transport.MAX_CONNECTIONS
+    per_account = transport.WORST_REPLY_SECONDS / transport.FASTEST_INTERVAL_SECONDS
+    needed = transport.WARM_CONNECTIONS + transport.FLEET_ACCOUNTS * per_account
+    assert transport.MAX_CONNECTIONS >= needed
+
+
+def test_each_account_gets_a_share_of_what_the_warm_up_leaves():
+    """A share of the pool, from the fleet actually running - not a constant.
+
+    Dividing by a fixed account count gave a solo account half the pool it
+    owned, and a fleet larger than that count more than the pool has.
+    """
+    usable = transport.MAX_CONNECTIONS - transport.WARM_CONNECTIONS
+    per_account = transport.WORST_REPLY_SECONDS / transport.FASTEST_INTERVAL_SECONDS
+
+    # A solo account owns everything the warm-up does not.
+    assert transport.in_flight_budget(1) == usable
+    # No fleet size can promise more than the pool holds.
+    for accounts in range(1, transport.FLEET_ACCOUNTS + 1):
+        assert transport.in_flight_budget(accounts) * accounts <= usable
+    # And up to the fleet this is sized for, the share still covers an open.
+    assert transport.in_flight_budget(transport.FLEET_ACCOUNTS) >= per_account
+    # Nonsense input cannot produce a nonsense cap.
+    assert transport.in_flight_budget(0) >= 4
