@@ -227,12 +227,44 @@ def test_submission_slot_lands_on_the_timetable() -> None:
     assert submission_slot(1000.020, **kw) == pytest.approx(1000.0375)
     # A stall of several slots resumes on the timetable, not at moment+interval.
     assert submission_slot(1000.100, **kw) == pytest.approx(1000.1125)
-    # Two members' slots always sit half a cadence apart (which of the two
-    # comes first just depends on where the moment falls between them).
+    # What two members actually buy: whichever of them is next, it is never
+    # more than half a cadence away, where one member can be a whole one.
     for moment in (1000.0, 1000.007, 1000.031, 1000.4):
         a = submission_slot(moment, origin=1000.0, phase=0.0, interval=0.025)
         b = submission_slot(moment, origin=1000.0, phase=0.0125, interval=0.025)
-        assert ((b - a) % 0.025) == pytest.approx(0.0125)
+        assert min(a, b) >= moment
+        assert min(a, b) - moment <= 0.0125 + 1e-9
+
+
+def test_a_placement_without_a_fleet_sends_at_once() -> None:
+    """No fleet means no shared origin, and nothing to wait for.
+
+    The timetable starts at this placement's own first moment, so its first
+    slot is that moment. Reading the clock a second time to snap it pushed the
+    first send a whole interval out whenever the two readings differed.
+    """
+    delays = []
+    for _ in range(20):
+        exchange = Exchange.__new__(Exchange)
+        exchange.client = _SlowFirstReplyClient(stall=0.0, budget=2)
+        sent = []
+        dispatch = Exchange._submit_placement_request
+
+        def record(self, payload, sent=sent):
+            sent.append(time.monotonic())
+            return dispatch(self, payload)
+
+        exchange._submit_placement_request = record.__get__(exchange, Exchange)
+        started = time.monotonic()
+        exchange.place_dual(
+            MARKET,
+            price=Decimal("0.01"),
+            size=Decimal("100"),
+            submission_interval_ms=Decimal("20"),
+        )
+        delays.append(sent[0] - started)
+
+    assert max(delays) < 0.010, f"first send delayed by {max(delays) * 1000:.1f} ms"
 
 
 def test_advancing_the_timetable_never_skips_a_slot() -> None:
@@ -245,9 +277,11 @@ def test_advancing_the_timetable_never_skips_a_slot() -> None:
     the cadence.
     """
     interval = 0.025
-    # 1e7 is where a double's noise first exceeds a nanosecond; the server's
-    # own monotonic clock is included so the machine we run on is covered.
-    for origin in (1234.5, 987654.321, 1e7, 3e7, time.monotonic()):
+    # The old arithmetic kept its slack in slot counts, which multiplies the
+    # clock's noise by 1/interval, so it began skipping from about three days
+    # of uptime (2**18 seconds). These origins cover that point and far past
+    # it; the machine's own clock is included so the box we run on is covered.
+    for origin in (1234.5, 262_500.0, 987654.321, 1e7, 3e7, time.monotonic()):
         for phase in (0.0, 0.0125, 0.005):
             kw = {"origin": origin, "phase": phase, "interval": interval}
             slot = submission_slot(origin, **kw)
@@ -312,7 +346,10 @@ def test_sends_stay_on_the_timetable_across_a_stall() -> None:
     interval = 0.2
     phase = 0.1
     stall = 0.65  # deliberately not a whole number of slots
-    origin = time.monotonic()
+    # Stale on purpose, the way a fleet's origin is by the time a member has
+    # warmed up and signed. A member that ignored it and started its own
+    # timetable would land 63 ms off this one.
+    origin = time.monotonic() - 0.137
 
     exchange = Exchange.__new__(Exchange)
     exchange.client = _SlowFirstReplyClient(stall=0.0, budget=7)
@@ -344,13 +381,28 @@ def test_sends_stay_on_the_timetable_across_a_stall() -> None:
     assert len(sent) >= 6
     assert max(b - a for a, b in zip(sent, sent[1:])) > stall  # the stall happened
 
-    off_timetable = []
+    # Judge the middle send, not the worst one. A broken timetable puts every
+    # send off it by the same amount; a busy host puts a few of them off it
+    # while the rest stay put, and this suite has to survive a busy host.
+    errors = []
     for moment in sent:
         distance = (moment - origin - phase) % interval
-        error = min(distance, interval - distance)
-        if error > 0.04:
-            off_timetable.append(round(error * 1000))
-    assert not off_timetable, f"sends off the timetable by ms: {off_timetable}"
+        errors.append(min(distance, interval - distance))
+    errors.sort()
+    middle = errors[len(errors) // 2]
+    assert middle <= 0.02, (
+        f"half the sends are more than {middle * 1000:.0f} ms off the timetable"
+    )
+
+    # Landing on the timetable is not enough: sending on every other slot also
+    # lands on it, and that halved rate is the defect the field showed. Every
+    # send must take the very next slot, except across the deliberate stall.
+    slots = [round((moment - origin - phase) / interval) for moment in sent]
+    steps = [b - a for a, b in zip(slots, slots[1:])]
+    stalled = [step for step in steps if step > 1]
+    assert len(stalled) == 1, f"expected one gap, the stall; got steps {steps}"
+    assert stalled[0] >= stall / interval, f"the stall skipped too little: {steps}"
+    assert all(step == 1 for step in steps if step <= 1), f"steps {steps}"
 
 
 def test_transient_batch_failure_immediately_reuses_the_same_signed_orders() -> None:

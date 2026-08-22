@@ -129,6 +129,89 @@ def test_every_member_shares_one_timetable_with_its_own_offset():
     assert max(starts) - min(starts) < 0.05
 
 
+class SlowSigningClient:
+    """A venue that keeps answering not-ready, so the loop keeps its cadence.
+
+    Signing costs differ per member on purpose: that difference is what used
+    to decide where each member's sends landed.
+    """
+
+    def __init__(self, sign_cost):
+        self.sign_cost = sign_cost
+        self.calls = 0
+
+    def create_order(self, order_args, options):
+        time.sleep(self.sign_cost)
+        return {"token_id": order_args.token_id, "side": order_args.side}
+
+    def post_orders(self, signed, post_only=False):
+        self.calls += 1
+        if self.calls >= 40:
+            return [
+                {"success": True, "orderID": f"{id(self)}-{index}", "status": "live"}
+                for index in range(len(signed))
+            ]
+        return [
+            {
+                "success": False,
+                "orderID": "",
+                "errorMsg": "the market is not yet ready to process new orders",
+            }
+            for _ in signed
+        ]
+
+    def cancel_orders(self, order_ids):
+        return {"canceled": list(order_ids)}
+
+
+def _recording_exchange(sign_cost):
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = SlowSigningClient(sign_cost)
+    exchange.sends = []
+    dispatch = Exchange._submit_placement_request
+
+    def record(self, payload):
+        self.sends.append(time.monotonic())
+        return dispatch(self, payload)
+
+    exchange._submit_placement_request = record.__get__(exchange, Exchange)
+    return exchange
+
+
+def test_two_members_reach_the_wire_half_a_cadence_apart():
+    """The acceptance criterion for the whole timetable change.
+
+    Run 15 and run 16 failed exactly here: both accounts fired within a few
+    milliseconds of each other instead of half a cadence apart, so the second
+    account bought nothing. The signing costs below differ by 127 ms, which
+    is 2 ms in cadence terms - close to what the field actually showed - so a
+    member that started its own timetable would land there instead of at
+    12.5 ms.
+    """
+    interval = 25.0
+    members = [
+        ("primary", _recording_exchange(0.010), Decimal("103.7")),
+        ("m1", _recording_exchange(0.137), Decimal("106.1")),
+    ]
+    fleet = Fleet(evenly_phased(members, Decimal("25")))
+
+    fleet.place(MARKET, price=Decimal("0.01"), submission_interval_ms=Decimal("25"))
+
+    first, second = (member.exchange.sends for member in fleet.members)
+    assert len(first) >= 20 and len(second) >= 20
+
+    base = first[0]
+    differences = []
+    for moment in second:
+        offset = ((moment - base) * 1000.0) % interval
+        differences.append(offset)
+    differences.sort()
+    middle = differences[len(differences) // 2]
+    assert 12.5 - 5.0 <= middle <= 12.5 + 5.0, (
+        f"members reached the wire {middle:.2f} ms apart, wanted 12.5"
+    )
+
+
 def test_keeps_earliest_registration_and_cancels_laggards():
     fleet = Fleet([
         member("primary", registered_ts_ms=1000),

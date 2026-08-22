@@ -74,3 +74,18 @@ def test_warm_connections_runs_once_per_window(monkeypatch):
     monkeypatch.setattr(transport, "WARM_INTERVAL_SECONDS", 0.0)
     transport.warm_connections(count=5)  # next market, window elapsed
     assert len(calls) == 10
+
+def test_the_pool_covers_every_account_at_the_open():
+    """The client keeps one pool for the whole process, fleet or not.
+
+    It was sized for a single account, and holding a true 25 ms cadence on two
+    accounts doubled the demand past it - so requests queued inside the pool
+    at the open, which is the one moment the strategy is entirely about.
+    """
+    in_flight = (
+        transport.FLEET_ACCOUNTS
+        * transport.WORST_REPLY_SECONDS
+        / transport.FASTEST_INTERVAL_SECONDS
+    )
+    assert transport.MAX_CONNECTIONS >= in_flight
+    assert transport.WARM_CONNECTIONS <= transport.MAX_CONNECTIONS

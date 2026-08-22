@@ -29,4 +29,8 @@ def test_main_shortens_the_thread_handoff(monkeypatch) -> None:
         cli.main()
 
     assert recorded == [cli.THREAD_SWITCH_SECONDS]
-    assert cli.THREAD_SWITCH_SECONDS < 0.005
+    # Measured on the server: the 5 ms default missed 188 of 400 slots and
+    # 4 ms missed 169, while 1 ms and below missed none. Anything coarser than
+    # a millisecond puts the defect back, so a millisecond is the bar - not
+    # merely "finer than the default".
+    assert cli.THREAD_SWITCH_SECONDS <= 0.001

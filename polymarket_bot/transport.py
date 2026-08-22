@@ -23,10 +23,18 @@ import httpx
 import py_clob_client_v2.http_helpers.helpers as _helpers
 
 CLOB_TIME_URL = "https://clob.polymarket.com/time"
-# At the open, replies take up to ~1s while submissions leave every 25ms,
-# so about 40 requests can be in flight at once; keep headroom above that.
-MAX_CONNECTIONS = 64
-WARM_CONNECTIONS = 48
+# At the open, replies take up to ~1s while each account submits every 25ms,
+# so an account can have ~40 requests in flight. Every account in the fleet
+# shares this one pool - the client library keeps a single module-level
+# client - so the requirement is accounts x reply_seconds / interval_seconds:
+# Beyond the pool's size the requests queue inside it, which is latency added
+# at exactly the moment the whole strategy is about queueing. Raise
+# FLEET_ACCOUNTS with the fleet: a test holds the pool to this arithmetic.
+FLEET_ACCOUNTS = 2
+WORST_REPLY_SECONDS = 1.0
+FASTEST_INTERVAL_SECONDS = 0.025
+MAX_CONNECTIONS = 128
+WARM_CONNECTIONS = 96
 # A market handed back by signing re-enters place_dual every loop tick, and
 # each entry asks to warm the pool; the pool is process-wide, so one warm-up
 # per window serves every member and every re-entry of that market.

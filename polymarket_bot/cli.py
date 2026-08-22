@@ -203,7 +203,16 @@ def _rotating_logger(name: str, path: Path) -> logging.Logger:
 # members wait together and their offsets vanish. Measured on the server
 # against a fake venue, two members 12.5 ms apart under load: 14.3 ms apart
 # with the default and 121 of 200 slots missed, 12.49 ms apart and no slot
-# missed at 0.2 ms, at the same processor cost.
+# missed at 0.2 ms.
+#
+# The cost was measured where it could bite: signing, the one processor-bound
+# thing here (the native backend is not installed, so signatures are computed
+# in Python and hold the interpreter), with every member signing at once. On
+# the single-core server the whole per-market signing cost is unchanged - five
+# members took 0.0707 s at the default and 0.0702 s at 0.2 ms. On a multi-core
+# machine the same measurement costs several times the processor time, because
+# the interpreter is then handed back and forth between cores; if this ever
+# runs on more than one core, measure again before keeping this value.
 THREAD_SWITCH_SECONDS = 0.0002
 
 

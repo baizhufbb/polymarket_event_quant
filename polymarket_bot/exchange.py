@@ -358,7 +358,12 @@ class Exchange:
         """
         interval = float(submission_interval_ms / Decimal("1000"))
         phase = float(phase_offset_ms / Decimal("1000"))
-        origin = time.monotonic() if grid_origin is None else grid_origin
+        # Without a fleet the timetable starts here, so this same reading is
+        # what the first slot must be snapped from. Reading the clock a second
+        # time below would push the first send a whole interval out whenever
+        # the two readings differ, which they usually do.
+        started = time.monotonic()
+        origin = started if grid_origin is None else grid_origin
 
         def slot_at_or_after(moment: float) -> float:
             return submission_slot(
@@ -372,7 +377,7 @@ class Exchange:
         attempts = 0
         registered_ts_ms: int | None = None
         next_submission = slot_at_or_after(
-            max(time.monotonic(), self._next_placement_submission)
+            max(started, self._next_placement_submission)
         )
         stop_submitting = False
         drain_deadline: float | None = None
