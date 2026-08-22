@@ -36,9 +36,13 @@ def test_fetches_open_orders_once_and_queries_only_missing_orders() -> None:
     assert update.orders[1].raw["status"] == "cancelled"
 
 
-def test_missing_order_becomes_terminal_unknown() -> None:
+def test_missing_order_becomes_terminal_unknown(monkeypatch) -> None:
+    import polymarket_bot.reconciliation as module
+
+    monkeypatch.setattr(module, "MISSING_ORDER_RECHECK_SECONDS", 0.0)
     exchange = FakeExchange()
-    exchange.get_order = lambda order_id: None
+    calls = []
+    exchange.get_order = lambda order_id: calls.append(order_id)
     worker = ReconciliationWorker(exchange)
 
     update = worker._fetch(
@@ -52,6 +56,8 @@ def test_missing_order_becomes_terminal_unknown() -> None:
         "status": "terminal_unknown",
         "size_matched": "0",
     }
+    # retired only after the re-read
+    assert calls == ["missing-order", "missing-order"]
 
 
 def test_fetch_rereads_a_missing_order_before_retiring_it(monkeypatch) -> None:
@@ -78,3 +84,43 @@ def test_fetch_rereads_a_missing_order_before_retiring_it(monkeypatch) -> None:
 
     assert exchange.calls == 2
     assert update.orders[0].raw["status"] == "live"
+
+
+def test_fetch_pauses_once_per_round_and_skips_the_reread_when_stopping(monkeypatch) -> None:
+    import polymarket_bot.reconciliation as module
+
+    monkeypatch.setattr(module, "MISSING_ORDER_RECHECK_SECONDS", 0.0)
+
+    class AbsentExchange:
+        def __init__(self):
+            self.calls = 0
+
+        def open_orders(self):
+            return []
+
+        def get_order(self, order_id):
+            self.calls += 1
+            return None
+
+    exchange = AbsentExchange()
+    worker = module.ReconciliationWorker(exchange)
+    snapshots = tuple(
+        module.TrackedOrderSnapshot(f"order-{i}", "slug", "100") for i in range(3)
+    )
+    waits = []
+    monkeypatch.setattr(
+        worker._stop, "wait", lambda seconds: waits.append(seconds) or worker._stop.is_set()
+    )
+
+    update = worker._fetch(snapshots)
+
+    assert waits == [0.0]
+    assert exchange.calls == 6
+    assert [o.raw["status"] for o in update.orders] == ["terminal_unknown"] * 3
+
+    worker._stop.set()
+    exchange.calls = 0
+    update = worker._fetch(snapshots)
+
+    assert exchange.calls == 3
+    assert update.orders == ()

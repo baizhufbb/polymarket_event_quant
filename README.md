@@ -112,8 +112,11 @@ The live farthest-first path runs in this order:
 4. The exchange signs Up and Down locally and submits both in one authenticated
    post-only batch. Signing itself first asks CLOB for the market's tick size,
    and a market announced moments ago still answers with an engine-readiness
-   rejection (`market not found`); that reply is retried every 100 ms for up to
-   45 s instead of abandoning the market (run 14 lost 17 of 72 markets to it). An explicit engine-readiness rejection (`invalid token id`,
+   rejection (`market not found`); that reply is retried in place for up to
+   3 s on a 100 ms grid, then handed back to the main loop as a retryable
+   placement that re-enters on the next tick, instead of abandoning the
+   market (run 14 lost 17 of 72 markets to it). An explicit engine-readiness
+   rejection (`invalid token id`,
    `market not found`, market not ready, or missing order books) preserves the
    signed pair and immediately retries from the main loop without another
    parameter request or an added delay. Ambiguous network failures are

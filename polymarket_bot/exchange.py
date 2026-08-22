@@ -39,13 +39,20 @@ DEFAULT_PLACEMENT_INTERVAL_MS = Decimal("20")
 # The client asks the venue for the market's tick size before signing, and a
 # freshly announced market answers 404 "market not found" for its first tens
 # of milliseconds. Run 14 lost 17 of 72 markets to that reply being fatal.
-SIGNING_NOT_READY_RETRY_SECONDS = 45.0
+# Signing runs on the service loop (or a fleet member thread the loop joins),
+# so the in-place wait is short; past it the market is handed back to the
+# loop as a retryable placement, the same path the submission loop uses.
+SIGNING_NOT_READY_RETRY_SECONDS = 3.0
 SIGNING_NOT_READY_POLL_SECONDS = 0.1
 DRAIN_TIMEOUT_SECONDS = 3.0
 DUPLICATE_ORDER_PATTERN = re.compile(
     r"\border\s+(0x[0-9a-f]{64})\s+is invalid\.\s*duplicated\.",
     re.IGNORECASE,
 )
+
+
+class _SigningNotReady(RuntimeError):
+    """The venue still rejects the market's tick-size lookup; retry later."""
 
 
 class AmbiguousPlacementError(RuntimeError):
@@ -116,6 +123,15 @@ def _order_engine_not_ready_error(error: PolyApiException) -> str | None:
     if (error.status_code, message) not in ORDER_ENGINE_NOT_READY_ERRORS:
         return None
     return message
+
+
+def _signing_retryable(error: PolyApiException) -> bool:
+    """The tick-size lookup's own not-ready reply, or a transient transport failure."""
+    payload = error.error_msg
+    message = str(payload.get("error") or "").lower() if isinstance(payload, dict) else ""
+    if error.status_code == 404 and message == "market not found":
+        return True
+    return _transient_submission_error(error)
 
 
 def classify_response(response: object) -> str:
@@ -208,10 +224,13 @@ class Exchange:
         submissions = self._dual_submission_cache()
         signed = submissions.get(submission_key)
         if signed is None:
-            signed = self._sign_entries(
-                specifications, options, price=price, size=size,
-                market_end_ts=market.end_ts,
-            )
+            try:
+                signed = self._sign_entries(
+                    specifications, options, price=price, size=size,
+                    market_end_ts=market.end_ts,
+                )
+            except _SigningNotReady as exc:
+                return PlacementResult((), str(exc), retryable=True, attempts=0)
             submissions[submission_key] = signed
 
         if submission_interval_ms is not None:
@@ -704,11 +723,16 @@ class Exchange:
         """Sign the entry legs, waiting out the venue's post-announcement gap.
 
         Signing is local, but the client first asks the venue for the tick
-        size, and a market announced moments ago still answers with an
-        engine-not-ready rejection. Retry those replies until the deadline;
-        anything else is raised as before.
+        size, and a market announced moments ago still answers 404 "market
+        not found"; transient transport failures (429, 5xx, no status) are
+        treated the same way, as the submission loop already does. Polls run
+        on an absolute grid so the wait does not disturb fleet phase offsets.
+        Past the short in-place budget the market is handed back as
+        _SigningNotReady; anything else is raised as before.
         """
-        deadline = time.monotonic() + SIGNING_NOT_READY_RETRY_SECONDS
+        start = time.monotonic()
+        next_poll = start
+        deadline = start + SIGNING_NOT_READY_RETRY_SECONDS
         while True:
             try:
                 signed = []
@@ -727,11 +751,16 @@ class Exchange:
                     )
                 return signed
             except PolyApiException as exc:
-                if _order_engine_not_ready_error(exc) is None:
+                if not _signing_retryable(exc):
                     raise
-                if time.monotonic() >= deadline or time.time() >= market_end_ts:
+                if time.time() >= market_end_ts:
                     raise
-                time.sleep(SIGNING_NOT_READY_POLL_SECONDS)
+                next_poll += SIGNING_NOT_READY_POLL_SECONDS
+                if next_poll >= deadline:
+                    raise _SigningNotReady(
+                        f"signing not ready after {SIGNING_NOT_READY_RETRY_SECONDS:g}s: {exc}"
+                    )
+                time.sleep(max(0.0, next_poll - time.monotonic()))
 
     @staticmethod
     def _dual_submission_key(

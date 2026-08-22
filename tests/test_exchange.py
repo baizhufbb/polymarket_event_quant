@@ -841,18 +841,51 @@ def test_signing_waits_out_the_post_announcement_404(monkeypatch) -> None:
     assert exchange.client.create_calls == 5
 
 
-def test_signing_gives_up_after_the_retry_deadline(monkeypatch) -> None:
+def test_signing_hands_the_market_back_after_the_in_place_budget(monkeypatch) -> None:
+    import polymarket_bot.exchange as exchange_module
+
+    monkeypatch.setattr(exchange_module, "SIGNING_NOT_READY_POLL_SECONDS", 0.05)
+    monkeypatch.setattr(exchange_module, "SIGNING_NOT_READY_RETRY_SECONDS", 0.3)
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = _NotReadyThenSigningClient(failures=100)
+
+    result = exchange.place_dual(
+        MARKET,
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        submission_interval_ms=Decimal("20"),
+    )
+
+    assert result.orders == ()
+    assert result.retryable
+    assert "signing not ready" in result.error
+    # absolute 50 ms grid inside a 300 ms budget: a handful of polls, not one, not hundreds
+    assert 4 <= exchange.client.create_calls <= 8
+
+
+class _RejectingClient(_NotReadyThenSigningClient):
+    def __init__(self, status, message):
+        super().__init__(failures=0)
+        self.status = status
+        self.message = message
+
+    def create_order(self, order_args, options):
+        self.create_calls += 1
+        raise PolyApiException(httpx.Response(self.status, json={"error": self.message}))
+
+
+def test_signing_does_not_retry_other_rejections(monkeypatch) -> None:
     import polymarket_bot.exchange as exchange_module
 
     monkeypatch.setattr(exchange_module, "SIGNING_NOT_READY_POLL_SECONDS", 0.0)
-    monkeypatch.setattr(exchange_module, "SIGNING_NOT_READY_RETRY_SECONDS", 0.0)
-    exchange = Exchange.__new__(Exchange)
-    exchange.client = _NotReadyThenSigningClient(failures=10)
-
-    with pytest.raises(PolyApiException):
-        exchange.place_dual(
-            MARKET,
-            price=Decimal("0.01"),
-            size=Decimal("100"),
-            submission_interval_ms=Decimal("20"),
-        )
+    for status, message in ((400, "invalid price"), (400, "invalid token id")):
+        exchange = Exchange.__new__(Exchange)
+        exchange.client = _RejectingClient(status, message)
+        with pytest.raises(PolyApiException):
+            exchange.place_dual(
+                MARKET,
+                price=Decimal("0.01"),
+                size=Decimal("100"),
+                submission_interval_ms=Decimal("20"),
+            )
+        assert exchange.client.create_calls == 1

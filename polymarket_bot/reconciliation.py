@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from queue import Empty, Queue, SimpleQueue
 from threading import Event, Thread
@@ -117,20 +116,15 @@ class ReconciliationWorker:
             )
 
         results = []
+        missing = []
         for snapshot in snapshots:
             try:
                 raw = open_by_id.get(snapshot.order_id)
                 if raw is None:
                     raw = self.exchange.get_order(snapshot.order_id)
                 if raw is None:
-                    time.sleep(MISSING_ORDER_RECHECK_SECONDS)
-                    raw = self.exchange.get_order(snapshot.order_id)
-                if raw is None:
-                    raw = {
-                        "id": snapshot.order_id,
-                        "status": "terminal_unknown",
-                        "size_matched": "0",
-                    }
+                    missing.append(snapshot)
+                    continue
                 if not isinstance(raw, dict):
                     raise ValueError("exchange returned no order payload")
                 results.append(ReconciledOrder(snapshot=snapshot, raw=raw))
@@ -142,4 +136,27 @@ class ReconciliationWorker:
                         error=f"{type(exc).__name__}: {exc}",
                     )
                 )
+        # One pause for the whole round, interruptible by stop(): a worker
+        # that is shutting down retires nothing on a single missed read.
+        if missing and not self._stop.wait(MISSING_ORDER_RECHECK_SECONDS):
+            for snapshot in missing:
+                try:
+                    raw = self.exchange.get_order(snapshot.order_id)
+                    if raw is None:
+                        raw = {
+                            "id": snapshot.order_id,
+                            "status": "terminal_unknown",
+                            "size_matched": "0",
+                        }
+                    if not isinstance(raw, dict):
+                        raise ValueError("exchange returned no order payload")
+                    results.append(ReconciledOrder(snapshot=snapshot, raw=raw))
+                except Exception as exc:
+                    results.append(
+                        ReconciledOrder(
+                            snapshot=snapshot,
+                            raw=None,
+                            error=f"{type(exc).__name__}: {exc}",
+                        )
+                    )
         return ReconciliationUpdate(tuple(results))
