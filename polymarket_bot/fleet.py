@@ -193,17 +193,21 @@ class Fleet:
         submission_interval_ms: Decimal,
     ) -> FleetPlacement:
         outcomes: dict[str, MemberPlacement] = {}
+        # One timetable for the whole fleet: every member sends only at
+        # origin + its own offset + k * interval. Sleeping each member's
+        # offset before it started instead put the offset ahead of the
+        # warm-up and signing, whose cost is far larger and varies per call.
+        grid_origin = time.monotonic()
 
         def run(member: FleetMember) -> None:
-            delay = float(member.phase_offset_ms) / 1000.0
-            if delay > 0:
-                time.sleep(delay)
             try:
                 result = member.exchange.place_dual(
                     market,
                     price=price,
                     size=member.size,
                     submission_interval_ms=submission_interval_ms,
+                    grid_origin=grid_origin,
+                    phase_offset_ms=member.phase_offset_ms,
                 )
             except Exception as exc:  # noqa: BLE001 - reported per member
                 outcomes[member.name] = MemberPlacement(

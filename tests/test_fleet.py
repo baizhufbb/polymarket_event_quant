@@ -46,9 +46,22 @@ class FakeExchange:
         self.started_at = None
         self.sizes = []
         self.canceled = []
+        self.grid_origin = None
+        self.phase_offset_ms = None
 
-    def place_dual(self, market, *, price, size, submission_interval_ms):
+    def place_dual(
+        self,
+        market,
+        *,
+        price,
+        size,
+        submission_interval_ms,
+        grid_origin=None,
+        phase_offset_ms=Decimal(0),
+    ):
         self.started_at = time.monotonic()
+        self.grid_origin = grid_origin
+        self.phase_offset_ms = phase_offset_ms
         self.sizes.append(size)
         time.sleep(0.02)
         if self.raise_exc:
@@ -93,13 +106,27 @@ def place(fleet):
     return fleet.place(MARKET, price=Decimal("0.01"), submission_interval_ms=Decimal("25"))
 
 
-def test_members_start_on_their_phase_offsets():
+def test_every_member_shares_one_timetable_with_its_own_offset():
+    """The offsets ride on a common origin instead of a per-member sleep.
+
+    Sleeping the offset before a member started put it ahead of that
+    member's warm-up and signing, which cost hundreds of milliseconds and
+    varied per call, so the intended offsets never reached the wire.
+    """
     fleet = Fleet([member("primary", 0), member("m1", 60), member("m2", 120)])
     place(fleet)
+
+    origins = {m.exchange.grid_origin for m in fleet.members}
+    assert len(origins) == 1
+    assert origins != {None}
+    assert [m.exchange.phase_offset_ms for m in fleet.members] == [
+        Decimal(0),
+        Decimal(60),
+        Decimal(120),
+    ]
+    # No member is held back before it starts preparing.
     starts = [m.exchange.started_at for m in fleet.members]
-    assert starts[0] < starts[1] < starts[2]
-    assert 0.03 < starts[1] - starts[0] < 0.12
-    assert 0.03 < starts[2] - starts[1] < 0.12
+    assert max(starts) - min(starts) < 0.05
 
 
 def test_keeps_earliest_registration_and_cancels_laggards():

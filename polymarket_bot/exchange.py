@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, wait
@@ -48,6 +49,25 @@ DEFAULT_PLACEMENT_INTERVAL_MS = Decimal("20")
 SIGNING_NOT_READY_RETRY_SECONDS = 0.5
 SIGNING_NOT_READY_POLL_SECONDS = 0.1
 DRAIN_TIMEOUT_SECONDS = 3.0
+# Slack when snapping a moment onto the submission timetable, so a slot that
+# is "now" to the nanosecond is taken rather than skipped.
+_GRID_EPSILON = 1e-9
+
+
+def submission_slot(
+    moment: float, *, origin: float, phase: float, interval: float
+) -> float:
+    """First slot at or after `moment` on the timetable origin+phase+k*interval.
+
+    Fleet members share `origin` and differ only in `phase`, so their sends
+    stay that far apart however long each member's warm-up and signing took,
+    and a member that misses slots resumes on its own next one rather than
+    starting a fresh timetable at "now".
+    """
+    steps = math.ceil((moment - origin - phase) / interval - _GRID_EPSILON)
+    return origin + phase + steps * interval
+
+
 DUPLICATE_ORDER_PATTERN = re.compile(
     r"\border\s+(0x[0-9a-f]{64})\s+is invalid\.\s*duplicated\.",
     re.IGNORECASE,
@@ -216,6 +236,8 @@ class Exchange:
         price: Decimal,
         size: Decimal,
         submission_interval_ms: Decimal | None = None,
+        grid_origin: float | None = None,
+        phase_offset_ms: Decimal = Decimal(0),
     ) -> PlacementResult:
         warm_connections()
         options = PartialCreateOrderOptions(
@@ -245,6 +267,8 @@ class Exchange:
                 price=price,
                 size=size,
                 submission_interval_ms=submission_interval_ms,
+                grid_origin=grid_origin,
+                phase_offset_ms=phase_offset_ms,
                 market_end_ts=market.end_ts,
                 submission_key=submission_key,
                 submissions=submissions,
@@ -317,18 +341,35 @@ class Exchange:
         market_end_ts: int,
         submission_key: tuple,
         submissions: dict[tuple, list[PostOrdersV2Args]],
+        grid_origin: float | None = None,
+        phase_offset_ms: Decimal = Decimal(0),
     ) -> PlacementResult:
-        """Submit one immutable signed pair at a fixed interval until accepted."""
+        """Submit one immutable signed pair on this member's timetable.
+
+        Every send falls on `grid_origin + phase_offset + k * interval`. The
+        fleet hands all members one origin, so their offsets hold whatever
+        each member's warm-up and signing cost, and a member that misses a
+        slot resumes on its own next slot instead of re-basing on "now" -
+        which is what collapsed the offsets when both members stalled on the
+        same core.
+        """
         interval = float(submission_interval_ms / Decimal("1000"))
+        phase = float(phase_offset_ms / Decimal("1000"))
+        origin = time.monotonic() if grid_origin is None else grid_origin
+
+        def slot_at_or_after(moment: float) -> float:
+            return submission_slot(
+                moment, origin=origin, phase=phase, interval=interval
+            )
+
         pending: dict[Future, tuple[tuple[tuple[str, str], ...], int, int]] = {}
         accepted: dict[str, PlacedOrder] = {}
         errors: list[str] = []
         ambiguous_errors: list[str] = []
         attempts = 0
         registered_ts_ms: int | None = None
-        next_submission = max(
-            time.monotonic(),
-            self._next_placement_submission,
+        next_submission = slot_at_or_after(
+            max(time.monotonic(), self._next_placement_submission)
         )
         stop_submitting = False
         drain_deadline: float | None = None
@@ -348,12 +389,12 @@ class Exchange:
                     attempts + 1,
                 )
                 attempts += 1
-                # Stay on an absolute grid so the phase relative to other
-                # fleet members holds; after a whole-tick stall resume on a
-                # fresh grid instead of bursting to catch up.
-                next_submission += interval
-                if next_submission <= now:
-                    next_submission = now + interval
+                # Next slot on this member's own timetable. A stall skips the
+                # slots it ate rather than re-basing the timetable, so the
+                # offset from the other members survives it.
+                next_submission = slot_at_or_after(
+                    max(next_submission + interval, time.monotonic())
+                )
                 self._next_placement_submission = next_submission
                 continue
 

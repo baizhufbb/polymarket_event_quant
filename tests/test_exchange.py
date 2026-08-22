@@ -5,7 +5,11 @@ from threading import Event, Lock
 import httpx
 import pytest
 
-from polymarket_bot.exchange import AmbiguousPlacementError, Exchange
+from polymarket_bot.exchange import (
+    AmbiguousPlacementError,
+    Exchange,
+    submission_slot,
+)
 from polymarket_bot.models import Market, PlacementResult
 from py_clob_client_v2 import Side
 from py_clob_client_v2.exceptions import PolyApiException
@@ -212,6 +216,116 @@ def test_staggered_submission_has_no_fixed_in_flight_limit() -> None:
 
     assert result.complete
     assert exchange.client.max_active >= 17
+
+
+def test_submission_slot_lands_on_the_timetable() -> None:
+    kw = {"origin": 1000.0, "phase": 0.0125, "interval": 0.025}
+
+    # A moment already on a slot takes that slot rather than skipping it.
+    assert submission_slot(1000.0125, **kw) == pytest.approx(1000.0125)
+    # Between slots, the next one.
+    assert submission_slot(1000.020, **kw) == pytest.approx(1000.0375)
+    # A stall of several slots resumes on the timetable, not at moment+interval.
+    assert submission_slot(1000.100, **kw) == pytest.approx(1000.1125)
+    # Two members' slots always sit half a cadence apart (which of the two
+    # comes first just depends on where the moment falls between them).
+    for moment in (1000.0, 1000.007, 1000.031, 1000.4):
+        a = submission_slot(moment, origin=1000.0, phase=0.0, interval=0.025)
+        b = submission_slot(moment, origin=1000.0, phase=0.0125, interval=0.025)
+        assert ((b - a) % 0.025) == pytest.approx(0.0125)
+
+
+class _SlowFirstReplyClient(FakeClient):
+    """Answers not-ready until its budget is reached, then accepts."""
+
+    def __init__(self, stall: float, budget: int):
+        super().__init__([])
+        self.stall = stall
+        self.budget = budget
+        self.lock = Lock()
+        self.calls = 0
+        self.sent_at: list[float] = []
+
+    def post_orders(self, signed, post_only=False):
+        with self.lock:
+            self.calls += 1
+            call_number = self.calls
+            self.sent_at.append(time.monotonic())
+        if call_number == 1:
+            time.sleep(self.stall)
+        if call_number >= self.budget:
+            up_id = "0x" + "1" * 64
+            down_id = "0x" + "2" * 64
+            return [
+                {"success": True, "orderID": up_id, "status": "live"},
+                {"success": True, "orderID": down_id, "status": "live"},
+            ]
+        return [
+            {
+                "success": False,
+                "orderID": "",
+                "errorMsg": "the market is not yet ready to process new orders",
+            },
+            {
+                "success": False,
+                "orderID": "",
+                "errorMsg": "the market is not yet ready to process new orders",
+            },
+        ]
+
+
+def test_sends_stay_on_the_timetable_across_a_stall() -> None:
+    """A stalled loop resumes on its own slots instead of a fresh timetable.
+
+    Re-basing on "now" is what collapsed the fleet's offsets: on one core both
+    members stall together, so both re-based to the same instant and ended up
+    sending together instead of a half cadence apart. The cadence here is
+    coarse on purpose - the point is where the sends land relative to the
+    timetable, and a coarse cadence keeps the operating system's wake-up
+    rounding (about 15 ms on Windows) well inside the tolerance.
+    """
+    interval = 0.2
+    phase = 0.1
+    stall = 0.65  # deliberately not a whole number of slots
+    origin = time.monotonic()
+
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = _SlowFirstReplyClient(stall=0.0, budget=7)
+
+    # Hold the loop thread itself, the way contention for a single core held
+    # it in the field. A slow reply would not do it: replies are carried by
+    # their own threads and never block the loop.
+    sent: list[float] = []
+    dispatch = Exchange._submit_placement_request
+
+    def stall_the_loop(self, payload):
+        sent.append(time.monotonic())
+        if len(sent) == 3:
+            time.sleep(stall)
+        return dispatch(self, payload)
+
+    exchange._submit_placement_request = stall_the_loop.__get__(exchange, Exchange)
+
+    result = exchange.place_dual(
+        MARKET,
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        submission_interval_ms=Decimal("200"),
+        grid_origin=origin,
+        phase_offset_ms=Decimal("100"),
+    )
+
+    assert result.complete
+    assert len(sent) >= 6
+    assert max(b - a for a, b in zip(sent, sent[1:])) > stall  # the stall happened
+
+    off_timetable = []
+    for moment in sent:
+        distance = (moment - origin - phase) % interval
+        error = min(distance, interval - distance)
+        if error > 0.04:
+            off_timetable.append(round(error * 1000))
+    assert not off_timetable, f"sends off the timetable by ms: {off_timetable}"
 
 
 def test_transient_batch_failure_immediately_reuses_the_same_signed_orders() -> None:
