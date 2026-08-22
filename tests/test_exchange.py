@@ -796,3 +796,63 @@ def test_solo_mode_places_only_the_chosen_leg_and_never_cancels_it():
     assert result.orders[0].outcome == "up"
     assert set(client.single_posts) == {"up-token"}
     assert client.canceled == []
+
+class _NotReadyThenSigningClient:
+    """create_order answers 404 market-not-found a few times, then signs."""
+
+    def __init__(self, failures):
+        self.failures = failures
+        self.create_calls = 0
+        self.canceled = []
+
+    def create_order(self, order_args, options):
+        self.create_calls += 1
+        if self.create_calls <= self.failures:
+            response = httpx.Response(404, json={"error": "market not found"})
+            raise PolyApiException(response)
+        return {"token_id": order_args.token_id, "side": order_args.side}
+
+    def post_orders(self, signed, post_only=False):
+        return [
+            {"success": True, "orderID": f"{item.order['token_id']}-id", "status": "live"}
+            for item in signed
+        ]
+
+    def cancel_orders(self, order_ids):
+        self.canceled.extend(order_ids)
+
+
+def test_signing_waits_out_the_post_announcement_404(monkeypatch) -> None:
+    import polymarket_bot.exchange as exchange_module
+
+    monkeypatch.setattr(exchange_module, "SIGNING_NOT_READY_POLL_SECONDS", 0.0)
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = _NotReadyThenSigningClient(failures=3)
+
+    result = exchange.place_dual(
+        MARKET,
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        submission_interval_ms=Decimal("20"),
+    )
+
+    assert result.complete
+    # three rejected attempts, then one attempt that signs both legs
+    assert exchange.client.create_calls == 5
+
+
+def test_signing_gives_up_after_the_retry_deadline(monkeypatch) -> None:
+    import polymarket_bot.exchange as exchange_module
+
+    monkeypatch.setattr(exchange_module, "SIGNING_NOT_READY_POLL_SECONDS", 0.0)
+    monkeypatch.setattr(exchange_module, "SIGNING_NOT_READY_RETRY_SECONDS", 0.0)
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = _NotReadyThenSigningClient(failures=10)
+
+    with pytest.raises(PolyApiException):
+        exchange.place_dual(
+            MARKET,
+            price=Decimal("0.01"),
+            size=Decimal("100"),
+            submission_interval_ms=Decimal("20"),
+        )

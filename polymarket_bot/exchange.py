@@ -36,6 +36,11 @@ ORDER_ENGINE_NOT_READY_ERRORS = {
     (404, "market not found"),
 }
 DEFAULT_PLACEMENT_INTERVAL_MS = Decimal("20")
+# The client asks the venue for the market's tick size before signing, and a
+# freshly announced market answers 404 "market not found" for its first tens
+# of milliseconds. Run 14 lost 17 of 72 markets to that reply being fatal.
+SIGNING_NOT_READY_RETRY_SECONDS = 45.0
+SIGNING_NOT_READY_POLL_SECONDS = 0.1
 DRAIN_TIMEOUT_SECONDS = 3.0
 DUPLICATE_ORDER_PATTERN = re.compile(
     r"\border\s+(0x[0-9a-f]{64})\s+is invalid\.\s*duplicated\.",
@@ -203,18 +208,10 @@ class Exchange:
         submissions = self._dual_submission_cache()
         signed = submissions.get(submission_key)
         if signed is None:
-            signed = []
-            for _, token_id in specifications:
-                order = self.client.create_order(
-                    OrderArgs(
-                        token_id=token_id,
-                        price=float(price),
-                        size=float(size),
-                        side=Side.BUY,
-                    ),
-                    options,
-                )
-                signed.append(PostOrdersV2Args(order=order, orderType=OrderType.GTC))
+            signed = self._sign_entries(
+                specifications, options, price=price, size=size,
+                market_end_ts=market.end_ts,
+            )
             submissions[submission_key] = signed
 
         if submission_interval_ms is not None:
@@ -694,6 +691,47 @@ class Exchange:
             payload = exc.error_msg if isinstance(exc.error_msg, dict) else {}
             message = str(payload.get("error") or exc.error_msg or exc)
             return {"errorMsg": message, "success": False}
+
+    def _sign_entries(
+        self,
+        specifications,
+        options: PartialCreateOrderOptions,
+        *,
+        price: Decimal,
+        size: Decimal,
+        market_end_ts: int,
+    ) -> list[PostOrdersV2Args]:
+        """Sign the entry legs, waiting out the venue's post-announcement gap.
+
+        Signing is local, but the client first asks the venue for the tick
+        size, and a market announced moments ago still answers with an
+        engine-not-ready rejection. Retry those replies until the deadline;
+        anything else is raised as before.
+        """
+        deadline = time.monotonic() + SIGNING_NOT_READY_RETRY_SECONDS
+        while True:
+            try:
+                signed = []
+                for _, token_id in specifications:
+                    order = self.client.create_order(
+                        OrderArgs(
+                            token_id=token_id,
+                            price=float(price),
+                            size=float(size),
+                            side=Side.BUY,
+                        ),
+                        options,
+                    )
+                    signed.append(
+                        PostOrdersV2Args(order=order, orderType=OrderType.GTC)
+                    )
+                return signed
+            except PolyApiException as exc:
+                if _order_engine_not_ready_error(exc) is None:
+                    raise
+                if time.monotonic() >= deadline or time.time() >= market_end_ts:
+                    raise
+                time.sleep(SIGNING_NOT_READY_POLL_SECONDS)
 
     @staticmethod
     def _dual_submission_key(

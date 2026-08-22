@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from queue import Empty, Queue, SimpleQueue
 from threading import Event, Thread
 
 from .exchange import Exchange
+
+# The venue's read index lags a fresh acceptance by up to about a second;
+# one re-read separates that from an order that is genuinely gone.
+MISSING_ORDER_RECHECK_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -116,6 +121,9 @@ class ReconciliationWorker:
             try:
                 raw = open_by_id.get(snapshot.order_id)
                 if raw is None:
+                    raw = self.exchange.get_order(snapshot.order_id)
+                if raw is None:
+                    time.sleep(MISSING_ORDER_RECHECK_SECONDS)
                     raw = self.exchange.get_order(snapshot.order_id)
                 if raw is None:
                     raw = {

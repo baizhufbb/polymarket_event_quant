@@ -38,6 +38,10 @@ TERMINAL_ORDER_STATES = {
     "failed",
     "terminal_unknown",
 }
+# An order the venue cannot show within this long after we recorded it is
+# far more likely still being indexed than gone; terminal states are sticky,
+# so a premature terminal_unknown would make the bot lose a live order.
+FRESH_ORDER_GRACE_SECONDS = 60
 
 
 @dataclass
@@ -343,6 +347,13 @@ class BotService:
                 previous_status = str(row["status"])
                 previous_matched = Decimal(row["matched_size"])
                 status, matched = normalize_order(result.raw)
+                if (
+                    status == "terminal_unknown"
+                    and previous_status not in TERMINAL_ORDER_STATES
+                    and int(time.time()) - int(row["created_ts"])
+                    < FRESH_ORDER_GRACE_SECONDS
+                ):
+                    continue
                 matched = max(matched, previous_matched)
                 if status == "matched" and matched >= Decimal(result.snapshot.size):
                     status = "filled"
@@ -993,6 +1004,13 @@ class BotService:
                     status, matched = normalize_order(raw)
                     if status == "matched" and matched >= Decimal(row["size"]):
                         status = "filled"
+                    if (
+                        status == "terminal_unknown"
+                        and str(row["status"]) not in TERMINAL_ORDER_STATES
+                        and int(time.time()) - int(row["created_ts"])
+                        < FRESH_ORDER_GRACE_SECONDS
+                    ):
+                        continue
                     self.database.update_order(
                         row["order_id"], status=status, matched_size=matched, raw=raw
                     )

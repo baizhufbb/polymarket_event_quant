@@ -1196,3 +1196,82 @@ def test_shutdown_cancel_records_only_confirmed_results(tmp_path) -> None:
             "stale-order": "terminal_unknown",
             "retryable-order": "cancel_requested",
         }
+
+
+def _terminal_unknown_update(order_id: str) -> ReconciliationUpdate:
+    return ReconciliationUpdate(
+        (
+            ReconciledOrder(
+                snapshot=TrackedOrderSnapshot(order_id, MARKET.slug, "100"),
+                raw={"id": order_id, "status": "terminal_unknown", "size_matched": "0"},
+            ),
+        )
+    )
+
+
+def _service_with_update(database, run_id, update) -> BotService:
+    service = BotService.__new__(BotService)
+    service.database = database
+    service.reconciliation_worker = FakeReconciliationWorker([update])
+    service.run_id = run_id
+    service.last_discovery = 1.0
+    service.exchange = object()
+    service.market_activation_worker = None
+    service.plan = TradePlan(Decimal("0.01"), (), Decimal("1"))
+    return service
+
+
+def test_reconcile_keeps_a_fresh_order_the_venue_cannot_show_yet(tmp_path) -> None:
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        run_id = database.start_run("live")
+        database.add_market(run_id, MARKET)
+        database.add_order(
+            run_id,
+            MARKET.slug,
+            PlacedOrder(
+                order_id="fresh-order",
+                outcome="up",
+                token_id=MARKET.up_token_id,
+                price=Decimal("0.01"),
+                size=Decimal("100"),
+                status="live",
+                raw={},
+            ),
+        )
+        service = _service_with_update(
+            database, run_id, _terminal_unknown_update("fresh-order")
+        )
+
+        service._drain_reconciliation_updates()
+
+        assert database.order("fresh-order")["status"] == "live"
+
+
+def test_reconcile_still_retires_an_old_order_the_venue_cannot_show(tmp_path) -> None:
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        run_id = database.start_run("live")
+        database.add_market(run_id, MARKET)
+        database.add_order(
+            run_id,
+            MARKET.slug,
+            PlacedOrder(
+                order_id="old-order",
+                outcome="up",
+                token_id=MARKET.up_token_id,
+                price=Decimal("0.01"),
+                size=Decimal("100"),
+                status="live",
+                raw={},
+            ),
+        )
+        database.connection.execute(
+            "UPDATE orders SET created_ts=created_ts-3600 WHERE order_id='old-order'"
+        )
+        database.connection.commit()
+        service = _service_with_update(
+            database, run_id, _terminal_unknown_update("old-order")
+        )
+
+        service._drain_reconciliation_updates()
+
+        assert database.order("old-order")["status"] == "terminal_unknown"
