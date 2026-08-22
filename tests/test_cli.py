@@ -1,3 +1,4 @@
+import argparse
 import sys
 
 import pytest
@@ -34,3 +35,16 @@ def test_main_shortens_the_thread_handoff(monkeypatch) -> None:
     # a millisecond puts the defect back, so a millisecond is the bar - not
     # merely "finer than the default".
     assert cli.THREAD_SWITCH_SECONDS <= 0.001
+
+
+def test_a_cadence_finer_than_the_loop_can_hold_is_rejected() -> None:
+    """Below about a millisecond the loop can never catch its own timetable.
+
+    It then never reaches the wait that collects replies, and every send is
+    carrying a thread, so the process spins until it runs out of them.
+    """
+    for good in ("1", "20", "25", "250"):
+        assert cli._placement_interval_ms_arg(good) > 0
+    for bad in ("0", "0.5", "0.001", "0.0001"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            cli._placement_interval_ms_arg(bad)

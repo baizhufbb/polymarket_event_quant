@@ -43,10 +43,20 @@ def _take_profit_arg(value: str) -> ExitTarget:
     )
 
 
+# A cadence finer than this leaves the submission loop permanently behind its
+# own timetable: it never reaches the wait that collects replies, and since
+# every send carries a thread it spins without bound. It is also three orders
+# of magnitude past what the venue will accept from one account, so nothing
+# real lives below it.
+MINIMUM_PLACEMENT_INTERVAL_MS = Decimal("1")
+
+
 def _placement_interval_ms_arg(value: str) -> Decimal:
     parsed = _decimal_arg(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("placement interval must be above 0 ms")
+    if parsed < MINIMUM_PLACEMENT_INTERVAL_MS:
+        raise argparse.ArgumentTypeError(
+            f"placement interval must be at least {MINIMUM_PLACEMENT_INTERVAL_MS:g} ms"
+        )
     return parsed
 
 
