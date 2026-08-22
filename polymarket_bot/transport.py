@@ -17,7 +17,8 @@ every call, so replacing the module attribute redirects all traffic.
 from __future__ import annotations
 
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor
+from threading import Thread
 
 import httpx
 import py_clob_client_v2.http_helpers.helpers as _helpers
@@ -80,6 +81,13 @@ def warm_connections(count: int = WARM_CONNECTIONS) -> None:
     TLS handshake per new connection exactly when it hurts. Firing `count`
     cheap concurrent requests forces the dials now. Failures are ignored;
     a connection that failed to warm is simply dialed on demand later.
+
+    The dialling runs on its own thread and this returns at once. Waiting for
+    it held the caller until the slowest dial answered - leaving an executor's
+    `with` block waits for every task, whatever timeout sits above it - and
+    the caller is the member thread that is about to start sending. In the
+    live run the member that paid for the warm-up started sending 0.6 s,
+    3.5 s and once 38 s behind the other one.
     """
     global _last_warm_monotonic
     if not _installed:
@@ -92,6 +100,10 @@ def warm_connections(count: int = WARM_CONNECTIONS) -> None:
         return
     _last_warm_monotonic = now
     client = _helpers._http_client
-    with ThreadPoolExecutor(max_workers=count) as pool:
-        futures = [pool.submit(client.get, CLOB_TIME_URL) for _ in range(count)]
-        wait(futures, timeout=10)
+
+    def dial() -> None:
+        with ThreadPoolExecutor(max_workers=count) as pool:
+            for _ in range(count):
+                pool.submit(client.get, CLOB_TIME_URL)
+
+    Thread(target=dial, name="warm-connections", daemon=True).start()
