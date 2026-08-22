@@ -578,6 +578,7 @@ class Exchange:
                 error,
                 retryable=not stop_submitting,
                 attempts=attempts,
+                held_back=held_back,
                 expected=len(specifications),
             )
         return self._finalize_dual_result(

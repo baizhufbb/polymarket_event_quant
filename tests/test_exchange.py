@@ -353,8 +353,55 @@ def test_the_loop_stops_outrunning_a_venue_that_has_gone_quiet(monkeypatch) -> N
 
     result = outcome["result"]
     assert result.complete
-    # The slots it gave up are reported, not silently dropped.
-    assert result.held_back > 20, result.held_back
+    # The slots it gave up are reported, not silently dropped. The count itself
+    # depends on how promptly a busy machine runs the loop; without the cap it
+    # is zero, which is what this separates it from.
+    assert result.held_back >= 5, result.held_back
+
+
+def test_held_back_slots_are_reported_when_nothing_registers(monkeypatch) -> None:
+    """Every way out of the loop has to carry the count.
+
+    A placement that registered nothing is the one worth reading afterwards,
+    and it was the one path that dropped it - so the record would have read
+    "we sent on every slot" for exactly the placements that did not.
+    """
+    import polymarket_bot.exchange as exchange_module
+
+    monkeypatch.setattr(exchange_module, "MAX_REQUESTS_IN_FLIGHT", 4)
+    release = Event()
+
+    class _NeverAccepts(_StuckClient):
+        def post_orders(self, signed, post_only=False):
+            with self.lock:
+                self.calls += 1
+            self.release.wait(timeout=5)
+            return [
+                {
+                    "success": False,
+                    "orderID": "",
+                    "errorMsg": "the market is not yet ready to process new orders",
+                }
+                for _ in signed
+            ]
+
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = _NeverAccepts(release)
+    # +2 rather than +1: int() truncates, so +1 can leave only milliseconds.
+    ending = MARKET.__class__(**{**MARKET.__dict__, "end_ts": int(time.time()) + 2})
+
+    try:
+        result = exchange.place_dual(
+            ending,
+            price=Decimal("0.01"),
+            size=Decimal("100"),
+            submission_interval_ms=Decimal("5"),
+        )
+    finally:
+        release.set()
+
+    assert not result.orders
+    assert result.held_back > 0, "a placement that registered nothing reported no held slots"
 
 
 def test_the_loop_resumes_once_the_venue_answers() -> None:
