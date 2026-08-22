@@ -1275,3 +1275,74 @@ def test_reconcile_still_retires_an_old_order_the_venue_cannot_show(tmp_path) ->
         service._drain_reconciliation_updates()
 
         assert database.order("old-order")["status"] == "terminal_unknown"
+
+
+class _LaggingIndexExchange(FakeExchange):
+    """The venue's read index has not caught up: no listing, no lookup."""
+
+    def open_orders(self):
+        self.open_calls += 1
+        return []
+
+    def get_order(self, order_id):
+        self.order_calls.append(order_id)
+        return None
+
+
+def _live_order(order_id: str) -> PlacedOrder:
+    return PlacedOrder(
+        order_id=order_id,
+        outcome="up",
+        token_id=MARKET.up_token_id,
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        status="live",
+        raw={},
+    )
+
+
+def test_inline_reconcile_keeps_a_fresh_order_but_retires_an_old_one(tmp_path) -> None:
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        run_id = database.start_run("live")
+        database.add_market(run_id, MARKET)
+        database.add_order(run_id, MARKET.slug, _live_order("fresh-order"))
+        database.add_order(run_id, MARKET.slug, _live_order("old-order"))
+        database.connection.execute(
+            "UPDATE orders SET created_ts=created_ts-3600 WHERE order_id='old-order'"
+        )
+        database.connection.commit()
+        service = BotService.__new__(BotService)
+        service.database = database
+        service.exchange = _LaggingIndexExchange()
+        service.reconciliation_worker = None
+        service.run_id = run_id
+        service.logger = logging.getLogger("test")
+        service.plan = TradePlan(Decimal("0.01"), (), Decimal("1"))
+        service.market_activation_worker = None
+        service.cancel_before_end_seconds = 0
+
+        service._reconcile()
+
+        assert database.order("fresh-order")["status"] == "live"
+        assert database.order("old-order")["status"] == "terminal_unknown"
+
+
+def test_shutdown_cancel_reaches_a_fresh_order_the_venue_could_not_show(tmp_path) -> None:
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        run_id = database.start_run("live")
+        database.add_market(run_id, MARKET)
+        database.add_order(run_id, MARKET.slug, _live_order("fresh-order"))
+        exchange = FakeExchange()
+        service = _service_with_update(
+            database, run_id, _terminal_unknown_update("fresh-order")
+        )
+        service.exchange = exchange
+        service.logger = logging.getLogger("test")
+
+        service._drain_reconciliation_updates()
+        assert database.order("fresh-order")["status"] == "live"
+
+        service._cancel_tracked_orders()
+
+        assert exchange.cancel_calls == [["fresh-order"]]
+        assert database.order("fresh-order")["status"] == "cancelled"
