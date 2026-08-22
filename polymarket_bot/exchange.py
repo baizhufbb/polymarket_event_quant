@@ -49,9 +49,12 @@ DEFAULT_PLACEMENT_INTERVAL_MS = Decimal("20")
 SIGNING_NOT_READY_RETRY_SECONDS = 0.5
 SIGNING_NOT_READY_POLL_SECONDS = 0.1
 DRAIN_TIMEOUT_SECONDS = 3.0
-# Slack when snapping a moment onto the submission timetable, so a slot that
-# is "now" to the nanosecond is taken rather than skipped.
-_GRID_EPSILON = 1e-9
+# A moment this close after a slot still counts as that slot. The monotonic
+# clock reads in the millions of seconds, where a double carries about a
+# nanosecond of noise, so without slack the arithmetic below rounds up at
+# random and silently skips every other slot. One microsecond swamps that
+# noise and is far below anything the scheduler can resolve.
+_GRID_TOLERANCE_SECONDS = 1e-6
 
 
 def submission_slot(
@@ -64,8 +67,8 @@ def submission_slot(
     and a member that misses slots resumes on its own next one rather than
     starting a fresh timetable at "now".
     """
-    steps = math.ceil((moment - origin - phase) / interval - _GRID_EPSILON)
-    return origin + phase + steps * interval
+    offset = moment - origin - phase - _GRID_TOLERANCE_SECONDS
+    return origin + phase + math.ceil(offset / interval) * interval
 
 
 DUPLICATE_ORDER_PATTERN = re.compile(

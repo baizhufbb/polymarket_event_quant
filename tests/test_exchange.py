@@ -235,6 +235,31 @@ def test_submission_slot_lands_on_the_timetable() -> None:
         assert ((b - a) % 0.025) == pytest.approx(0.0125)
 
 
+def test_advancing_the_timetable_never_skips_a_slot() -> None:
+    """Walking the timetable forward moves exactly one slot at a time.
+
+    The clock reads in the millions of seconds, where a double carries about
+    a nanosecond of noise. Without slack in the arithmetic, `slot + interval`
+    lands a hair past the next slot about half the time and the loop skips
+    it - which halves the send rate, and the send rate is the whole point of
+    the cadence.
+    """
+    interval = 0.025
+    # 1e7 is where a double's noise first exceeds a nanosecond; the server's
+    # own monotonic clock is included so the machine we run on is covered.
+    for origin in (1234.5, 987654.321, 1e7, 3e7, time.monotonic()):
+        for phase in (0.0, 0.0125, 0.005):
+            kw = {"origin": origin, "phase": phase, "interval": interval}
+            slot = submission_slot(origin, **kw)
+            for _ in range(400):
+                nxt = submission_slot(slot + interval, **kw)
+                step = (nxt - slot) / interval
+                assert step == pytest.approx(1.0, abs=1e-6), (
+                    f"origin={origin} phase={phase} jumped {step} slots"
+                )
+                slot = nxt
+
+
 class _SlowFirstReplyClient(FakeClient):
     """Answers not-ready until its budget is reached, then accepts."""
 
