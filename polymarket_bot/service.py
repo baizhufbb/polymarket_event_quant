@@ -328,6 +328,8 @@ class BotService:
                     details={"error": update.batch_error},
                 )
                 continue
+            if update.open_rows:
+                order_changed = self._adopt_unknown_open_orders(update.open_rows) > 0 or order_changed
             for result in update.orders:
                 row = self.database.order(result.snapshot.order_id)
                 if row is None:
@@ -381,6 +383,86 @@ class BotService:
             self.last_discovery = 0.0
         if order_changed and self.exchange and not self.plan.buy_only:
             self._place_missing_exits(int(time.time()))
+
+    def _adopt_unknown_open_orders(self, open_rows: tuple[dict, ...]) -> int:
+        """Write down orders the venue is holding that we have no row for.
+
+        A placement that raises leaves nothing behind - the legs it had
+        collected and the requests still on the wire are both discarded - so
+        an order that did register becomes invisible: not cancelled at the
+        market end, not counted against spend, not in the record. Rather than
+        catching the right exception, this compares the venue's list against
+        ours, which catches every way an order can go missing including ones
+        nobody has thought of.
+
+        Three things must hold before a row is written, so nothing that is not
+        ours is adopted: we have no row for that order id, the market belongs
+        to this run, and the asset is one of that market's two tokens.
+        """
+        adopted = 0
+        for raw in open_rows:
+            try:
+                order_id = raw.get("id") or raw.get("orderID") or raw.get("orderId")
+                if not order_id:
+                    continue
+                order_id = str(order_id)
+                if self.database.order(order_id) is not None:
+                    continue
+                market_row = self.database.market_for_condition(
+                    str(raw.get("market") or ""), self.run_id
+                )
+                if market_row is None:
+                    continue
+                asset_id = str(raw.get("asset_id") or "")
+                if asset_id == str(market_row["up_token_id"]):
+                    outcome = "up"
+                elif asset_id == str(market_row["down_token_id"]):
+                    outcome = "down"
+                else:
+                    continue
+                status, matched = normalize_order(raw)
+                order = PlacedOrder(
+                    order_id=order_id,
+                    outcome=outcome,
+                    token_id=asset_id,
+                    price=Decimal(str(raw.get("price") or self.plan.buy_price)),
+                    size=Decimal(str(raw.get("original_size") or raw.get("size") or "0")),
+                    status=status,
+                    raw=raw,
+                    side="sell" if str(raw.get("side", "")).upper() == "SELL" else "buy",
+                    account=str(raw.get("account") or ""),
+                )
+                self.database.add_order(self.run_id, str(market_row["slug"]), order)
+                adopted += 1
+                self.database.event(
+                    self.run_id,
+                    "WARNING",
+                    "order_adopted",
+                    slug=str(market_row["slug"]),
+                    details={
+                        "order_id": order_id,
+                        "account": order.account,
+                        "outcome": outcome,
+                        "status": status,
+                        "matched": str(matched),
+                    },
+                )
+                self.logger.warning(
+                    "adopted an order the venue was holding that we had no record of: "
+                    "%s on %s (%s)",
+                    order_id,
+                    market_row["slug"],
+                    order.account or "primary",
+                )
+            except Exception as exc:  # noqa: BLE001 - one bad row must not end the run
+                self.logger.warning("could not adopt an open order: %s", exc)
+                self.database.event(
+                    self.run_id,
+                    "WARNING",
+                    "order_adopt_failed",
+                    details={"error": f"{type(exc).__name__}: {exc}"},
+                )
+        return adopted
 
     def _drain_user_stream_updates(self) -> bool:
         if not self.user_stream_worker:

@@ -29,6 +29,8 @@ class ReconciledOrder:
 class ReconciliationUpdate:
     orders: tuple[ReconciledOrder, ...]
     batch_error: str | None = None
+    # Everything the venue says is open, including orders we have no row for.
+    open_rows: tuple[dict, ...] = ()
 
 
 class ReconciliationWorker:
@@ -101,11 +103,16 @@ class ReconciliationWorker:
     def _fetch(
         self, snapshots: tuple[TrackedOrderSnapshot, ...]
     ) -> ReconciliationUpdate:
-        if not snapshots:
-            return ReconciliationUpdate(())
+        # No early return on an empty batch: the round where we are tracking
+        # nothing is exactly the round where an order may be resting that we
+        # have no row for, and reading the venue is the only way to find it.
+        open_rows: list[dict] = []
         try:
             open_by_id = {}
             for raw in self.exchange.open_orders():
+                if not isinstance(raw, dict):
+                    continue
+                open_rows.append(raw)
                 order_id = raw.get("id") or raw.get("orderID") or raw.get("orderId")
                 if order_id:
                     open_by_id[str(order_id)] = raw
@@ -132,7 +139,7 @@ class ReconciliationWorker:
                 if self._stop.is_set():
                     break
                 results.append(self._resolve(snapshot, None, retire_if_missing=True))
-        return ReconciliationUpdate(tuple(results))
+        return ReconciliationUpdate(tuple(results), open_rows=tuple(open_rows))
 
     def _resolve(
         self,

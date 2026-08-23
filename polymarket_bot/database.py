@@ -327,6 +327,15 @@ class BotDatabase:
         )
         self.connection.commit()
 
+    def market_for_condition(
+        self, condition_id: str, run_id: int
+    ) -> sqlite3.Row | None:
+        """The market this run prepared for that condition, if it is ours."""
+        return self.connection.execute(
+            "SELECT * FROM markets WHERE condition_id = ? AND run_id = ?",
+            (condition_id, run_id),
+        ).fetchone()
+
     def order(self, order_id: str) -> sqlite3.Row | None:
         return self.connection.execute(
             "SELECT * FROM orders WHERE order_id=?", (order_id,)

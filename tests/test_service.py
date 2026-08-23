@@ -1346,3 +1346,131 @@ def test_shutdown_cancel_reaches_a_fresh_order_the_venue_could_not_show(tmp_path
 
         assert exchange.cancel_calls == [["fresh-order"]]
         assert database.order("fresh-order")["status"] == "cancelled"
+
+def _service_with_a_market(tmp_path):
+    """A live-ish service with one market of this run recorded."""
+    from polymarket_bot.service import BotService
+
+    database = BotDatabase(tmp_path / "bot.sqlite")
+    service = BotService.__new__(BotService)
+    service.database = database
+    service.run_id = database.start_run("live", plan={})
+    service.logger = logging.getLogger("adopt-test")
+    service.plan = SimpleNamespace(buy_price=Decimal("0.01"), buy_only=True)
+    database.add_market(service.run_id, MARKET)
+    return service, database
+
+
+def test_an_order_the_venue_holds_and_we_do_not_know_is_written_down(tmp_path) -> None:
+    """The whole point: an order nobody recorded becomes visible and cancellable.
+
+    Last night four markets had a fleet member raise, and the orders were only
+    pulled because a shell script sweeps the venue when the session ends.
+    """
+    service, database = _service_with_a_market(tmp_path)
+
+    adopted = service._adopt_unknown_open_orders((
+        {
+            "id": "0xorphan",
+            "market": MARKET.condition_id,
+            "asset_id": MARKET.up_token_id,
+            "price": "0.01",
+            "original_size": "103.7",
+            "size_matched": "0",
+            "status": "LIVE",
+            "side": "BUY",
+            "account": "m1",
+        },
+    ))
+
+    assert adopted == 1
+    row = database.order("0xorphan")
+    assert row is not None
+    assert row["slug"] == MARKET.slug
+    assert row["account"] == "m1"
+    assert row["outcome"] == "up"
+    assert row["status"] == "live"
+    # and it is now something the deadline sweep can see
+    assert any(r["order_id"] == "0xorphan" for r in database.tracked_open_orders())
+
+
+def test_orders_that_are_not_ours_are_left_alone(tmp_path) -> None:
+    """Three guards, each of which must independently refuse."""
+    service, database = _service_with_a_market(tmp_path)
+    known = PlacedOrder(
+        order_id="0xknown", outcome="up", token_id=MARKET.up_token_id,
+        price=Decimal("0.01"), size=Decimal("103.7"), status="live", raw={},
+    )
+    database.add_order(service.run_id, MARKET.slug, known)
+
+    adopted = service._adopt_unknown_open_orders((
+        # already ours - not adopted twice
+        {"id": "0xknown", "market": MARKET.condition_id, "asset_id": MARKET.up_token_id,
+         "status": "LIVE", "side": "BUY"},
+        # a market this run never prepared
+        {"id": "0xother-market", "market": "0xsomebody-elses", "asset_id": MARKET.up_token_id,
+         "status": "LIVE", "side": "BUY"},
+        # our market, but not one of its two tokens
+        {"id": "0xother-token", "market": MARKET.condition_id, "asset_id": "some-other-token",
+         "status": "LIVE", "side": "BUY"},
+        # no id at all
+        {"market": MARKET.condition_id, "asset_id": MARKET.up_token_id, "status": "LIVE"},
+    ))
+
+    assert adopted == 0
+    assert database.order("0xother-market") is None
+    assert database.order("0xother-token") is None
+
+
+def test_one_unreadable_row_does_not_end_a_six_hour_run(tmp_path) -> None:
+    """An unattended run must survive a field it cannot parse."""
+    service, database = _service_with_a_market(tmp_path)
+
+    adopted = service._adopt_unknown_open_orders((
+        {"id": "0xbad", "market": MARKET.condition_id, "asset_id": MARKET.up_token_id,
+         "price": "not a number", "status": "LIVE", "side": "BUY"},
+        {"id": "0xgood", "market": MARKET.condition_id, "asset_id": MARKET.down_token_id,
+         "price": "0.01", "original_size": "106.1", "status": "LIVE", "side": "BUY"},
+    ))
+
+    assert adopted == 1
+    assert database.order("0xbad") is None
+    assert database.order("0xgood") is not None
+
+def test_the_drain_adopts_what_the_venue_holds_and_we_do_not_know(tmp_path) -> None:
+    """The whole path, not just the method: a round that carries an unknown
+    open order must leave a row behind, because that row is what the deadline
+    sweep, the spend accounting and the reconciler all work from."""
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        run_id = database.start_run("live")
+        database.add_market(run_id, MARKET)
+        update = ReconciliationUpdate(
+            (),
+            open_rows=(
+                {
+                    "id": "0xnobody-recorded-this",
+                    "market": MARKET.condition_id,
+                    "asset_id": MARKET.down_token_id,
+                    "price": "0.01",
+                    "original_size": "106.1",
+                    "size_matched": "0",
+                    "status": "LIVE",
+                    "side": "BUY",
+                    "account": "m1",
+                },
+            ),
+        )
+        service = _service_with_update(database, run_id, update)
+        service.logger = logging.getLogger("drain-adopt-test")
+
+        service._drain_reconciliation_updates()
+
+        row = database.order("0xnobody-recorded-this")
+        assert row is not None, "the drain did not adopt the venue's order"
+        assert row["slug"] == MARKET.slug
+        assert row["account"] == "m1"
+        assert row["outcome"] == "down"
+        assert any(
+            r["order_id"] == "0xnobody-recorded-this"
+            for r in database.tracked_open_orders()
+        )

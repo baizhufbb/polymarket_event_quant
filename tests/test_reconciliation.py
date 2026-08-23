@@ -157,3 +157,53 @@ def test_fetch_stops_retiring_when_stop_lands_during_the_reread(monkeypatch) -> 
     assert exchange.calls == 4
     assert [o.snapshot.order_id for o in update.orders] == ["order-0"]
     assert update.orders[0].raw["status"] == "terminal_unknown"
+
+def test_fetch_returns_what_the_venue_holds_even_with_nothing_tracked() -> None:
+    """The round where we track nothing is the round an orphan shows up in.
+
+    A placement that raises writes no row, so the reconciler has nothing to
+    look up - and the early return meant it never asked the venue either, so
+    an order resting behind a lost reply stayed invisible for the whole run.
+    """
+    import polymarket_bot.reconciliation as module
+
+    class VenueWithAnOrder:
+        def __init__(self):
+            self.asked = 0
+
+        def open_orders(self):
+            self.asked += 1
+            return [{"id": "orphan", "market": "0xcondition", "asset_id": "up-token"}]
+
+        def get_order(self, order_id):
+            raise AssertionError("nothing is tracked, so nothing should be looked up")
+
+    exchange = VenueWithAnOrder()
+    worker = module.ReconciliationWorker(exchange)
+
+    update = worker._fetch(())
+
+    assert exchange.asked == 1
+    assert update.orders == ()
+    assert [row["id"] for row in update.open_rows] == ["orphan"]
+
+
+def test_fetch_carries_the_venue_rows_alongside_the_tracked_ones() -> None:
+    """Both lists come back, so the service can compare them."""
+    import polymarket_bot.reconciliation as module
+
+    class Venue:
+        def open_orders(self):
+            return [
+                {"id": "known", "status": "LIVE", "size_matched": "0"},
+                {"id": "orphan", "status": "LIVE", "size_matched": "0"},
+            ]
+
+        def get_order(self, order_id):
+            raise AssertionError("both rows are in the open list")
+
+    worker = module.ReconciliationWorker(Venue())
+    update = worker._fetch((module.TrackedOrderSnapshot("known", "slug", "100"),))
+
+    assert [o.snapshot.order_id for o in update.orders] == ["known"]
+    assert sorted(row["id"] for row in update.open_rows) == ["known", "orphan"]
