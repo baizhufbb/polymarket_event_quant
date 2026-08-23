@@ -395,9 +395,18 @@ class BotService:
         ours, which catches every way an order can go missing including ones
         nobody has thought of.
 
-        Three things must hold before a row is written, so nothing that is not
-        ours is adopted: we have no row for that order id, the market belongs
-        to this run, and the asset is one of that market's two tokens.
+        Four things must hold before a row is written. Three place the order on
+        one of this run's markets - we have no row for that id, the market
+        belongs to this run, the asset is one of its two tokens - and the
+        fourth says the order looks like one of ours: the price is the one we
+        sign at. Without it a hand-placed order on the same market would be
+        adopted, charged against the reserve cap and cancelled as if we had
+        placed it.
+
+        An order the venue already reports as terminal is left alone. Writing
+        it down would put it in a state no sweep looks at again, and the row
+        cannot carry how much of it actually matched, so its unmatched shares
+        would rest at the venue with nothing left to pull them.
         """
         adopted = 0
         for raw in open_rows:
@@ -420,16 +429,27 @@ class BotService:
                     outcome = "down"
                 else:
                     continue
+                price = Decimal(str(raw.get("price") or self.plan.buy_price))
+                if price != self.plan.buy_price:
+                    self._report_foreign_order(order_id, market_row, raw, price)
+                    continue
                 status, matched = normalize_order(raw)
+                if status in TERMINAL_ORDER_STATES:
+                    self._report_foreign_order(
+                        order_id, market_row, raw, price, reason=f"already {status}"
+                    )
+                    continue
+                side = "sell" if str(raw.get("side", "")).upper() == "SELL" else "buy"
                 order = PlacedOrder(
                     order_id=order_id,
                     outcome=outcome,
                     token_id=asset_id,
-                    price=Decimal(str(raw.get("price") or self.plan.buy_price)),
+                    price=price,
                     size=Decimal(str(raw.get("original_size") or raw.get("size") or "0")),
                     status=status,
                     raw=raw,
-                    side="sell" if str(raw.get("side", "")).upper() == "SELL" else "buy",
+                    side=side,
+                    role="exit" if side == "sell" else "entry",
                     account=str(raw.get("account") or ""),
                 )
                 self.database.add_order(self.run_id, str(market_row["slug"]), order)
@@ -463,6 +483,40 @@ class BotService:
                     details={"error": f"{type(exc).__name__}: {exc}"},
                 )
         return adopted
+
+    def _report_foreign_order(
+        self,
+        order_id: str,
+        market_row,
+        raw: dict,
+        price,
+        reason: str = "not the price we sign at",
+    ) -> None:
+        """Say so when the venue holds something on our market we will not adopt.
+
+        Silence here would read as "there was nothing there", which is the one
+        reading that matters: an order resting on our market that this program
+        will neither track nor cancel is worth a human looking at.
+        """
+        self.database.event(
+            self.run_id,
+            "WARNING",
+            "open_order_not_adopted",
+            slug=str(market_row["slug"]),
+            details={
+                "order_id": order_id,
+                "reason": reason,
+                "price": str(price),
+                "size": str(raw.get("original_size") or raw.get("size") or ""),
+                "side": str(raw.get("side") or ""),
+            },
+        )
+        self.logger.warning(
+            "the venue holds an order on %s we will not adopt (%s): %s",
+            market_row["slug"],
+            reason,
+            order_id,
+        )
 
     def _drain_user_stream_updates(self) -> bool:
         if not self.user_stream_worker:

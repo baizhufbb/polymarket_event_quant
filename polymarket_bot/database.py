@@ -40,6 +40,8 @@ CREATE TABLE IF NOT EXISTS markets (
     updated_ts INTEGER NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_markets_condition ON markets(condition_id);
+
 CREATE TABLE IF NOT EXISTS orders (
     order_id TEXT PRIMARY KEY,
     run_id INTEGER NOT NULL REFERENCES runs(id),

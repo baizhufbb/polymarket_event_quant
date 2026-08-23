@@ -832,6 +832,26 @@ class Exchange:
             return
         for token_id in (market.up_token_id, market.down_token_id):
             cache.setdefault(token_id, str(market.tick_size))
+        self._warm_protocol_version()
+
+    def _warm_protocol_version(self) -> None:
+        """Ask for the protocol version now rather than inside a signature.
+
+        The client caches it, but lazily, and nothing warmed it - so the first
+        signature of every account still went to the venue and the round trip
+        landed in front of the first market of a session. The reply is
+        forgiving (any failure answers the current version), so this only ever
+        moves the call, never adds one.
+        """
+        if getattr(self.client, "_ClobClient__cached_version", None) is not None:
+            return
+        getter = getattr(self.client, "get_version", None)
+        if not callable(getter):
+            return
+        try:
+            self.client._ClobClient__cached_version = getter()
+        except Exception:  # noqa: BLE001 - the library answers a default anyway
+            pass
 
     def _sign_entries(
         self,

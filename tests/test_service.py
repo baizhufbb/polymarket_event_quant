@@ -1474,3 +1474,79 @@ def test_the_drain_adopts_what_the_venue_holds_and_we_do_not_know(tmp_path) -> N
             r["order_id"] == "0xnobody-recorded-this"
             for r in database.tracked_open_orders()
         )
+
+def test_an_order_at_a_price_we_never_sign_is_not_adopted(tmp_path) -> None:
+    """Being on our market is not the same as being ours.
+
+    The guards established the market; nothing established the order. A
+    hand-placed order on the same market was adopted, charged against the
+    reserve cap, and cancelled by the deadline sweep as if we had placed it.
+    """
+    service, database = _service_with_a_market(tmp_path)
+
+    adopted = service._adopt_unknown_open_orders((
+        {"id": "0xsomeone-elses", "market": MARKET.condition_id,
+         "asset_id": MARKET.up_token_id, "price": "0.42", "original_size": "500",
+         "status": "LIVE", "side": "BUY"},
+    ))
+
+    assert adopted == 0
+    assert database.order("0xsomeone-elses") is None
+    # and it is not silent - an order resting on our market that we will
+    # neither track nor cancel is worth a human seeing
+    assert any(
+        row["event_type"] == "open_order_not_adopted"
+        for row in database.connection.execute("SELECT event_type FROM events")
+    )
+
+
+def test_an_order_the_venue_calls_finished_is_not_adopted(tmp_path) -> None:
+    """A terminal row is one no sweep ever looks at again.
+
+    Writing it down would also book it as fully matched whatever the venue
+    said, so any unmatched shares would rest there with nothing left to pull
+    them.
+    """
+    service, database = _service_with_a_market(tmp_path)
+
+    adopted = service._adopt_unknown_open_orders((
+        {"id": "0xhalf-done", "market": MARKET.condition_id,
+         "asset_id": MARKET.up_token_id, "price": "0.01",
+         "original_size": "103.7", "size_matched": "61.4",
+         "status": "MATCHED", "side": "BUY"},
+    ))
+
+    assert adopted == 0
+    assert database.order("0xhalf-done") is None
+
+
+def test_an_adopted_row_carries_the_size_and_side_the_venue_reported(tmp_path) -> None:
+    """The row is what every sweep works from, so it has to match the venue."""
+    service, database = _service_with_a_market(tmp_path)
+
+    service._adopt_unknown_open_orders((
+        {"id": "0xours", "market": MARKET.condition_id,
+         "asset_id": MARKET.down_token_id, "price": "0.01",
+         "original_size": "106.1", "size_matched": "0",
+         "status": "LIVE", "side": "BUY", "account": "m1"},
+    ))
+
+    row = database.order("0xours")
+    assert row is not None
+    assert Decimal(row["size"]) == Decimal("106.1")
+    assert row["side"] == "buy"
+    assert row["role"] == "entry"
+    assert row["outcome"] == "down"
+
+    # A sell is an exit, and filing it as an entry would let the exit ladder
+    # count it as inventory to sell again.
+    service._adopt_unknown_open_orders((
+        {"id": "0xa-sell", "market": MARKET.condition_id,
+         "asset_id": MARKET.up_token_id, "price": "0.01",
+         "original_size": "50", "size_matched": "0",
+         "status": "LIVE", "side": "SELL"},
+    ))
+    sold = database.order("0xa-sell")
+    assert sold is not None
+    assert sold["side"] == "sell"
+    assert sold["role"] == "exit"

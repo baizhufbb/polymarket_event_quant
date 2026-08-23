@@ -1367,3 +1367,30 @@ def test_signing_does_not_retry_other_rejections(monkeypatch) -> None:
                 submission_interval_ms=Decimal("20"),
             )
         assert exchange.client.create_calls == 1
+
+def test_signing_does_not_go_to_the_venue_for_the_protocol_version() -> None:
+    """The one network call left in signing, and it was still there.
+
+    The client caches the protocol version but only after asking for it once,
+    and nothing warmed it - so the first signature of every account still made
+    a round trip, in front of the first market of a session.
+    """
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = _TickAskingClient()
+    exchange.client.version_lookups = 0
+
+    def get_version():
+        exchange.client.version_lookups += 1
+        return 2
+
+    exchange.client.get_version = get_version
+    exchange.client._ClobClient__cached_version = None
+
+    exchange._prime_tick_size(MARKET)
+
+    assert exchange.client.version_lookups == 1, "the version was never warmed"
+    assert exchange.client._ClobClient__cached_version == 2
+
+    # and warming is idempotent: a second market does not ask again
+    exchange._prime_tick_size(MARKET)
+    assert exchange.client.version_lookups == 1
