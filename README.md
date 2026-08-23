@@ -110,13 +110,16 @@ The live farthest-first path runs in this order:
    The service validates eligibility, database uniqueness, tick size, minimum
    size, and optional limits.
 4. The exchange signs Up and Down locally and submits both in one authenticated
-   post-only batch. Signing itself first asks CLOB for the market's tick size,
-   and a market announced moments ago still answers with an engine-readiness
-   rejection (`market not found`); that reply is retried in place for up to
-   0.5 s (wall clock, paced at 100 ms, kept below the cancel-before-end
-   margin), then handed back to the main loop as a retryable
-   placement that re-enters on the next tick, instead of abandoning the
-   market (run 14 lost 17 of 72 markets to it). An explicit engine-readiness
+   post-only batch. Signing touches the network for nothing: the client is
+   handed the market's tick size and the protocol version before it can ask
+   for them, because the tick size it would fetch is only used to check ours
+   is not finer and discovery already read it off the listing. That lookup
+   used to answer `market not found` for a market announced moments ago, which
+   cost run 14 seventeen of seventy-two markets and later cost a fleet member
+   a whole market on its own. Should signing raise a readiness rejection
+   anyway, it is retried in place for up to 0.5 s and then handed back to the
+   main loop as a retryable placement that re-enters on the next tick, instead
+   of abandoning the market. An explicit engine-readiness
    rejection (`invalid token id`,
    `market not found`, market not ready, or missing order books) preserves the
    signed pair and immediately retries from the main loop without another
