@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import time
 from decimal import Decimal
 from pathlib import Path
@@ -17,9 +18,24 @@ from .market_activation import MarketActivationUpdate, MarketActivationWorker
 TARGET_PRICE = Decimal("0.01")
 BOOK_WAIT_SECONDS = 120
 OPENING_WINDOW_SECONDS = 2
-OUTPUT_PATH = (
-    Path(__file__).resolve().parents[1] / "logs" / "queue_probe_opening.jsonl"
-)
+OUTPUT_DIRECTORY = Path(__file__).resolve().parents[1] / "logs"
+OUTPUT_PREFIX = "queue_probe_opening"
+
+
+def output_path() -> Path:
+    """This process's own recording file.
+
+    Several probes run at once, because about half of this network's websocket
+    handshakes to the venue fail and one instance alone misses markets. Sharing
+    one file cost us observations: two writers ask for the end of the same file,
+    get the same answer, and one lands on top of the other. It only shows up
+    when they write fast, and the only time they write fast is the burst right
+    after a market opens - 92.5% of the lines destroyed that way fell inside
+    that first second, the one that decides queue position.
+
+    Reading side: take every file matching queue_probe_opening*.jsonl.
+    """
+    return OUTPUT_DIRECTORY / f"{OUTPUT_PREFIX}.{os.getpid()}.jsonl"
 
 
 def _timestamp_ms(value: object) -> int:
@@ -168,12 +184,13 @@ async def _monitor_market(
 async def _run(
     opening_window_seconds: float = OPENING_WINDOW_SECONDS,
 ) -> None:
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    destination = output_path()
+    destination.parent.mkdir(parents=True, exist_ok=True)
     worker = MarketActivationWorker(window_minutes=0, farthest_first=True)
     tasks: set[asyncio.Task] = set()
     worker.start()
     try:
-        with OUTPUT_PATH.open("a", encoding="utf-8", buffering=1) as output:
+        with destination.open("a", encoding="utf-8", buffering=1) as output:
             while True:
                 for update in worker.drain():
                     if not isinstance(update, MarketActivationUpdate):

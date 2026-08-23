@@ -56,3 +56,22 @@ def test_price_change_replaces_the_target_bid_level() -> None:
 
 def test_timestamp_is_preserved_in_epoch_milliseconds() -> None:
     assert _timestamp_ms("2000000000000") == 2_000_000_000_000
+
+
+def test_each_probe_writes_its_own_file() -> None:
+    """Two probes sharing one file wrote over each other's lines.
+
+    It only happened while both were writing fast, and the only time they
+    write fast is the burst after a market opens - which is the burst the
+    whole recording exists for. Two processes cannot share a process id.
+    """
+    import os
+
+    from polymarket_bot import queue_probe
+
+    path = queue_probe.output_path()
+    assert str(os.getpid()) in path.name
+    assert path.name.startswith(queue_probe.OUTPUT_PREFIX)
+    assert path.suffix == ".jsonl"
+    # and the reading side can still find them all
+    assert path.match(f"{queue_probe.OUTPUT_PREFIX}*.jsonl")
