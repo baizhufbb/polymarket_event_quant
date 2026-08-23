@@ -6,3 +6,6 @@ __pycache__/
 data/
 logs/
 
+
+# Local code index, rebuilt on demand.
+.codegraph/
