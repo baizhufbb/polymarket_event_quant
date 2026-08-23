@@ -423,6 +423,97 @@ def test_the_loop_resumes_once_the_venue_answers() -> None:
     assert result.held_back == 0, "a venue answering promptly should not be held back"
 
 
+class _TickAskingClient:
+    """A venue client shaped like the real one where signing is concerned.
+
+    py_clob_client_v2 keeps resolved tick sizes in a dict on the client and
+    only asks the venue when a token is missing from it; a market announced
+    moments ago answers 404 to that lookup. Everything below mirrors that.
+    """
+
+    def __init__(self):
+        self._ClobClient__tick_sizes = {}
+        self.venue_lookups = []
+        self.canceled = []
+
+    def create_order(self, order_args, options):
+        token_id = order_args.token_id
+        if token_id not in self._ClobClient__tick_sizes:
+            self.venue_lookups.append(token_id)
+            response = httpx.Response(404, json={"error": "market not found"})
+            raise PolyApiException(response)
+        return {"token_id": token_id, "side": order_args.side}
+
+    def post_orders(self, signed, post_only=False):
+        return [
+            {"success": True, "orderID": f"{item.order['token_id']}-id", "status": "live"}
+            for item in signed
+        ]
+
+    def cancel_orders(self, order_ids):
+        self.canceled.extend(order_ids)
+
+
+def test_signing_does_not_ask_the_venue_for_a_tick_size_we_already_have() -> None:
+    """Discovery read the tick size off the listing; asking again costs a market.
+
+    The client only fetches the market's minimum tick to check ours is not
+    finer - the order it signs carries ours either way. That lookup is the one
+    network call left in signing, and in run 18 it answered 404 for a member,
+    which sat that account out of the whole market while the other one sent
+    three thousand times.
+    """
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = _TickAskingClient()
+
+    result = exchange.place_dual(
+        MARKET,
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        submission_interval_ms=Decimal("20"),
+    )
+
+    assert result.complete
+    assert exchange.client.venue_lookups == [], (
+        f"signing still asked the venue about {exchange.client.venue_lookups}"
+    )
+    assert exchange.client._ClobClient__tick_sizes == {
+        MARKET.up_token_id: str(MARKET.tick_size),
+        MARKET.down_token_id: str(MARKET.tick_size),
+    }
+
+
+def test_priming_leaves_a_tick_size_the_client_already_learned() -> None:
+    """If the client has been told the real value, that is the one to keep."""
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = _TickAskingClient()
+    exchange.client._ClobClient__tick_sizes[MARKET.up_token_id] = "0.001"
+
+    exchange._prime_tick_size(MARKET)
+
+    assert exchange.client._ClobClient__tick_sizes[MARKET.up_token_id] == "0.001"
+    assert exchange.client._ClobClient__tick_sizes[MARKET.down_token_id] == str(MARKET.tick_size)
+
+
+def test_priming_says_so_if_the_library_moves_its_tick_cache() -> None:
+    """Silently reverting to a network call in front of every signature is the
+    one outcome worth crashing over, so it is only tolerated for test doubles."""
+    from py_clob_client_v2 import ClobClient
+
+    moved = ClobClient.__new__(ClobClient)
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = moved
+
+    with pytest.raises(RuntimeError, match="tick sizes"):
+        exchange._prime_tick_size(MARKET)
+
+    class NotTheRealClient:
+        pass
+
+    exchange.client = NotTheRealClient()
+    exchange._prime_tick_size(MARKET)  # a double without the cache is left alone
+
+
 class _SlowFirstReplyClient(FakeClient):
     """Answers not-ready until its budget is reached, then accepts."""
 

@@ -272,6 +272,7 @@ class Exchange:
         submissions = self._dual_submission_cache()
         signed = submissions.get(submission_key)
         if signed is None:
+            self._prime_tick_size(market)
             try:
                 signed = self._sign_entries(
                     specifications, options, price=price, size=size,
@@ -808,6 +809,29 @@ class Exchange:
             payload = exc.error_msg if isinstance(exc.error_msg, dict) else {}
             message = str(payload.get("error") or exc.error_msg or exc)
             return {"errorMsg": message, "success": False}
+
+    def _prime_tick_size(self, market: Market) -> None:
+        """Hand the client the tick size it would otherwise ask the venue for.
+
+        The client asks the venue for the market's minimum tick only to check
+        ours is not finer; the order it signs carries the value we pass either
+        way, and discovery already read that value off the market listing. The
+        lookup is the one network call left in signing, it happens once per
+        token, and a market announced moments ago answers 404 to it - which is
+        how a fleet member sat out a whole market while the other one sent
+        three thousand times.
+        """
+        cache = getattr(self.client, "_ClobClient__tick_sizes", None)
+        if not isinstance(cache, dict):
+            if isinstance(self.client, ClobClient):
+                raise RuntimeError(
+                    "py_clob_client_v2 no longer keeps tick sizes in "
+                    "_ClobClient__tick_sizes; signing would quietly go back "
+                    "to asking the venue for them"
+                )
+            return
+        for token_id in (market.up_token_id, market.down_token_id):
+            cache.setdefault(token_id, str(market.tick_size))
 
     def _sign_entries(
         self,
