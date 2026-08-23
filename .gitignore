@@ -11,6 +11,4 @@ logs/
 .codegraph/
 
 # Session data pulled off the server for analysis; regenerated on demand.
-run*_detail.json
-run*_before.json
-run*_both.json
+run*.json
