@@ -230,6 +230,11 @@ class Exchange:
             funder=config.funder_address,
             retry_on_error=False,
         )
+        # Whoever wants to open this account's user stream needs these, and an
+        # account whose env file carries no API key has them only after the
+        # derivation above.
+        self.config = config
+        self.credentials = creds
         self._dual_submissions: dict[tuple, list[PostOrdersV2Args]] = {}
         self._next_placement_submission = 0.0
 

@@ -242,6 +242,7 @@ def _service_for_run(database, tick, *, hours=None):
     service.run_id = 0
     service.geoblock_worker = None
     service.user_stream_worker = None
+    service.member_stream_workers = ()
     service.market_activation_worker = None
     service.reconciliation_worker = None
     service._tick = tick
@@ -565,6 +566,7 @@ def test_activation_worker_owns_continuous_gamma_discovery() -> None:
     service.activation_market_updates = []
     service.reconciliation_worker = None
     service.user_stream_worker = None
+    service.member_stream_workers = ()
     service.geoblock_worker = None
     service.last_reconcile = float("inf")
     service.last_discovery = 0.0

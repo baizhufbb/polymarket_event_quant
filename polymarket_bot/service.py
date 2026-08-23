@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from decimal import Decimal
 from threading import Event
 
+from polymarket.models import ApiKeyCreds
+
 from .config import BotConfig
 from .database import BotDatabase
 from .discovery import MarketDiscovery, is_eligible
@@ -129,6 +131,40 @@ class BotService:
         self.user_stream_worker = (
             UserStreamWorker(config, logger=logger) if live else None
         )
+        # One stream per extra account, purely so the venue stamps ITS OWN
+        # registration time on every account's order rather than only the
+        # primary's. Without them a fleet run cannot say what the head start
+        # bought: the two sides of the comparison sit on different clocks.
+        # These are for measurement, so a sick one must never stop trading -
+        # `healthy` below deliberately still asks only the primary.
+        self.member_stream_workers: tuple[UserStreamWorker, ...] = ()
+        if live and self.fleet:
+            extras = []
+            for member in self.fleet.members[1:]:
+                try:
+                    creds = member.exchange.credentials
+                    extras.append(
+                        UserStreamWorker(
+                            member.exchange.config,
+                            logger=logger,
+                            # the trading client and the socket name the same
+                            # three secrets differently
+                            credentials=ApiKeyCreds(
+                                key=creds.api_key,
+                                secret=creds.api_secret,
+                                passphrase=creds.api_passphrase,
+                            ),
+                            account=member.name,
+                        )
+                    )
+                except Exception as error:  # noqa: BLE001 - measurement only
+                    logger.warning(
+                        "no user stream for %s; its venue timestamps will be "
+                        "missing: %s",
+                        member.name,
+                        error,
+                    )
+            self.member_stream_workers = tuple(extras)
         self.market_activation_worker = (
             MarketActivationWorker(
                 window_minutes=lookahead_minutes,
@@ -180,6 +216,8 @@ class BotService:
             self.geoblock_worker.start()
         if self.user_stream_worker:
             self.user_stream_worker.start()
+        for worker in self.member_stream_workers:
+            worker.start()
         if self.market_activation_worker:
             self.market_activation_worker.start()
         if self.reconciliation_worker:
@@ -213,8 +251,11 @@ class BotService:
             if self.reconciliation_worker:
                 self.reconciliation_worker.stop()
                 self._drain_reconciliation_updates()
+            for worker in self.member_stream_workers:
+                worker.stop()
             if self.user_stream_worker:
                 self.user_stream_worker.stop()
+            if self.user_stream_worker or self.member_stream_workers:
                 self._drain_user_stream_updates()
             if self.geoblock_worker:
                 self.geoblock_worker.stop()
@@ -519,27 +560,60 @@ class BotService:
         )
 
     def _drain_user_stream_updates(self) -> bool:
-        if not self.user_stream_worker:
+        if not self.user_stream_worker and not self.member_stream_workers:
             return False
         recovered = False
         order_changed = False
         settlement_changed = False
-        for update in self.user_stream_worker.drain():
+        updates: list[tuple[UserStreamWorker, object]] = []
+        if self.user_stream_worker:
+            updates.extend(
+                (self.user_stream_worker, update)
+                for update in self.user_stream_worker.drain()
+            )
+        for worker in self.member_stream_workers:
+            updates.extend((worker, update) for update in worker.drain())
+
+        for worker, update in updates:
+            # Only the primary's socket gates trading. The others exist to have
+            # the venue stamp their account's orders, and a measurement going
+            # quiet must not stop the run.
+            gating = worker is self.user_stream_worker
             if isinstance(update, UserStreamState):
                 if update.healthy:
-                    if update.recovered:
+                    if update.recovered and gating:
                         recovered = True
-                    self.database.event(self.run_id, "INFO", "user_stream_connected")
-                    self.logger.info("user WebSocket connected")
-                else:
+                    self.database.event(
+                        self.run_id,
+                        "INFO",
+                        "user_stream_connected",
+                        details={"account": worker.account},
+                    )
+                    self.logger.info(
+                        "user WebSocket connected (%s)", worker.account
+                    )
+                elif gating:
                     self.database.event(
                         self.run_id,
                         "ERROR",
                         "user_stream_disconnected",
-                        details={"error": update.error},
+                        details={"error": update.error, "account": worker.account},
                     )
                     self.logger.error(
                         "user WebSocket unavailable; new placements paused: %s",
+                        update.error,
+                    )
+                else:
+                    self.database.event(
+                        self.run_id,
+                        "WARNING",
+                        "user_stream_disconnected",
+                        details={"error": update.error, "account": worker.account},
+                    )
+                    self.logger.warning(
+                        "user WebSocket for %s unavailable; its venue "
+                        "timestamps will be missing: %s",
+                        worker.account,
                         update.error,
                     )
                 continue
@@ -572,6 +646,7 @@ class BotService:
                     slug=row["slug"],
                     details={
                         "order_id": update.order_id,
+                        "account": row["account"] or worker.account,
                         "exchange_event_ts_ms": update.exchange_event_ts_ms,
                         "exchange_created_ts_ms": update.exchange_created_ts_ms,
                         "user_stream_received_ts_ms": update.received_ts_ms,

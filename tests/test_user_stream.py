@@ -34,6 +34,8 @@ MARKET = Market(
 
 
 class FakeUserStream:
+    account = "primary"
+
     def __init__(self, updates):
         self.updates = updates
 
@@ -210,6 +212,7 @@ def test_stream_fill_places_exit_without_waiting_for_rest_poll(tmp_path) -> None
         service.cancel_before_end_seconds = 2
         service.logger = logging.getLogger("test")
         service.user_stream_worker = FakeUserStream([update])
+        service.member_stream_workers = ()
 
         service._drain_user_stream_updates()
 
@@ -277,6 +280,7 @@ def test_placement_event_queued_during_http_submission_is_recorded(tmp_path) -> 
         service.live = True
         service.logger = logging.getLogger("test")
         service.user_stream_worker = stream
+        service.member_stream_workers = ()
         service._placement_retries = {}
 
         service._place(MARKET, trigger="test")
@@ -327,6 +331,7 @@ def test_matched_order_waits_when_conditional_tokens_are_not_settled(tmp_path) -
         )
         service.cancel_before_end_seconds = 2
         service.logger = logging.getLogger("test")
+        service.member_stream_workers = ()
         service.user_stream_worker = FakeUserStream(
             [
                 UserOrderUpdate(
@@ -378,6 +383,7 @@ def test_mined_trade_places_exit_after_balance_is_available(tmp_path) -> None:
         )
         service.cancel_before_end_seconds = 2
         service.logger = logging.getLogger("test")
+        service.member_stream_workers = ()
         service.user_stream_worker = FakeUserStream(
             [
                 UserTradeUpdate(
@@ -392,3 +398,152 @@ def test_mined_trade_places_exit_after_balance_is_available(tmp_path) -> None:
         service._drain_user_stream_updates()
 
         assert len(exchange.exit_calls) == 1
+
+
+def test_worker_takes_explicit_credentials_and_names_its_thread() -> None:
+    """A fleet member's key is often derived at startup, not read from a file.
+
+    The account that has no API key in its env file gets one from the venue
+    when its Exchange is built, so the stream has to be able to take those
+    credentials directly instead of re-reading a config that never had them.
+    """
+    from polymarket.models import ApiKeyCreds
+
+    from polymarket_bot.config import BotConfig
+
+    empty = BotConfig(
+        project_root=__import__("pathlib").Path("."),
+        private_key="",
+        funder_address="",
+        signature_type=0,
+        api_key=None,
+        api_secret=None,
+        api_passphrase=None,
+    )
+    worker = UserStreamWorker(
+        empty,
+        logger=logging.getLogger("test"),
+        credentials=ApiKeyCreds(key="k", secret="s", passphrase="p"),
+        account="m1",
+    )
+
+    assert worker.credentials.key == "k"
+    assert worker.account == "m1"
+    # Several of these run at once; a shared thread name makes a stack dump
+    # useless.
+    worker.start()
+    try:
+        names = {thread.name for thread in __import__("threading").enumerate()}
+        assert "polymarket-user-stream-m1" in names
+    finally:
+        worker.stop()
+
+
+def test_member_stream_records_the_venue_time_against_its_own_account(
+    tmp_path,
+) -> None:
+    """The whole point of the extra streams.
+
+    Only the primary had a user stream, so only the primary's orders carried
+    the venue's own registration time. Comparing the two accounts then meant
+    comparing one venue timestamp against one of ours - two different clocks,
+    which measures nothing.
+    """
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        run_id = database.start_run("live")
+        database.add_market(run_id, MARKET)
+        database.add_order(
+            run_id,
+            MARKET.slug,
+            PlacedOrder(
+                order_id="m1-order",
+                outcome="up",
+                token_id=MARKET.up_token_id,
+                price=Decimal("0.01"),
+                size=Decimal("100"),
+                status="live",
+                raw={},
+                account="m1",
+            ),
+        )
+        update = UserOrderUpdate(
+            order_id="m1-order",
+            status="live",
+            matched_size=Decimal("0"),
+            raw={},
+            event_type="PLACEMENT",
+            exchange_event_ts_ms=2_000_000_000_123,
+        )
+        member = FakeUserStream([update])
+        member.account = "m1"
+
+        service = BotService.__new__(BotService)
+        service.database = database
+        service.exchange = None
+        service.run_id = run_id
+        service.plan = TradePlan(Decimal("0.01"), (), Decimal("1"))
+        service.cancel_before_end_seconds = 0
+        service.logger = logging.getLogger("test")
+        service.user_stream_worker = None
+        service.member_stream_workers = (member,)
+
+        service._drain_user_stream_updates()
+
+        rows = list(
+            database.connection.execute(
+                "SELECT details_json FROM events WHERE event_type=?",
+                ("order_placement_observed",),
+            )
+        )
+        assert len(rows) == 1
+        details = json.loads(rows[0][0])
+        assert details["account"] == "m1"
+        assert details["exchange_event_ts_ms"] == 2_000_000_000_123
+
+
+def test_a_sick_member_stream_does_not_pause_trading(tmp_path) -> None:
+    """These streams measure; they must not be able to stop the run.
+
+    A disconnected primary pauses new placements, which is right - without it
+    we would place orders we cannot see. A member's stream carries no such
+    duty, and letting one gate the run would mean a flaky second socket costs
+    us every market.
+    """
+    from polymarket_bot.user_stream import UserStreamState
+
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        run_id = database.start_run("live")
+        member = FakeUserStream(
+            [
+                UserStreamState(
+                    healthy=False,
+                    changed=True,
+                    recovered=False,
+                    error="handshake failed",
+                )
+            ]
+        )
+        member.account = "m1"
+
+        service = BotService.__new__(BotService)
+        service.database = database
+        service.exchange = None
+        service.run_id = run_id
+        service.plan = TradePlan(Decimal("0.01"), (), Decimal("1"))
+        service.cancel_before_end_seconds = 0
+        service.logger = logging.getLogger("test")
+        service.user_stream_worker = None
+        service.member_stream_workers = (member,)
+
+        recovered = service._drain_user_stream_updates()
+
+        assert recovered is False
+        levels = [
+            row[0]
+            for row in database.connection.execute(
+                "SELECT level FROM events WHERE event_type=?",
+                ("user_stream_disconnected",),
+            )
+        ]
+        # A warning, not the ERROR that reads as "new placements paused".
+        assert levels == ["WARNING"]

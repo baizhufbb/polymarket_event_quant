@@ -53,14 +53,25 @@ class UserStreamWorker:
         *,
         logger: logging.Logger,
         stabilization_seconds: float = 2.0,
+        credentials: ApiKeyCreds | None = None,
+        account: str = "primary",
     ):
-        if not config.api_key or not config.api_secret or not config.api_passphrase:
-            raise ValueError("CLOB API credentials are required for the user stream")
-        self.credentials = ApiKeyCreds(
-            key=config.api_key,
-            secret=config.api_secret,
-            passphrase=config.api_passphrase,
-        )
+        if credentials is None:
+            if (
+                not config.api_key
+                or not config.api_secret
+                or not config.api_passphrase
+            ):
+                raise ValueError(
+                    "CLOB API credentials are required for the user stream"
+                )
+            credentials = ApiKeyCreds(
+                key=config.api_key,
+                secret=config.api_secret,
+                passphrase=config.api_passphrase,
+            )
+        self.credentials = credentials
+        self.account = account
         self.logger = logger
         self.stabilization_seconds = stabilization_seconds
         self._stop = Event()
@@ -80,7 +91,7 @@ class UserStreamWorker:
             raise RuntimeError("user stream worker already started")
         self._thread = Thread(
             target=self._run,
-            name="polymarket-user-stream",
+            name=f"polymarket-user-stream-{self.account}",
             daemon=True,
         )
         self._thread.start()
