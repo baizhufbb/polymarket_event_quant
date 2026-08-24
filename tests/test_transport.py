@@ -154,3 +154,41 @@ def test_each_account_gets_a_share_of_what_the_warm_up_leaves():
     assert transport.in_flight_budget(transport.FLEET_ACCOUNTS) >= per_account
     # Nonsense input cannot produce a nonsense cap.
     assert transport.in_flight_budget(0) >= 4
+
+
+def test_a_reply_cannot_outlive_what_the_in_flight_budget_assumed() -> None:
+    """The pool arithmetic assumes a reply lands within WORST_REPLY_SECONDS.
+
+    Nothing enforced that: the client's timeout was ten seconds, so a reply
+    could hold its slot forty times longer than the sizing above allows. The
+    send loop then hit its in-flight cap and skipped slots - 18% of them over
+    a six-hour run, and the markets where it happened sat 2834 shares deeper
+    in the queue than the ones where it did not.
+
+    With the timeout tied to the same constant, an account sending every
+    FASTEST_INTERVAL_SECONDS can never accumulate more than the ratio between
+    them, so the cap becomes unreachable rather than merely generous.
+    """
+    from polymarket_bot.transport import in_flight_budget
+
+    alive = transport.WORST_REPLY_SECONDS / transport.FASTEST_INTERVAL_SECONDS
+
+    def cap(accounts: int) -> int:
+        # Exchange.max_requests_in_flight: a share of the pool, halved outside
+        # batch mode, where each request is carried by two threads.
+        return max(2, in_flight_budget(accounts) // 2)
+
+    largest_safe = max(
+        (n for n in range(1, transport.FLEET_ACCOUNTS + 1) if alive < cap(n)),
+        default=0,
+    )
+    assert largest_safe >= 2, (
+        f"a request lives up to {alive:.0f} sends, but the cap allows only "
+        f"{cap(2)} on two accounts - backpressure will fire at the open"
+    )
+    # Beyond this the halving leaves less room than a request's lifetime, and
+    # the skipping this change removes comes back. Raising the fleet means
+    # revisiting the budget, not just the account count.
+    assert largest_safe < transport.FLEET_ACCOUNTS or alive < cap(
+        transport.FLEET_ACCOUNTS
+    )

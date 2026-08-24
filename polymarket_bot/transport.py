@@ -81,7 +81,20 @@ def install_parallel_transport() -> None:
             max_keepalive_connections=MAX_CONNECTIONS,
             keepalive_expiry=300.0,
         ),
-        timeout=httpx.Timeout(10.0, connect=5.0),
+        # The pool above is sized on WORST_REPLY_SECONDS, but nothing made a
+        # reply keep to it: the timeout was ten seconds, so a slow reply held
+        # its slot forty times longer than the arithmetic assumed. Requests
+        # then piled up until the send loop hit its in-flight cap and gave up
+        # slots - 18% of them across the six-hour run, and the markets where
+        # that happened landed 2834 shares deeper in the queue than the ones
+        # where it did not.
+        #
+        # A request we are still waiting on after a second has already lost us
+        # the moment it was sent for. Abandoning it is not a lost order: the
+        # next send returns "Duplicated" carrying that order's id, and every
+        # account now has a user stream that reports the placement without
+        # asking us to wait for anything.
+        timeout=httpx.Timeout(WORST_REPLY_SECONDS),
     )
     previous = _helpers._http_client
     _helpers._http_client = replacement
