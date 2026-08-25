@@ -428,6 +428,10 @@ def test_every_member_is_told_how_many_share_the_pool():
         for member in fleet.members:
             assert member.exchange.accounts_sharing_the_pool == size
             assert member.exchange.max_requests_in_flight == in_flight_budget(size)
+            # The halving that once cut this outside batch mode hurt exactly
+            # the non-batch multi-account quadrant; pin that quadrant too.
+            member.exchange.entry_submission = "solo-up"
+            assert member.exchange.max_requests_in_flight == in_flight_budget(size)
 
     # A single Exchange with no fleet around it still owns the whole pool.
     alone = _recording_exchange(0.0)

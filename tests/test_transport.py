@@ -197,10 +197,8 @@ def test_the_full_fleet_cannot_exhaust_the_thread_supply() -> None:
     the whole planned fleet an order of magnitude under it.
     """
     per_request_threads = 3  # dispatch + one per leg, two legs at most
-    worst = (
-        transport.FLEET_ACCOUNTS
-        * transport.in_flight_budget(transport.FLEET_ACCOUNTS)
-        * per_request_threads
-        + transport.WARM_CONNECTIONS
-    )
+    worst = max(
+        accounts * transport.in_flight_budget(accounts) * per_request_threads
+        for accounts in range(1, transport.FLEET_ACCOUNTS + 1)
+    ) + transport.WARM_CONNECTIONS
     assert worst <= 700
