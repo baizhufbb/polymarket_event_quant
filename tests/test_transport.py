@@ -140,18 +140,31 @@ def test_each_account_gets_a_share_of_what_the_warm_up_leaves():
     """A share of the pool, from the fleet actually running - not a constant.
 
     Dividing by a fixed account count gave a solo account half the pool it
-    owned, and a fleet larger than that count more than the pool has.
+    owned, and a fleet larger than that count more than the pool has. The
+    share is clipped at the ceiling: outstanding requests cost threads, and
+    nothing past a 4-second spell's worth of them buys any coverage.
     """
     usable = transport.MAX_CONNECTIONS - transport.WARM_CONNECTIONS
     per_account = transport.WORST_REPLY_SECONDS / transport.FASTEST_INTERVAL_SECONDS
 
-    # A solo account owns everything the warm-up does not.
-    assert transport.in_flight_budget(1) == usable
+    # A solo account gets the ceiling, not the whole pool.
+    assert transport.in_flight_budget(1) == transport.ACCOUNT_BUDGET_CEILING
+    # The ceiling covers a 4-second spell at the fastest cadence.
+    assert (
+        transport.ACCOUNT_BUDGET_CEILING * transport.FASTEST_INTERVAL_SECONDS
+        >= 4.0
+    )
     # No fleet size can promise more than the pool holds.
     for accounts in range(1, transport.FLEET_ACCOUNTS + 1):
         assert transport.in_flight_budget(accounts) * accounts <= usable
     # And up to the fleet this is sized for, the share still covers an open.
     assert transport.in_flight_budget(transport.FLEET_ACCOUNTS) >= per_account
+    # Three accounts must ride out the spells run21 actually measured: a
+    # sustained 2.2s of slow replies demands 264 connections and the old
+    # 256-connection pool queued our own sends at the door (57% of sends
+    # left with 200+ in flight).
+    spell_demand = 3 * 2.2 / transport.FASTEST_INTERVAL_SECONDS
+    assert 3 * transport.in_flight_budget(3) >= spell_demand
     # Nonsense input cannot produce a nonsense cap.
     assert transport.in_flight_budget(0) >= 4
 
@@ -201,4 +214,7 @@ def test_the_full_fleet_cannot_exhaust_the_thread_supply() -> None:
         accounts * transport.in_flight_budget(accounts) * per_request_threads
         for accounts in range(1, transport.FLEET_ACCOUNTS + 1)
     ) + transport.WARM_CONNECTIONS
-    assert worst <= 700
+    # The field crash ran out at several thousand threads (the server allows
+    # 7277); the ceiling keeps the worst case five times under that, and the
+    # review measured the real cost at 2 threads per request, not 3.
+    assert worst <= 1500

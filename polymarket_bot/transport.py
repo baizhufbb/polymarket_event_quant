@@ -24,33 +24,47 @@ import httpx
 import py_clob_client_v2.http_helpers.helpers as _helpers
 
 CLOB_TIME_URL = "https://clob.polymarket.com/time"
-# At the open, replies take up to ~1s while each account submits every 25ms,
-# so an account can have ~40 requests in flight. Every account in the process
-# shares this one pool - the client library keeps a single module-level client
-# - and so does the warm-up, which now dials while the accounts are sending.
-# Beyond the pool's size requests queue inside it, which is latency added at
-# exactly the moment the whole strategy is about queueing.
+# The venue has slow spells, whole markets at a time: reply medians sit at
+# 30ms for clean markets and jump to 1.2-2.2s for spell markets, flat from
+# the first knock to the last (run20: 16/72 markets, run21: 56/72). During a
+# spell the fleet's demand for connections is
+#   accounts x spell_seconds / interval
+# and when that passes the pool, new sends wait at our own door before they
+# even leave - latency added at exactly the moment the strategy is about
+# queueing. Run21 (3 accounts, 2.2s spells) demanded 264 of the old 208
+# usable connections: 57% of the session's sends left with 200+ already in
+# flight, at 2.2s median lifetimes.
 #
-# The budget: the warm-up gets WARM_CONNECTIONS, and the accounts share what
-# is left. Sized for the largest fleet planned, five accounts:
-#   48 + 5 x (1.0 / 0.025) = 248
-# A test holds these numbers to that arithmetic.
+# The pool is therefore sized for spells, not for the happy path: the
+# warm-up gets WARM_CONNECTIONS and the accounts share the rest, which at
+# three accounts covers a sustained 154 x 25ms = 3.85s spell. The deep tail
+# (p90 spells reach ~7s) still trips the in-flight cap and skips slots -
+# that is the designed protection, the pool does not chase 23-second tails.
+#
+# WORST_REPLY_SECONDS is the httpx timeout. It is per-phase (connect, write,
+# read-gap), NOT a lifetime bound: a reply that trickles never sits silent
+# for a second and can live many times longer (run21 p99 lifetime 11.5s).
 FLEET_ACCOUNTS = 5
 WORST_REPLY_SECONDS = 1.0
 FASTEST_INTERVAL_SECONDS = 0.025
 WARM_CONNECTIONS = 48
-MAX_CONNECTIONS = 256
+MAX_CONNECTIONS = 512
+# No account needs more outstanding requests than a 4-second spell fills;
+# past the ceiling the extra would only buy thread count, not coverage.
+ACCOUNT_BUDGET_CEILING = 160
 
 
 def in_flight_budget(accounts: int) -> int:
     """How many requests one account may have outstanding at once.
 
     What is left of the pool once the warm-up has its slice, divided by the
-    accounts actually running - not by a constant, so a solo account gets the
-    whole pool and a fleet of any size gets an honest share.
+    accounts actually running - not by a constant, so a fleet of any size
+    gets an honest share - and clipped at the ceiling, because outstanding
+    requests cost threads and nothing above a 4-second spell's worth of
+    them buys any coverage.
     """
     usable = MAX_CONNECTIONS - WARM_CONNECTIONS
-    return max(4, usable // max(1, accounts))
+    return max(4, min(usable // max(1, accounts), ACCOUNT_BUDGET_CEILING))
 # A market handed back by signing re-enters place_dual every loop tick, and
 # each entry asks to warm the pool; the pool is process-wide, so one warm-up
 # per window serves every member and every re-entry of that market.
