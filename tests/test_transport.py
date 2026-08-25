@@ -123,6 +123,23 @@ def test_warm_connections_runs_once_per_window(monkeypatch):
     assert _wait_for(lambda: len(calls) == 10)
 
 
+def test_the_process_lifts_its_own_fd_limit_as_far_as_the_pool_needs():
+    """runuser's PAM resets the soft fd limit to 1024; the pool holds 512.
+
+    The launcher cannot fix this from outside - the reset happens after it -
+    so the process must, and a soft limit below the pool plus daily overhead
+    would surface as connection errors at the open.
+    """
+    transport._raise_file_descriptor_limit()
+    try:
+        import resource
+    except ImportError:
+        return  # no rlimits on this platform, nothing to verify
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    wanted = 8192 if hard == resource.RLIM_INFINITY else min(8192, hard)
+    assert soft >= min(wanted, transport.MAX_CONNECTIONS + 256)
+
+
 def test_the_pool_covers_the_warm_up_and_every_account_at_the_open():
     """One pool serves the whole process: the warm-up and every account.
 

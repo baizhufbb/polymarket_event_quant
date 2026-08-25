@@ -77,11 +77,38 @@ _last_warm_monotonic: float | None = None
 _warm_lock = Lock()
 
 
+def _raise_file_descriptor_limit(target: int = 8192) -> None:
+    """Lift this process's own fd soft limit toward `target`.
+
+    The 512-connection pool holds one descriptor per socket, and the launch
+    path runs through runuser, whose PAM session resets the soft limit to
+    the 1024 default no matter what the calling shell set. A process may
+    raise its own soft limit up to the hard limit without privilege, so the
+    bot does it here rather than trusting any launcher to.
+    """
+    try:
+        import resource
+    except ImportError:  # not a POSIX system; no 1024 default applies
+        return
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    wanted = target if hard == resource.RLIM_INFINITY else min(target, hard)
+    if soft >= wanted:
+        return
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
+    except (ValueError, OSError) as exc:
+        logger.warning(
+            "could not raise the fd soft limit from %d to %d: %s",
+            soft, wanted, exc,
+        )
+
+
 def install_parallel_transport() -> None:
     """Replace the official client's shared transport. Idempotent."""
     global _installed
     if _installed:
         return
+    _raise_file_descriptor_limit()
     if not isinstance(getattr(_helpers, "_http_client", None), httpx.Client):
         raise RuntimeError(
             "py_clob_client_v2 no longer exposes _http_client as an "
