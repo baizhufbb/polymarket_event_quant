@@ -435,11 +435,13 @@ def test_every_member_is_told_how_many_share_the_pool():
     assert alone.max_requests_in_flight == in_flight_budget(1)
 
 
-def test_a_single_leg_mode_halves_the_cap():
-    """Outside batch mode each request is carried by two threads, not one.
+def test_the_cap_is_the_pool_share_in_every_submission_mode():
+    """The cap counts connections; threads are budgeted where they are spent.
 
-    Threads, not requests, are what ran out in the field, so the budget has to
-    be counted in the resource that ran out.
+    Halving the cap outside batch mode was thread protection priced in the
+    wrong unit: at three or more accounts it fell below the ~40 requests a
+    one-second reply lets accumulate, and the send loop skipped slots again.
+    A transport test now holds the fleet's worst-case thread count instead.
     """
     from polymarket_bot.transport import in_flight_budget
 
@@ -449,4 +451,4 @@ def test_a_single_leg_mode_halves_the_cap():
     solo.entry_submission = "solo-up"
 
     assert batch.max_requests_in_flight == in_flight_budget(1)
-    assert solo.max_requests_in_flight == in_flight_budget(1) // 2
+    assert solo.max_requests_in_flight == in_flight_budget(1)

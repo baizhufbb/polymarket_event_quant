@@ -167,28 +167,40 @@ def test_a_reply_cannot_outlive_what_the_in_flight_budget_assumed() -> None:
 
     With the timeout tied to the same constant, an account sending every
     FASTEST_INTERVAL_SECONDS can never accumulate more than the ratio between
-    them, so the cap becomes unreachable rather than merely generous.
+    them, so the cap becomes unreachable rather than merely generous - and it
+    must stay unreachable for every fleet size this pool was sized for, which
+    is what the old halved cap broke at three accounts and above.
     """
     from polymarket_bot.transport import in_flight_budget
 
     alive = transport.WORST_REPLY_SECONDS / transport.FASTEST_INTERVAL_SECONDS
 
-    def cap(accounts: int) -> int:
-        # Exchange.max_requests_in_flight: a share of the pool, halved outside
-        # batch mode, where each request is carried by two threads.
-        return max(2, in_flight_budget(accounts) // 2)
+    for accounts in range(1, transport.FLEET_ACCOUNTS + 1):
+        # Exchange.max_requests_in_flight: the account's share of the pool.
+        cap = in_flight_budget(accounts)
+        assert alive < cap, (
+            f"a request lives up to {alive:.0f} sends, but {accounts} "
+            f"account(s) get a cap of {cap} - the send loop will skip slots "
+            f"at the open, which cost 2834 shares a market when it last fired"
+        )
 
-    largest_safe = max(
-        (n for n in range(1, transport.FLEET_ACCOUNTS + 1) if alive < cap(n)),
-        default=0,
-    )
-    assert largest_safe >= 2, (
-        f"a request lives up to {alive:.0f} sends, but the cap allows only "
-        f"{cap(2)} on two accounts - backpressure will fire at the open"
-    )
-    # Beyond this the halving leaves less room than a request's lifetime, and
-    # the skipping this change removes comes back. Raising the fleet means
-    # revisiting the budget, not just the account count.
-    assert largest_safe < transport.FLEET_ACCOUNTS or alive < cap(
+
+def test_the_full_fleet_cannot_exhaust_the_thread_supply() -> None:
+    """Threads are what actually ran out in the field (run17).
+
+    The in-flight cap used to be halved outside batch mode to protect them,
+    which re-armed slot-skipping at three accounts. The guard belongs here
+    instead: at worst every account holds its whole cap, and each of those
+    requests is carried by a dispatch thread plus one thread per leg (two
+    legs at most), so the fleet's ceiling is accounts x cap x 3 plus the
+    warm-up dials. The field failure came at several thousand threads; keep
+    the whole planned fleet an order of magnitude under it.
+    """
+    per_request_threads = 3  # dispatch + one per leg, two legs at most
+    worst = (
         transport.FLEET_ACCOUNTS
+        * transport.in_flight_budget(transport.FLEET_ACCOUNTS)
+        * per_request_threads
+        + transport.WARM_CONNECTIONS
     )
+    assert worst <= 700

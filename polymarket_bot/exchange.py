@@ -190,16 +190,19 @@ class Exchange:
 
     @property
     def max_requests_in_flight(self) -> int:
-        """Outstanding requests this account may hold at once.
+        """Outstanding requests this account may hold at once: its pool share.
 
-        Its share of the pool, halved outside batch mode: there each request
-        is carried by a dispatch thread that waits on a second thread per leg,
-        and threads, not requests, are what ran out in the field.
+        This used to be halved outside batch mode to protect the thread
+        supply - each request there is carried by a dispatch thread plus one
+        thread per leg, and threads are what ran out in the field. But the
+        halving was priced in connections, not threads, and at three or more
+        accounts it pushed the cap below the ~40 requests a one-second reply
+        timeout lets accumulate, re-arming the slot-skipping it was never
+        meant to cause. The thread supply is guarded where it is spent: a
+        transport test holds the whole planned fleet's worst-case thread
+        count far under the limit the field run exhausted.
         """
-        budget = in_flight_budget(self.accounts_sharing_the_pool)
-        if self.entry_submission != "batch":
-            budget = max(2, budget // 2)
-        return budget
+        return in_flight_budget(self.accounts_sharing_the_pool)
 
     def __init__(self, config: BotConfig):
         install_parallel_transport()
