@@ -21,9 +21,11 @@ from py_clob_client_v2 import (
 )
 from py_clob_client_v2.exceptions import PolyApiException
 
+from .async_submitter import get_submitter
 from .config import BotConfig
 from .models import Market, PlacedOrder, PlacementResult
 from .transport import (
+    WARM_CONNECTIONS,
     in_flight_budget,
     install_parallel_transport,
     warm_connections,
@@ -187,6 +189,14 @@ class Exchange:
     # An account alone in the process owns the whole pool; Fleet narrows this
     # to a share when it builds its members.
     accounts_sharing_the_pool = 1
+    # Non-batch sends go through the event loop: a request in flight costs
+    # an entry in its book instead of two OS threads. run22's venue slow
+    # spell put ~460 requests in flight and the ~930 carrier threads starved
+    # the one-core server - reply reads stalled, the user streams dropped 52
+    # times, and placements sat paused for hours. The default stays False so
+    # every test exercises whichever path it was written against; the CLI
+    # turns it on for live runs (--sync-submitter opts back out).
+    use_async_submitter = False
 
     @property
     def max_requests_in_flight(self) -> int:
@@ -271,6 +281,10 @@ class Exchange:
         phase_offset_ms: Decimal = Decimal(0),
     ) -> PlacementResult:
         warm_connections()
+        if self.entry_submission != "batch" and self.use_async_submitter:
+            # The hot path sends through the event loop's own pool, which
+            # dials its own connections; warm it alongside the sync pool.
+            get_submitter().warm(WARM_CONNECTIONS)
         options = PartialCreateOrderOptions(
             tick_size=str(market.tick_size),
             neg_risk=False,
@@ -688,6 +702,13 @@ class Exchange:
         self,
         signed: list[PostOrdersV2Args],
     ) -> Future:
+        if self.entry_submission != "batch" and self.use_async_submitter:
+            # A request in flight costs an event-loop entry, not two OS
+            # threads: run22 held ~460 requests in a venue slow spell and
+            # the ~930 carrier threads starved the one-core box to death.
+            submitter = get_submitter()
+            legs = [submitter.prepare(self.client, args) for args in signed]
+            return submitter.submit(legs)
         future: Future = Future()
 
         def submit() -> None:
