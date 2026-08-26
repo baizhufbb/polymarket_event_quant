@@ -227,17 +227,6 @@ def test_the_cache_cannot_answer_for_a_recycled_object_id(monkeypatch):
     assert fresh.body_dict == {"market": "market-B"}
 
 
-def test_the_cli_run_branch_switches_live_runs_onto_the_loop():
-    """Nothing else pins cli.py's wiring line: deleting it would silently
-    revert live runs to the run22 thread-per-send path with a green suite."""
-    import inspect
-
-    from polymarket_bot import cli
-
-    source = inspect.getsource(cli.main)
-    assert "use_async_submitter = not args.sync_submitter" in source
-
-
 def test_warm_is_rate_limited_like_the_sync_warm_up(monkeypatch):
     """place_dual asks to warm on every re-entry; unguarded, a signing-not-
     ready window bunches hundreds of dials into the moments before the
@@ -282,6 +271,8 @@ def test_warm_is_rate_limited_like_the_sync_warm_up(monkeypatch):
 
 
 def test_exchange_routes_non_batch_sends_through_the_loop(monkeypatch):
+    """Non-batch is the loop, unconditionally: the thread-per-send path was
+    removed after run22, and only batch mode keeps a dispatch thread."""
     from polymarket_bot import exchange as exchange_module
     from polymarket_bot.exchange import Exchange
 
@@ -305,14 +296,20 @@ def test_exchange_routes_non_batch_sends_through_the_loop(monkeypatch):
 
     ex = Exchange.__new__(Exchange)
     ex.entry_submission = "solo-up"
-    ex.use_async_submitter = True
     ex.client = FakeClient()
 
     future = ex._submit_placement_request(["signed-args"])
     assert future.result(timeout=1) == [{"success": True}]
     assert stub.calls == [[("prepared", "signed-args")]]
 
-    # The flag off, or batch mode, falls back to the thread path - which
-    # calls the real client, so only the routing decision is asserted here.
-    ex.use_async_submitter = False
-    assert ex._submit_placement_request is not None
+    # Batch mode never touches the submitter: its endpoint takes the whole
+    # pair in one request and stays on its dispatch thread.
+    class BatchClient:
+        def post_orders(self, signed, post_only=False):
+            return [{"success": True}]
+
+    ex.entry_submission = "batch"
+    ex.client = BatchClient()
+    future = ex._submit_placement_request(["signed-args"])
+    assert future.result(timeout=5) == [{"success": True}]
+    assert stub.calls == [[("prepared", "signed-args")]]

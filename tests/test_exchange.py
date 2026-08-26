@@ -27,6 +27,59 @@ MARKET = Market(
 )
 
 
+@pytest.fixture(autouse=True)
+def _loop_backed_by_the_fake_client(monkeypatch):
+    """Non-batch sends go through the event loop in production; these tests
+    exercise the sending loop against fake clients, so the submitter here is
+    a stand-in that fulfils each leg from the fake client's post_order with
+    the exact wrapping the real loop applies (transient errors re-raised,
+    other rejections folded to the errorMsg dict)."""
+    from concurrent.futures import Future
+
+    from polymarket_bot import exchange as exchange_module
+    from polymarket_bot.exchange import _transient_submission_error
+
+    class LoopStandIn:
+        def warm(self, count):
+            pass
+
+        def prepare(self, client, args):
+            return (client, args)
+
+        def submit(self, legs):
+            future: Future = Future()
+            try:
+                results = []
+                for client, args in legs:
+                    try:
+                        results.append(
+                            client.post_order(
+                                args.order, args.orderType, post_only=True
+                            )
+                        )
+                    except PolyApiException as exc:
+                        if _transient_submission_error(exc):
+                            raise
+                        payload = (
+                            exc.error_msg
+                            if isinstance(exc.error_msg, dict)
+                            else {}
+                        )
+                        message = str(
+                            payload.get("error") or exc.error_msg or exc
+                        )
+                        results.append(
+                            {"errorMsg": message, "success": False}
+                        )
+            except BaseException as exc:  # noqa: BLE001 - mirrors the loop
+                future.set_exception(exc)
+            else:
+                future.set_result(results)
+            return future
+
+    monkeypatch.setattr(exchange_module, "get_submitter", lambda: LoopStandIn())
+
+
 class FakeClient:
     def __init__(self, responses):
         self.responses = responses

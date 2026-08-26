@@ -143,16 +143,6 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     run.add_argument(
-        "--sync-submitter",
-        action="store_true",
-        help=(
-            "send orders through the old thread-per-request path instead of "
-            "the event loop; the loop is the default because two carrier "
-            "threads per in-flight request starved the one-core server "
-            "during venue slow spells"
-        ),
-    )
-    run.add_argument(
         "--fleet-env",
         action="append",
         default=[],
@@ -320,9 +310,6 @@ def main() -> None:
             )
         if args.fleet_env and args.take_profit:
             raise SystemExit("--fleet-env supports buy-only plans for now")
-        # Live runs send through the event loop unless explicitly opted out;
-        # the class default stays off so tests keep the path they pin.
-        Exchange.use_async_submitter = not args.sync_submitter
         fleet = None
         if live and args.fleet_env:
             members = [("primary", Exchange(config), plan.order_size)]

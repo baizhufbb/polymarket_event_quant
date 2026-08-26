@@ -189,14 +189,6 @@ class Exchange:
     # An account alone in the process owns the whole pool; Fleet narrows this
     # to a share when it builds its members.
     accounts_sharing_the_pool = 1
-    # Non-batch sends go through the event loop: a request in flight costs
-    # an entry in its book instead of two OS threads. run22's venue slow
-    # spell put ~460 requests in flight and the ~930 carrier threads starved
-    # the one-core server - reply reads stalled, the user streams dropped 52
-    # times, and placements sat paused for hours. The default stays False so
-    # every test exercises whichever path it was written against; the CLI
-    # turns it on for live runs (--sync-submitter opts back out).
-    use_async_submitter = False
 
     @property
     def max_requests_in_flight(self) -> int:
@@ -281,7 +273,7 @@ class Exchange:
         phase_offset_ms: Decimal = Decimal(0),
     ) -> PlacementResult:
         warm_connections()
-        if self.entry_submission != "batch" and self.use_async_submitter:
+        if self.entry_submission != "batch":
             # The hot path sends through the event loop's own pool, which
             # dials its own connections; warm it alongside the sync pool.
             get_submitter().warm(WARM_CONNECTIONS)
@@ -702,23 +694,24 @@ class Exchange:
         self,
         signed: list[PostOrdersV2Args],
     ) -> Future:
-        if self.entry_submission != "batch" and self.use_async_submitter:
+        if self.entry_submission != "batch":
             # A request in flight costs an event-loop entry, not two OS
             # threads: run22 held ~460 requests in a venue slow spell and
             # the ~930 carrier threads starved the one-core box to death.
             submitter = get_submitter()
             legs = [submitter.prepare(self.client, args) for args in signed]
             return submitter.submit(legs)
+        # Batch mode is the one entry mode still carried by a thread: its
+        # endpoint takes the whole pair in one request, it is not used by
+        # the fleet, and one dispatch thread per in-flight send is the cost
+        # the thread test budgets for.
         future: Future = Future()
 
         def submit() -> None:
             if not future.set_running_or_notify_cancel():
                 return
             try:
-                if self.entry_submission == "batch":
-                    response = self.client.post_orders(signed, post_only=True)
-                else:
-                    response = self._post_dual_singles(signed)
+                response = self.client.post_orders(signed, post_only=True)
             except BaseException as exc:
                 future.set_exception(exc)
             else:
@@ -797,47 +790,6 @@ class Exchange:
             return specifications, signed
         spec, args = remaining[attempts % len(remaining)]
         return (spec,), [args]
-
-    def _post_dual_singles(self, signed: list[PostOrdersV2Args]) -> list[object]:
-        """Submit each leg as its own single-order request, in parallel.
-
-        The batch endpoint keeps answering "not ready" for a while after the
-        book is publicly live; this probes whether the single-order path
-        opens earlier. A leg whose response is lost is recovered on the next
-        tick through the duplicate-order recognition.
-        """
-        results: list[object] = [None] * len(signed)
-        failures: list[BaseException] = []
-
-        def run(index: int) -> None:
-            try:
-                results[index] = self._post_single(signed[index])
-            except BaseException as exc:
-                failures.append(exc)
-
-        threads = [
-            Thread(target=run, args=(index,), daemon=True)
-            for index in range(len(signed))
-        ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-        if failures:
-            raise failures[0]
-        return results
-
-    def _post_single(self, args: PostOrdersV2Args) -> object:
-        try:
-            return self.client.post_order(
-                args.order, args.orderType, post_only=True
-            )
-        except PolyApiException as exc:
-            if _transient_submission_error(exc):
-                raise
-            payload = exc.error_msg if isinstance(exc.error_msg, dict) else {}
-            message = str(payload.get("error") or exc.error_msg or exc)
-            return {"errorMsg": message, "success": False}
 
     def _prime_tick_size(self, market: Market) -> None:
         """Hand the client the tick size it would otherwise ask the venue for.

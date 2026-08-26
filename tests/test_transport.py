@@ -226,12 +226,14 @@ def test_the_full_fleet_cannot_exhaust_the_thread_supply() -> None:
     warm-up dials. The field failure came at several thousand threads; keep
     the whole planned fleet an order of magnitude under it.
     """
-    per_request_threads = 3  # dispatch + one per leg, two legs at most
+    # Non-batch sends ride the event loop and cost no thread at all; batch
+    # mode - the one entry mode still carried by threads - spends a single
+    # dispatch thread per in-flight send.
+    per_request_threads = 1
     worst = max(
         accounts * transport.in_flight_budget(accounts) * per_request_threads
         for accounts in range(1, transport.FLEET_ACCOUNTS + 1)
     ) + transport.WARM_CONNECTIONS
-    # The field crash ran out at several thousand threads (the server allows
-    # 7277); the ceiling keeps the worst case five times under that, and the
-    # review measured the real cost at 2 threads per request, not 3.
-    assert worst <= 1500
+    # The field crash ran out at several thousand threads (the server
+    # allows 7277); keep the worst case an order of magnitude under it.
+    assert worst <= 700

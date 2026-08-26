@@ -49,6 +49,11 @@ WORST_REPLY_SECONDS = 1.0
 FASTEST_INTERVAL_SECONDS = 0.025
 WARM_CONNECTIONS = 48
 MAX_CONNECTIONS = 512
+# The sync pool no longer carries placements - those go through the event
+# loop's own pool, sized by MAX_CONNECTIONS above. What is left here is
+# cancels, reconciliation reads and the warm-up: small, bursty at market
+# end, never hundreds deep.
+SYNC_POOL_CONNECTIONS = 64
 # No account needs more outstanding requests than a 4-second spell fills;
 # past the ceiling the extra would only buy thread count, not coverage.
 ACCOUNT_BUDGET_CEILING = 160
@@ -118,8 +123,8 @@ def install_parallel_transport() -> None:
     replacement = httpx.Client(
         http2=False,
         limits=httpx.Limits(
-            max_connections=MAX_CONNECTIONS,
-            max_keepalive_connections=MAX_CONNECTIONS,
+            max_connections=SYNC_POOL_CONNECTIONS,
+            max_keepalive_connections=SYNC_POOL_CONNECTIONS,
             keepalive_expiry=300.0,
         ),
         # The pool above is sized on WORST_REPLY_SECONDS, but nothing made a
