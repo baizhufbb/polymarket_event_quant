@@ -167,6 +167,7 @@ def test_prepare_serializes_once_and_reuses(flat_headers, monkeypatch):
     def fake_init(self, client, args):
         built.append(args)
         self.client = client
+        self.args = args
         self.url = "u"
         self.body_dict = {}
         self.serialized = "{}"
@@ -184,6 +185,100 @@ def test_prepare_serializes_once_and_reuses(flat_headers, monkeypatch):
     second = submitter.prepare(client, args)
     assert first is second
     assert len(built) == 1
+
+
+def test_the_cache_cannot_answer_for_a_recycled_object_id(monkeypatch):
+    """CPython hands a freed object's id to the next same-shaped allocation,
+    and the cache is keyed by id: an entry that let its args die could be
+    found by a NEW signed order on the recycled id and answer with the
+    PREVIOUS market's body - an authentic order for the wrong market.
+
+    Two guarantees close it: the entry pins args (its id stays taken while
+    the entry is findable), and the lookup checks object identity, not just
+    the key."""
+
+    def fake_init(self, client, args):
+        self.client = client
+        self.args = args
+        self.url = "u"
+        self.body_dict = {"market": getattr(args, "label", "?")}
+        self.serialized = "{}"
+        self.body_bytes = b"{}"
+
+    monkeypatch.setattr(PreparedLeg, "__init__", fake_init)
+    submitter = AsyncSubmitter()
+    client = FakeClient()
+
+    class Args:
+        def __init__(self, label):
+            self.label = label
+
+    first_args = Args("market-A")
+    leg = submitter.prepare(client, first_args)
+    # The entry must hold the object itself; while it does, no new object
+    # can be allocated at this id.
+    assert leg.args is first_args
+
+    # Even if a lookup ever arrives with a different object on the same
+    # key, identity - not the key - decides.
+    impostor = Args("market-B")
+    submitter._prepared[id(impostor)] = leg
+    fresh = submitter.prepare(client, impostor)
+    assert fresh.body_dict == {"market": "market-B"}
+
+
+def test_the_cli_run_branch_switches_live_runs_onto_the_loop():
+    """Nothing else pins cli.py's wiring line: deleting it would silently
+    revert live runs to the run22 thread-per-send path with a green suite."""
+    import inspect
+
+    from polymarket_bot import cli
+
+    source = inspect.getsource(cli.main)
+    assert "use_async_submitter = not args.sync_submitter" in source
+
+
+def test_warm_is_rate_limited_like_the_sync_warm_up(monkeypatch):
+    """place_dual asks to warm on every re-entry; unguarded, a signing-not-
+    ready window bunches hundreds of dials into the moments before the
+    open."""
+    from polymarket_bot import transport
+
+    monkeypatch.setattr(transport, "_installed", True)
+    submitter = AsyncSubmitter()
+    started = []
+    monkeypatch.setattr(submitter, "start", lambda: started.append(True))
+
+    class FakeLoop:
+        pass
+
+    submitter._loop = None  # start() is stubbed; warm must bail before use
+
+    def fake_run_coroutine_threadsafe(coro, loop):
+        coro.close()
+        raise AssertionError("dial scheduled despite stubbed start")
+
+    # First call passes the rate gate (then fails on the stubbed start's
+    # missing loop only if it tries to schedule - we stop before that by
+    # asserting on the gate itself).
+    submitter._last_warm = None
+    submitter._last_warm = 0.0  # long ago -> allowed
+    import time as time_module
+
+    monkeypatch.setattr(time_module, "monotonic", lambda: 1000.0)
+    try:
+        submitter.warm(1)
+    except AssertionError:
+        pass
+    first_stamp = submitter._last_warm
+    assert first_stamp == 1000.0
+
+    # A second call inside the window must not even reach start().
+    started.clear()
+    monkeypatch.setattr(time_module, "monotonic", lambda: 1000.0 + 5.0)
+    submitter.warm(1)
+    assert submitter._last_warm == first_stamp
+    assert started == []
 
 
 def test_exchange_routes_non_batch_sends_through_the_loop(monkeypatch):

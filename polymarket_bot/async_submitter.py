@@ -65,14 +65,25 @@ _VERSION_HEAL_INTERVAL_SECONDS = 30.0
 
 
 class PreparedLeg:
-    """Everything constant about one signed order's request, built once."""
+    """Everything constant about one signed order's request, built once.
 
-    __slots__ = ("client", "url", "body_dict", "body_bytes", "serialized")
+    Holding `args` is load-bearing, not bookkeeping: the cache below keys
+    entries by id(args), and CPython reuses a freed object's id for the
+    next same-shaped allocation - reliably, not rarely. An entry that let
+    its args die could be looked up by a NEW signed order that landed on
+    the recycled id and answer with the PREVIOUS market's body, which
+    headers() would then sign freshly - an authentic order for the wrong
+    market. Pinning args means its id stays taken for as long as the entry
+    can be found.
+    """
+
+    __slots__ = ("client", "args", "url", "body_dict", "body_bytes", "serialized")
 
     def __init__(self, client, args) -> None:
         owner = client.creds.api_key or ""
         to_json = order_to_json_v2 if _is_v2_order(args.order) else order_to_json_v1
         self.client = client
+        self.args = args
         self.body_dict = to_json(
             args.order, owner, args.orderType, True, getattr(args, "deferExec", False)
         )
@@ -114,6 +125,7 @@ class AsyncSubmitter:
         self._thread: threading.Thread | None = None
         self._prepared: dict[int, PreparedLeg] = {}
         self._last_version_heal = 0.0
+        self._last_warm: float | None = None
         self._lock = threading.Lock()
 
     # -- lifecycle ---------------------------------------------------------
@@ -172,7 +184,7 @@ class AsyncSubmitter:
     def prepare(self, client, args) -> PreparedLeg:
         key = id(args)
         leg = self._prepared.get(key)
-        if leg is None or leg.client is not client:
+        if leg is None or leg.client is not client or leg.args is not args:
             leg = PreparedLeg(client, args)
             if len(self._prepared) > 4096:
                 self._prepared.clear()
@@ -237,13 +249,28 @@ class AsyncSubmitter:
     # -- side channels -----------------------------------------------------
 
     def warm(self, count: int) -> None:
-        """Dial pool connections ahead of the burst; fire and forget."""
+        """Dial pool connections ahead of the burst; fire and forget.
+
+        Rate-limited like the sync warm-up, and for the same reason: a
+        market handed back by signing re-enters place_dual every loop
+        tick, and every entry asks to warm - unguarded, three members
+        would bunch hundreds of dials into the seconds before the open,
+        on the loop thread whose next job is the first sends.
+        """
         from . import transport
 
         if not transport._installed:
             # Same marker the sync warm-up keys on: no live process has
             # installed the transport, so this is a test - do not dial out.
             return
+        with self._lock:
+            now = time.monotonic()
+            if (
+                self._last_warm is not None
+                and now - self._last_warm < transport.WARM_INTERVAL_SECONDS
+            ):
+                return
+            self._last_warm = now
         self.start()
         assert self._loop is not None
 
