@@ -270,9 +270,10 @@ def test_warm_is_rate_limited_like_the_sync_warm_up(monkeypatch):
     assert started == []
 
 
-def test_exchange_routes_non_batch_sends_through_the_loop(monkeypatch):
-    """Non-batch is the loop, unconditionally: the thread-per-send path was
-    removed after run22, and only batch mode keeps a dispatch thread."""
+def test_exchange_routes_every_send_through_the_loop(monkeypatch):
+    """The loop is the only road: the thread-per-send path was removed
+    after run22, and batch mode - the last dispatch-thread user - after
+    run23's post-mortem."""
     from polymarket_bot import exchange as exchange_module
     from polymarket_bot.exchange import Exchange
 
@@ -300,16 +301,4 @@ def test_exchange_routes_non_batch_sends_through_the_loop(monkeypatch):
 
     future = ex._submit_placement_request(["signed-args"])
     assert future.result(timeout=1) == [{"success": True}]
-    assert stub.calls == [[("prepared", "signed-args")]]
-
-    # Batch mode never touches the submitter: its endpoint takes the whole
-    # pair in one request and stays on its dispatch thread.
-    class BatchClient:
-        def post_orders(self, signed, post_only=False):
-            return [{"success": True}]
-
-    ex.entry_submission = "batch"
-    ex.client = BatchClient()
-    future = ex._submit_placement_request(["signed-args"])
-    assert future.result(timeout=5) == [{"success": True}]
     assert stub.calls == [[("prepared", "signed-args")]]

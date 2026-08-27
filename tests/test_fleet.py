@@ -160,8 +160,71 @@ class SlowSigningClient:
             for _ in signed
         ]
 
+    def post_order(self, order, order_type, post_only=False):
+        return self.post_orders([order], post_only=post_only)[0]
+
     def cancel_orders(self, order_ids):
         return {"canceled": list(order_ids)}
+
+
+@pytest.fixture(autouse=True)
+def _loop_backed_by_the_fake_client(monkeypatch):
+    """Production sends go through the event loop; these tests exercise
+    fleets of fake clients, so the submitter is a stand-in that fulfils
+    each leg from the fake client's post_order with the wrapping the real
+    loop applies (transient errors re-raised, other rejections folded to
+    the errorMsg dict)."""
+    from concurrent.futures import Future
+
+    from polymarket_bot import exchange as exchange_module
+    from polymarket_bot.exchange import _transient_submission_error
+    from py_clob_client_v2.exceptions import PolyApiException
+
+    class LoopStandIn:
+        def warm(self, count):
+            pass
+
+        def prepare(self, client, args):
+            return (client, args)
+
+        def submit(self, legs):
+            from threading import Thread as _Thread
+
+            future: Future = Future()
+
+            def work() -> None:
+                try:
+                    results = []
+                    for client, args in legs:
+                        try:
+                            results.append(
+                                client.post_order(
+                                    args.order, args.orderType, post_only=True
+                                )
+                            )
+                        except PolyApiException as exc:
+                            if _transient_submission_error(exc):
+                                raise
+                            payload = (
+                                exc.error_msg
+                                if isinstance(exc.error_msg, dict)
+                                else {}
+                            )
+                            message = str(
+                                payload.get("error") or exc.error_msg or exc
+                            )
+                            results.append(
+                                {"errorMsg": message, "success": False}
+                            )
+                except BaseException as exc:  # noqa: BLE001 - mirrors the loop
+                    future.set_exception(exc)
+                else:
+                    future.set_result(results)
+
+            _Thread(target=work, daemon=True).start()
+            return future
+
+    monkeypatch.setattr(exchange_module, "get_submitter", lambda: LoopStandIn())
 
 
 def _recording_exchange(sign_cost):
@@ -391,6 +454,13 @@ class AcceptingClient:
             {"success": True, "orderID": f"{item.order['token_id']}-id", "status": "live"}
             for item in signed
         ]
+
+    def post_order(self, order, order_type, post_only=False):
+        return {
+            "success": True,
+            "orderID": f"{order['token_id']}-id",
+            "status": "live",
+        }
 
     def cancel_orders(self, order_ids):
         return {"canceled": list(order_ids)}

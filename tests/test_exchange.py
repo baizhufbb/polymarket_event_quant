@@ -47,34 +47,40 @@ def _loop_backed_by_the_fake_client(monkeypatch):
             return (client, args)
 
         def submit(self, legs):
+            from threading import Thread as _Thread
+
             future: Future = Future()
-            try:
-                results = []
-                for client, args in legs:
-                    try:
-                        results.append(
-                            client.post_order(
-                                args.order, args.orderType, post_only=True
+
+            def work() -> None:
+                try:
+                    results = []
+                    for client, args in legs:
+                        try:
+                            results.append(
+                                client.post_order(
+                                    args.order, args.orderType, post_only=True
+                                )
                             )
-                        )
-                    except PolyApiException as exc:
-                        if _transient_submission_error(exc):
-                            raise
-                        payload = (
-                            exc.error_msg
-                            if isinstance(exc.error_msg, dict)
-                            else {}
-                        )
-                        message = str(
-                            payload.get("error") or exc.error_msg or exc
-                        )
-                        results.append(
-                            {"errorMsg": message, "success": False}
-                        )
-            except BaseException as exc:  # noqa: BLE001 - mirrors the loop
-                future.set_exception(exc)
-            else:
-                future.set_result(results)
+                        except PolyApiException as exc:
+                            if _transient_submission_error(exc):
+                                raise
+                            payload = (
+                                exc.error_msg
+                                if isinstance(exc.error_msg, dict)
+                                else {}
+                            )
+                            message = str(
+                                payload.get("error") or exc.error_msg or exc
+                            )
+                            results.append(
+                                {"errorMsg": message, "success": False}
+                            )
+                except BaseException as exc:  # noqa: BLE001 - mirrors the loop
+                    future.set_exception(exc)
+                else:
+                    future.set_result(results)
+
+            _Thread(target=work, daemon=True).start()
             return future
 
     monkeypatch.setattr(exchange_module, "get_submitter", lambda: LoopStandIn())
@@ -147,8 +153,16 @@ class StaggeredClient(FakeClient):
         super().__init__([])
         self.lock = Lock()
         self.posted_batches = []
+        self.posted_orders = []
         self.active = 0
         self.max_active = 0
+
+    def post_order(self, order, order_type, post_only=False):
+        with self.lock:
+            self.posted_orders.append(order)
+        responses = self.post_orders([None, None], post_only=post_only)
+        index = 0 if order["token_id"] == "up-token" else 1
+        return responses[index]
 
     def post_orders(self, signed, post_only=False):
         assert post_only is True
@@ -205,7 +219,7 @@ class UncappedInFlightClient(FakeClient):
                 self.release.set()
         try:
             self.release.wait(timeout=1)
-            if call_number == 17:
+            if call_number >= 17:
                 return [
                     {"success": True, "orderID": "up-order", "status": "live"},
                     {
@@ -229,6 +243,11 @@ class UncappedInFlightClient(FakeClient):
         finally:
             with self.lock:
                 self.active -= 1
+    def post_order(self, order, order_type, post_only=False):
+        responses = self.post_orders([None, None], post_only=post_only)
+        index = 0 if order["token_id"] == "up-token" else 1
+        return responses[index]
+
 
 
 def api_error(status_code: int, message: str) -> PolyApiException:
@@ -251,9 +270,10 @@ def test_staggered_submission_overlaps_identical_signed_batches() -> None:
     assert result.attempts >= 2
     assert exchange.client.max_active >= 2
     assert exchange.client.canceled == []
-    first = exchange.client.posted_batches[0]
-    assert all(batch[0] is first[0] for batch in exchange.client.posted_batches)
-    assert all(batch[1] is first[1] for batch in exchange.client.posted_batches)
+    ups = [o for o in exchange.client.posted_orders if o["token_id"] == "up-token"]
+    downs = [o for o in exchange.client.posted_orders if o["token_id"] == "down-token"]
+    assert ups and all(order is ups[0] for order in ups)
+    assert downs and all(order is downs[0] for order in downs)
 
 
 def test_staggered_submission_has_no_fixed_in_flight_limit() -> None:
@@ -366,6 +386,11 @@ class _StuckClient(FakeClient):
             {"success": True, "orderID": up_id, "status": "live"},
             {"success": True, "orderID": down_id, "status": "live"},
         ]
+
+    def post_order(self, order, order_type, post_only=False):
+        responses = self.post_orders([None, None], post_only=post_only)
+        index = 0 if order["token_id"] == "up-token" else 1
+        return responses[index]
 
 
 def test_the_loop_stops_outrunning_a_venue_that_has_gone_quiet(monkeypatch) -> None:
@@ -497,11 +522,12 @@ class _TickAskingClient:
             raise PolyApiException(response)
         return {"token_id": token_id, "side": order_args.side}
 
-    def post_orders(self, signed, post_only=False):
-        return [
-            {"success": True, "orderID": f"{item.order['token_id']}-id", "status": "live"}
-            for item in signed
-        ]
+    def post_order(self, order, order_type, post_only=False):
+        return {
+            "success": True,
+            "orderID": f"{order['token_id']}-id",
+            "status": "live",
+        }
 
     def cancel_orders(self, order_ids):
         self.canceled.extend(order_ids)
@@ -569,6 +595,11 @@ def test_priming_says_so_if_the_library_moves_its_tick_cache() -> None:
 
 class _SlowFirstReplyClient(FakeClient):
     """Answers not-ready until its budget is reached, then accepts."""
+
+    def post_order(self, order, order_type, post_only=False):
+        responses = self.post_orders([None, None], post_only=post_only)
+        index = 0 if order["token_id"] == "up-token" else 1
+        return responses[index]
 
     def __init__(self, stall: float, budget: int):
         super().__init__([])
@@ -676,386 +707,6 @@ def test_sends_stay_on_the_timetable_across_a_stall() -> None:
     assert len(stalled) == 1, f"expected one gap, the stall; got steps {steps}"
     assert stalled[0] >= stall / interval, f"the stall skipped too little: {steps}"
     assert all(step == 1 for step in steps if step <= 1), f"steps {steps}"
-
-
-def test_transient_batch_failure_immediately_reuses_the_same_signed_orders() -> None:
-    exchange = Exchange.__new__(Exchange)
-    exchange.client = TransientRetryClient(
-        [
-            {"success": True, "orderID": "up-order", "status": "live"},
-            {"success": True, "orderID": "down-order", "status": "live"},
-        ]
-    )
-
-    result = exchange.place_dual(MARKET, price=Decimal("0.01"), size=Decimal("100"))
-
-    assert result.complete
-    assert len(exchange.client.posted_batches) == 2
-    assert exchange.client.posted_batches[0][0] is exchange.client.posted_batches[1][0]
-    assert exchange.client.posted_batches[0][1] is exchange.client.posted_batches[1][1]
-
-
-def test_market_retry_reuses_the_same_signed_orders() -> None:
-    not_ready = {
-        "success": True,
-        "orderID": "",
-        "errorMsg": "the market is not yet ready to process new orders",
-    }
-    exchange = Exchange.__new__(Exchange)
-    exchange.client = SequencedClient(
-        [
-            [dict(not_ready), dict(not_ready)],
-            [
-                {"success": True, "orderID": "up-order", "status": "live"},
-                {"success": True, "orderID": "down-order", "status": "live"},
-            ],
-        ]
-    )
-
-    first = exchange.place_dual(
-        MARKET, price=Decimal("0.01"), size=Decimal("100")
-    )
-    second = exchange.place_dual(
-        MARKET, price=Decimal("0.01"), size=Decimal("100")
-    )
-
-    assert first.retryable
-    assert second.complete
-    assert len(exchange.client.created_order_args) == 2
-    assert exchange.client.posted_batches[0][0] is exchange.client.posted_batches[1][0]
-    assert exchange.client.posted_batches[0][1] is exchange.client.posted_batches[1][1]
-
-
-@pytest.mark.parametrize(
-    ("status_code", "message"),
-    ((400, "invalid token id"), (404, "market not found")),
-)
-def test_explicit_engine_rejection_reuses_the_same_signed_orders(
-    status_code: int,
-    message: str,
-) -> None:
-    exchange = Exchange.__new__(Exchange)
-    exchange.client = SequencedClient(
-        [
-            api_error(status_code, message),
-            [
-                {"success": True, "orderID": "up-order", "status": "live"},
-                {"success": True, "orderID": "down-order", "status": "live"},
-            ],
-        ]
-    )
-
-    first = exchange.place_dual(
-        MARKET, price=Decimal("0.01"), size=Decimal("100")
-    )
-    second = exchange.place_dual(
-        MARKET, price=Decimal("0.01"), size=Decimal("100")
-    )
-
-    assert first == PlacementResult((), message, retryable=True)
-    assert second.complete
-    assert len(exchange.client.created_order_args) == 2
-    assert exchange.client.posted_batches[0][0] is exchange.client.posted_batches[1][0]
-    assert exchange.client.posted_batches[0][1] is exchange.client.posted_batches[1][1]
-
-
-def test_engine_rejection_after_transient_failure_stays_retryable() -> None:
-    exchange = Exchange.__new__(Exchange)
-    exchange.client = SequencedClient(
-        [
-            PolyApiException(error_msg="Request exception!"),
-            api_error(400, "invalid token id"),
-            [
-                {"success": True, "orderID": "up-order", "status": "live"},
-                {"success": True, "orderID": "down-order", "status": "live"},
-            ],
-        ]
-    )
-
-    first = exchange.place_dual(
-        MARKET, price=Decimal("0.01"), size=Decimal("100")
-    )
-    second = exchange.place_dual(
-        MARKET, price=Decimal("0.01"), size=Decimal("100")
-    )
-
-    assert first == PlacementResult(
-        (), "invalid token id", retryable=True, attempts=2
-    )
-    assert second.complete
-    assert len(exchange.client.created_order_args) == 2
-    assert all(
-        batch[0] is exchange.client.posted_batches[0][0]
-        and batch[1] is exchange.client.posted_batches[0][1]
-        for batch in exchange.client.posted_batches
-    )
-
-
-def test_rate_limit_response_retries_the_same_signed_orders() -> None:
-    exchange = Exchange.__new__(Exchange)
-    exchange.client = SequencedClient(
-        [
-            api_error(429, "rate limit exceeded"),
-            [
-                {"success": True, "orderID": "up-order", "status": "live"},
-                {"success": True, "orderID": "down-order", "status": "live"},
-            ],
-        ]
-    )
-
-    result = exchange.place_dual(
-        MARKET, price=Decimal("0.01"), size=Decimal("100")
-    )
-
-    assert result.complete
-    assert result.attempts == 2
-    first, second = exchange.client.posted_batches
-    assert first[0] is second[0]
-    assert first[1] is second[1]
-
-
-def test_ambiguous_retry_reuses_the_same_signed_orders() -> None:
-    exchange = Exchange.__new__(Exchange)
-    exchange.client = SequencedClient(
-        [
-            PolyApiException(error_msg="Request exception!"),
-            PolyApiException(error_msg="Request exception!"),
-            [
-                {"success": True, "orderID": "up-order", "status": "live"},
-                {"success": True, "orderID": "down-order", "status": "live"},
-            ],
-        ]
-    )
-    exchange.open_orders = lambda condition_id: []
-
-    with pytest.raises(AmbiguousPlacementError):
-        exchange.place_dual(MARKET, price=Decimal("0.01"), size=Decimal("100"))
-    reconciliation = exchange.reconcile_ambiguous_dual(
-        MARKET, price=Decimal("0.01"), size=Decimal("100")
-    )
-    result = exchange.place_dual(
-        MARKET, price=Decimal("0.01"), size=Decimal("100")
-    )
-
-    assert reconciliation.retryable
-    assert result.complete
-    assert len(exchange.client.created_order_args) == 2
-    assert all(
-        batch[0] is exchange.client.posted_batches[0][0]
-        and batch[1] is exchange.client.posted_batches[0][1]
-        for batch in exchange.client.posted_batches
-    )
-
-
-def test_http_protocol_failure_is_retryable_with_the_same_signed_orders() -> None:
-    exchange = Exchange.__new__(Exchange)
-    exchange.client = SequencedClient(
-        [
-            httpx.RemoteProtocolError("server disconnected"),
-            [
-                {"success": True, "orderID": "up-order", "status": "live"},
-                {"success": True, "orderID": "down-order", "status": "live"},
-            ],
-        ]
-    )
-    exchange.open_orders = lambda condition_id: []
-
-    with pytest.raises(AmbiguousPlacementError) as raised:
-        exchange.place_dual(MARKET, price=Decimal("0.01"), size=Decimal("100"))
-    reconciliation = exchange.reconcile_ambiguous_dual(
-        MARKET, price=Decimal("0.01"), size=Decimal("100")
-    )
-    result = exchange.place_dual(
-        MARKET, price=Decimal("0.01"), size=Decimal("100")
-    )
-
-    assert raised.value.retryable
-    assert reconciliation.retryable
-    assert result.complete
-    assert len(exchange.client.created_order_args) == 2
-    assert all(
-        batch[0] is exchange.client.posted_batches[0][0]
-        and batch[1] is exchange.client.posted_batches[0][1]
-        for batch in exchange.client.posted_batches
-    )
-
-
-def test_incomplete_batch_response_is_reconciled_before_retry() -> None:
-    exchange = Exchange.__new__(Exchange)
-    exchange.client = SequencedClient(
-        [
-            [{"success": True, "orderID": "up-order", "status": "live"}],
-            [
-                {"success": True, "orderID": "up-order", "status": "live"},
-                {"success": True, "orderID": "down-order", "status": "live"},
-            ],
-        ]
-    )
-    exchange.open_orders = lambda condition_id: []
-
-    with pytest.raises(AmbiguousPlacementError):
-        exchange.place_dual(MARKET, price=Decimal("0.01"), size=Decimal("100"))
-    reconciliation = exchange.reconcile_ambiguous_dual(
-        MARKET, price=Decimal("0.01"), size=Decimal("100")
-    )
-    result = exchange.place_dual(
-        MARKET, price=Decimal("0.01"), size=Decimal("100")
-    )
-
-    assert reconciliation.retryable
-    assert result.complete
-    assert len(exchange.client.created_order_args) == 2
-
-
-def test_terminal_rejection_after_ambiguous_attempt_is_not_requeued() -> None:
-    exchange = Exchange.__new__(Exchange)
-    exchange.client = SequencedClient(
-        [
-            PolyApiException(error_msg="Request exception!"),
-            api_error(400, "rejected"),
-        ]
-    )
-    exchange.open_orders = lambda condition_id: []
-
-    with pytest.raises(AmbiguousPlacementError) as raised:
-        exchange.place_dual(MARKET, price=Decimal("0.01"), size=Decimal("100"))
-    result = exchange.reconcile_ambiguous_dual(
-        MARKET,
-        price=Decimal("0.01"),
-        size=Decimal("100"),
-        retryable_if_missing=raised.value.retryable,
-    )
-
-    assert not raised.value.retryable
-    assert not result.retryable
-
-
-def test_duplicate_responses_recover_the_original_order_ids() -> None:
-    up_id = "0x" + "1" * 64
-    down_id = "0x" + "2" * 64
-    exchange = Exchange.__new__(Exchange)
-    exchange.client = FakeClient(
-        [
-            {
-                "success": False,
-                "orderID": "",
-                "errorMsg": f"order {up_id} is invalid. Duplicated.",
-            },
-            {
-                "success": False,
-                "orderID": "",
-                "errorMsg": f"order {down_id} is invalid. Duplicated.",
-            },
-        ]
-    )
-
-    result = exchange.place_dual(
-        MARKET, price=Decimal("0.01"), size=Decimal("100")
-    )
-
-    assert result.complete
-    assert {order.order_id for order in result.orders} == {up_id, down_id}
-
-
-def test_business_rejection_is_terminal_and_not_retried() -> None:
-    class RejectedClient(FakeClient):
-        def __init__(self):
-            super().__init__([])
-            self.calls = 0
-
-        def post_orders(self, signed, post_only=False):
-            self.calls += 1
-            request = httpx.Request("POST", "https://clob.polymarket.com/orders")
-            response = httpx.Response(400, json={"error": "rejected"}, request=request)
-            raise PolyApiException(response)
-
-    exchange = Exchange.__new__(Exchange)
-    exchange.client = RejectedClient()
-
-    result = exchange.place_dual(
-        MARKET, price=Decimal("0.01"), size=Decimal("100")
-    )
-
-    assert exchange.client.calls == 1
-    assert not result.complete
-    assert not result.retryable
-    assert "rejected" in result.error
-
-
-def test_partial_batch_is_immediately_canceled() -> None:
-    exchange = Exchange.__new__(Exchange)
-    exchange.client = FakeClient(
-        [
-            {"success": True, "orderID": "up-order", "status": "live"},
-            {"success": False, "errorMsg": "rejected"},
-        ]
-    )
-    result = exchange.place_dual(MARKET, price=Decimal("0.01"), size=Decimal("100"))
-    assert not result.complete
-    assert not result.retryable
-    assert exchange.client.canceled == ["up-order"]
-
-
-def test_market_not_ready_pair_is_retryable() -> None:
-    exchange = Exchange.__new__(Exchange)
-    response = {
-        "success": True,
-        "orderID": "",
-        "errorMsg": "the market is not yet ready to process new orders",
-    }
-    exchange.client = FakeClient([dict(response), dict(response)])
-
-    result = exchange.place_dual(MARKET, price=Decimal("0.01"), size=Decimal("100"))
-
-    assert not result.complete
-    assert result.orders == ()
-    assert result.retryable
-    assert exchange.client.canceled == []
-
-
-def test_missing_orderbook_pair_is_retryable() -> None:
-    exchange = Exchange.__new__(Exchange)
-    exchange.client = FakeClient(
-        [
-            {
-                "success": True,
-                "orderID": "",
-                "errorMsg": "the orderbook up-token does not exist",
-            },
-            {
-                "success": True,
-                "orderID": "",
-                "errorMsg": "the orderbook down-token does not exist",
-            },
-        ]
-    )
-
-    result = exchange.place_dual(MARKET, price=Decimal("0.01"), size=Decimal("100"))
-
-    assert not result.complete
-    assert result.orders == ()
-    assert result.retryable
-    assert exchange.client.canceled == []
-
-
-def test_entries_are_post_only_gtc_without_expiration() -> None:
-    exchange = Exchange.__new__(Exchange)
-    exchange.client = FakeClient(
-        [
-            {"success": True, "orderID": "up-order", "status": "live"},
-            {"success": True, "orderID": "down-order", "status": "live"},
-        ]
-    )
-
-    result = exchange.place_dual(MARKET, price=Decimal("0.01"), size=Decimal("100"))
-
-    assert result.complete
-    assert [args.expiration for args in exchange.client.created_order_args] == [0, 0]
-    assert [options.neg_risk for options in exchange.client.created_order_options] == [
-        False,
-        False,
-    ]
-    assert exchange.client.posted_batch_types == ["GTC", "GTC"]
 
 
 def test_ambiguous_submission_adopts_exact_pair() -> None:
@@ -1276,11 +927,12 @@ class _NotReadyThenSigningClient:
             raise PolyApiException(response)
         return {"token_id": order_args.token_id, "side": order_args.side}
 
-    def post_orders(self, signed, post_only=False):
-        return [
-            {"success": True, "orderID": f"{item.order['token_id']}-id", "status": "live"}
-            for item in signed
-        ]
+    def post_order(self, order, order_type, post_only=False):
+        return {
+            "success": True,
+            "orderID": f"{order['token_id']}-id",
+            "status": "live",
+        }
 
     def cancel_orders(self, order_ids):
         self.canceled.extend(order_ids)
@@ -1447,3 +1099,183 @@ def test_signing_does_not_go_to_the_venue_for_the_protocol_version() -> None:
     # and warming is idempotent: a second market does not ask again
     exchange._prime_tick_size(MARKET)
     assert exchange.client.version_lookups == 1
+
+
+def _staggered_market(end_in_seconds: int) -> Market:
+    import time as time_module
+
+    now = int(time_module.time())
+    return Market(
+        slug=f"btc-updown-5m-{now}",
+        condition_id="0xcondition",
+        start_ts=now - 60,
+        end_ts=now + end_in_seconds,
+        up_token_id="up-token",
+        down_token_id="down-token",
+        min_size=Decimal("5"),
+        tick_size=Decimal("0.01"),
+    )
+
+
+class _PerTokenClient:
+    """Answers each leg by token: accepted, engine-not-ready, or rejected."""
+
+    def __init__(self, behaviour):
+        self.behaviour = behaviour
+        self.canceled = []
+        self.created_order_args = []
+        self.created_order_options = []
+        self.posted = []
+
+    def create_order(self, order_args, options):
+        self.created_order_args.append(order_args)
+        self.created_order_options.append(options)
+        return {"token_id": order_args.token_id, "side": order_args.side}
+
+    def post_order(self, order, order_type, post_only=False):
+        self.posted.append((order["token_id"], order_type, post_only))
+        kind = self.behaviour[order["token_id"]]
+        if kind == "accept":
+            return {
+                "success": True,
+                "orderID": f"{order['token_id']}-id",
+                "status": "live",
+            }
+        if kind == "transient":
+            raise PolyApiException(error_msg="Request exception!")
+        if kind == "not_ready":
+            return {
+                "success": True,
+                "orderID": "",
+                "errorMsg": "the market is not yet ready to process new orders",
+            }
+        return {"success": False, "orderID": "", "errorMsg": "rejected"}
+
+    def cancel_orders(self, order_ids):
+        self.canceled.extend(order_ids)
+
+
+def test_partial_pair_is_canceled_when_the_market_ends() -> None:
+    """One leg registered, the other never made it: the resting single leg
+    is a naked position, so finalize cancels it rather than keep it."""
+    exchange = Exchange.__new__(Exchange)
+    exchange.entry_submission = "single"
+    exchange.client = _PerTokenClient(
+        {"up-token": "accept", "down-token": "not_ready"}
+    )
+
+    result = exchange.place_dual(
+        _staggered_market(end_in_seconds=1),
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        submission_interval_ms=Decimal("1"),
+    )
+
+    assert not result.complete
+    assert not result.retryable
+    assert exchange.client.canceled == ["up-token-id"]
+
+
+def test_business_rejection_stops_the_loop_and_is_terminal() -> None:
+    exchange = Exchange.__new__(Exchange)
+    exchange.entry_submission = "single"
+    exchange.client = _PerTokenClient(
+        {"up-token": "reject", "down-token": "reject"}
+    )
+
+    result = exchange.place_dual(
+        _staggered_market(end_in_seconds=60),
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        submission_interval_ms=Decimal("1"),
+    )
+
+    assert not result.complete
+    assert not result.retryable
+    assert exchange.client.canceled == []
+
+
+def test_entries_are_post_only_gtc_without_expiration() -> None:
+    exchange = Exchange.__new__(Exchange)
+    exchange.entry_submission = "single"
+    exchange.client = _PerTokenClient(
+        {"up-token": "accept", "down-token": "accept"}
+    )
+
+    result = exchange.place_dual(
+        _staggered_market(end_in_seconds=60),
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        submission_interval_ms=Decimal("1"),
+    )
+
+    assert result.complete
+    assert [args.expiration for args in exchange.client.created_order_args] == [0, 0]
+    assert [
+        options.neg_risk for options in exchange.client.created_order_options
+    ] == [False, False]
+    assert {(order_type, post_only) for _, order_type, post_only in exchange.client.posted} == {
+        ("GTC", True)
+    }
+
+
+def test_engine_not_ready_phrases_stay_recoverable() -> None:
+    """The venue words "not yet open" several ways; every phrasing must keep
+    the loop knocking instead of aborting the market."""
+    from polymarket_bot.exchange import _order_engine_not_ready
+
+    for message in (
+        "the market is not yet ready to process new orders",
+        "the orderbook up-token does not exist",
+    ):
+        assert _order_engine_not_ready(
+            {"success": True, "orderID": "", "errorMsg": message}
+        )
+    assert not _order_engine_not_ready(
+        {"success": False, "orderID": "", "errorMsg": "rejected"}
+    )
+
+
+def test_a_retryable_failure_reuses_the_same_signed_orders() -> None:
+    """Re-signing on retry would change the order fingerprint and orphan any
+    copy the venue already holds; the cache must hand back the same tickets.
+
+    The retryable exit of the staggered loop is the ambiguous one: nothing
+    but transient trouble and the market clock running out."""
+    exchange = Exchange.__new__(Exchange)
+    exchange.entry_submission = "single"
+    behaviour = {"up-token": "transient", "down-token": "transient"}
+    exchange.client = _PerTokenClient(behaviour)
+    market = _staggered_market(end_in_seconds=1)
+
+    with pytest.raises(AmbiguousPlacementError) as caught:
+        exchange.place_dual(
+            market,
+            price=Decimal("0.01"),
+            size=Decimal("100"),
+            submission_interval_ms=Decimal("1"),
+        )
+    assert caught.value.retryable
+
+    behaviour["up-token"] = "accept"
+    behaviour["down-token"] = "accept"
+    market = replace_market_end(market, end_in_seconds=60)
+    second = exchange.place_dual(
+        market,
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        submission_interval_ms=Decimal("1"),
+    )
+
+    assert second.complete
+    # signed exactly once per leg across both entries
+    assert len(exchange.client.created_order_args) == 2
+
+
+def replace_market_end(market: Market, *, end_in_seconds: int) -> Market:
+    import dataclasses
+    import time as time_module
+
+    return dataclasses.replace(
+        market, end_ts=int(time_module.time()) + end_in_seconds
+    )

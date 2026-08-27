@@ -72,7 +72,7 @@ def _classify_cancel_result(result: object) -> tuple[list[str], list[str]]:
 
 class BotService:
     placement_interval_ms = DEFAULT_PLACEMENT_INTERVAL_MS
-    entry_submission = "batch"
+    entry_submission = "single"
     fleet: Fleet | None = None
 
     def __init__(
@@ -86,7 +86,7 @@ class BotService:
         lookahead_minutes: int,
         placement_order: str,
         placement_interval_ms: Decimal,
-        entry_submission: str = "batch",
+        entry_submission: str = "single",
         fleet: Fleet | None = None,
         cancel_before_end_seconds: int,
         live: bool,

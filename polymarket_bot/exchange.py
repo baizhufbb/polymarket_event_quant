@@ -5,7 +5,6 @@ import re
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, wait
 from decimal import Decimal
-from threading import Thread
 
 import requests
 from py_clob_client_v2 import (
@@ -88,7 +87,7 @@ class _SigningNotReady(RuntimeError):
 
 
 class AmbiguousPlacementError(RuntimeError):
-    """The exchange may have received a batch whose response was lost."""
+    """The exchange may have received a submission whose response was lost."""
 
     def __init__(
         self,
@@ -184,7 +183,7 @@ def classify_response(response: object) -> str:
 
 class Exchange:
     _next_placement_submission = 0.0
-    entry_submission = "batch"
+    entry_submission = "single"
     attempt_trace = None
     # An account alone in the process owns the whole pool; Fleet narrows this
     # to a share when it builds its members.
@@ -273,10 +272,9 @@ class Exchange:
         phase_offset_ms: Decimal = Decimal(0),
     ) -> PlacementResult:
         warm_connections()
-        if self.entry_submission != "batch":
-            # The hot path sends through the event loop's own pool, which
-            # dials its own connections; warm it alongside the sync pool.
-            get_submitter().warm(WARM_CONNECTIONS)
+        # The hot path sends through the event loop's own pool, which
+        # dials its own connections; warm it alongside the sync pool.
+        get_submitter().warm(WARM_CONNECTIONS)
         options = PartialCreateOrderOptions(
             tick_size=str(market.tick_size),
             neg_risk=False,
@@ -296,74 +294,17 @@ class Exchange:
                 return PlacementResult((), str(exc), retryable=True, attempts=1)
             submissions[submission_key] = signed
 
-        if submission_interval_ms is not None:
-            if submission_interval_ms <= 0:
-                raise ValueError("submission_interval_ms must be above 0")
-            return self._place_dual_staggered(
-                specifications,
-                signed,
-                price=price,
-                size=size,
-                submission_interval_ms=submission_interval_ms,
-                grid_origin=grid_origin,
-                phase_offset_ms=phase_offset_ms,
-                market_end_ts=market.end_ts,
-                submission_key=submission_key,
-                submissions=submissions,
-            )
-
-        attempts = 1
-        try:
-            responses = self.client.post_orders(signed, post_only=True)
-        except PolyApiException as exc:
-            not_ready_error = _order_engine_not_ready_error(exc)
-            if not_ready_error:
-                return PlacementResult(
-                    (), not_ready_error, retryable=True, attempts=attempts
-                )
-            if not _transient_submission_error(exc):
-                submissions.pop(submission_key, None)
-                return PlacementResult(
-                    (),
-                    f"{type(exc).__name__}: {exc}",
-                    attempts=attempts,
-                )
-            attempts += 1
-            try:
-                responses = self.client.post_orders(signed, post_only=True)
-            except Exception as retry_exc:
-                retryable = True
-                if isinstance(retry_exc, PolyApiException):
-                    not_ready_error = _order_engine_not_ready_error(retry_exc)
-                    if not_ready_error:
-                        return PlacementResult(
-                            (),
-                            not_ready_error,
-                            retryable=True,
-                            attempts=attempts,
-                        )
-                    retryable = _transient_submission_error(retry_exc)
-                raise AmbiguousPlacementError(
-                    f"transient submission retry failed: "
-                    f"initial={exc}; retry={type(retry_exc).__name__}: {retry_exc}",
-                    retryable=retryable,
-                    attempts=attempts,
-                ) from retry_exc
-        except Exception as exc:
-            raise AmbiguousPlacementError(
-                f"submission response unavailable: {type(exc).__name__}: {exc}",
-                attempts=attempts,
-            ) from exc
-
-        result = self._parse_dual_responses(
+        if submission_interval_ms is None or submission_interval_ms <= 0:
+            raise ValueError("submission_interval_ms must be above 0")
+        return self._place_dual_staggered(
             specifications,
-            responses,
+            signed,
             price=price,
             size=size,
-            attempts=attempts,
-        )
-        return self._finalize_dual_result(
-            result,
+            submission_interval_ms=submission_interval_ms,
+            grid_origin=grid_origin,
+            phase_offset_ms=phase_offset_ms,
+            market_end_ts=market.end_ts,
             submission_key=submission_key,
             submissions=submissions,
         )
@@ -694,31 +635,12 @@ class Exchange:
         self,
         signed: list[PostOrdersV2Args],
     ) -> Future:
-        if self.entry_submission != "batch":
-            # A request in flight costs an event-loop entry, not two OS
-            # threads: run22 held ~460 requests in a venue slow spell and
-            # the ~930 carrier threads starved the one-core box to death.
-            submitter = get_submitter()
-            legs = [submitter.prepare(self.client, args) for args in signed]
-            return submitter.submit(legs)
-        # Batch mode is the one entry mode still carried by a thread: its
-        # endpoint takes the whole pair in one request, it is not used by
-        # the fleet, and one dispatch thread per in-flight send is the cost
-        # the thread test budgets for.
-        future: Future = Future()
-
-        def submit() -> None:
-            if not future.set_running_or_notify_cancel():
-                return
-            try:
-                response = self.client.post_orders(signed, post_only=True)
-            except BaseException as exc:
-                future.set_exception(exc)
-            else:
-                future.set_result(response)
-
-        Thread(target=submit, name="placement", daemon=True).start()
-        return future
+        # A request in flight costs an event-loop entry, not two OS
+        # threads: run22 held ~460 requests in a venue slow spell and
+        # the ~930 carrier threads starved the one-core box to death.
+        submitter = get_submitter()
+        legs = [submitter.prepare(self.client, args) for args in signed]
+        return submitter.submit(legs)
 
     def _trace(
         self,

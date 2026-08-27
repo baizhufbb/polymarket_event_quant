@@ -122,7 +122,7 @@ def _parser() -> argparse.ArgumentParser:
         metavar="MILLISECONDS",
         help=(
             "delay between submission ticks; single mode sends one pending "
-            "leg per tick, batch mode sends the signed pair; "
+            "leg per tick; "
             f"default {DEFAULT_PLACEMENT_INTERVAL_MS} ms"
         ),
     )
@@ -133,12 +133,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--entry-submission",
-        choices=("batch", "single", "solo-up", "solo-down"),
-        default="batch",
+        choices=("single", "solo-up", "solo-down"),
+        default="single",
         help=(
-            "batch submits the pair in one request, single rotates both legs "
-            "through single-order requests, solo-up/solo-down trade only that "
-            "leg; default batch"
+            "single rotates both legs through single-order requests, "
+            "solo-up/solo-down trade only that leg; default single"
         ),
     )
     run.add_argument(
