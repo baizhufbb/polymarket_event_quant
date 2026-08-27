@@ -65,7 +65,6 @@ def test_run_limits_are_optional_cli_parameters() -> None:
             "1",
         ]
     )
-    assert args.hours is None
     assert args.max_reserved_usd is None
     assert args.max_daily_filled_cost is None
     assert args.lookahead_minutes == 40

@@ -81,7 +81,6 @@ class BotService:
         database: BotDatabase,
         plan: TradePlan,
         *,
-        hours: Decimal | None,
         max_reserved_usd: Decimal | None,
         max_daily_filled_cost: Decimal | None,
         lookahead_minutes: int,
@@ -96,7 +95,6 @@ class BotService:
         self.config = config
         self.database = database
         self.plan = plan
-        self.hours = hours
         self.max_reserved_usd = max_reserved_usd
         self.max_daily_filled_cost = max_daily_filled_cost
         self.lookahead_minutes = lookahead_minutes
@@ -187,7 +185,6 @@ class BotService:
     def run(self) -> None:
         mode = "live" if self.live else "dry-run"
         run_config = self.plan.as_dict() | {
-            "hours": str(self.hours) if self.hours is not None else None,
             "max_reserved_usd": (
                 str(self.max_reserved_usd)
                 if self.max_reserved_usd is not None
@@ -206,11 +203,6 @@ class BotService:
             "early_activation_probe": self.market_activation_worker is not None,
         }
         self.run_id = self.database.start_run(mode, run_config)
-        deadline = (
-            time.monotonic() + float(self.hours * Decimal("3600"))
-            if self.hours is not None
-            else None
-        )
         self.database.event(self.run_id, "INFO", "run_started", details={"mode": mode})
         if self.geoblock_worker:
             self.geoblock_worker.start()
@@ -224,7 +216,10 @@ class BotService:
             self.reconciliation_worker.start()
         cancel_on_shutdown = False
         try:
-            while deadline is None or time.monotonic() < deadline:
+            # The session's duration is owned by the launcher's external
+            # timeout signal, which can interrupt even a wedged loop; an
+            # in-process deadline could only be checked between ticks.
+            while True:
                 self.wake_event.clear()
                 self._tick()
                 self.wake_event.wait(0.2)

@@ -103,7 +103,6 @@ def _parser() -> argparse.ArgumentParser:
         help="repeatable exit rung; omitted fractions remain held to resolution",
     )
     run.add_argument("--usd-per-side", type=_decimal_arg, required=True)
-    run.add_argument("--hours", type=_decimal_arg)
     run.add_argument("--max-reserved-usd", type=_decimal_arg)
     run.add_argument("--max-daily-filled-cost", type=_decimal_arg)
     run.add_argument(
@@ -257,8 +256,7 @@ def main() -> None:
                     database,
                     plan,
                     lookahead_minutes=args.lookahead_minutes,
-                    hours=args.hours,
-                    logger=_rotating_logger(
+                        logger=_rotating_logger(
                         "polymarket_paper", project_root / "logs" / "paper.log"
                     ),
                 ).run()
@@ -283,7 +281,6 @@ def main() -> None:
         )
         plan.validate()
         optional_positive = {
-            "--hours": args.hours,
             "--max-reserved-usd": args.max_reserved_usd,
             "--max-daily-filled-cost": args.max_daily_filled_cost,
         }
@@ -332,7 +329,6 @@ def main() -> None:
                 config,
                 database,
                 plan,
-                hours=args.hours,
                 max_reserved_usd=args.max_reserved_usd,
                 max_daily_filled_cost=args.max_daily_filled_cost,
                 lookahead_minutes=args.lookahead_minutes,
