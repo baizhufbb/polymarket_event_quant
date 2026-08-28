@@ -231,7 +231,10 @@ class AsyncSubmitter:
                     leg.url, content=leg.body_bytes, headers=leg.headers()
                 )
         except (httpx.RequestError, TimeoutError) as exc:
-            logger.error("[async-submitter] request error: %s", exc)
+            logger.error(
+                "[async-submitter] request error: %s",
+                str(exc) or type(exc).__name__,
+            )
             raise PolyApiException(error_msg="Request exception!")
         if response.status_code != 200:
             logger.error(

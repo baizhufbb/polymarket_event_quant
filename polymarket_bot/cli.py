@@ -169,13 +169,27 @@ class _ExpectedOrderEngineFilter(logging.Filter):
     """Keep the human log readable during the pre-open hammering.
 
     These replies are expected thousands of times per market. They stay in
-    logs/attempts.jsonl, which records every attempt regardless.
+    logs/attempts.jsonl, which records every attempt regardless. The same
+    goes for the event loop's lifetime kills: a request cancelled at
+    TOTAL_LIFETIME_SECONDS is routine traffic during a venue slow spell -
+    run25 wrote three hundred thousand of them in one night - and the
+    trace already records each one as a transport_error.
     """
 
-    EXPECTED = ("invalid token id", "market not found", "trading is disabled")
+    NAMES = (
+        "py_clob_client_v2.http_helpers.helpers",
+        "polymarket_bot.async_submitter",
+    )
+    EXPECTED = (
+        "invalid token id",
+        "market not found",
+        "trading is disabled",
+        "request error: timeouterror",
+        "request error: cancellederror",
+    )
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if record.name != "py_clob_client_v2.http_helpers.helpers":
+        if record.name not in self.NAMES:
             return True
         message = record.getMessage().lower()
         return not any(expected in message for expected in self.EXPECTED)
@@ -183,8 +197,9 @@ class _ExpectedOrderEngineFilter(logging.Filter):
 
 def _logger(config: BotConfig) -> logging.Logger:
     logger = _rotating_logger("polymarket_bot", config.log_path)
-    clob_logger = logging.getLogger("py_clob_client_v2.http_helpers.helpers")
-    clob_logger.addFilter(_ExpectedOrderEngineFilter())
+    expected_filter = _ExpectedOrderEngineFilter()
+    for name in _ExpectedOrderEngineFilter.NAMES:
+        logging.getLogger(name).addFilter(expected_filter)
     return logger
 
 

@@ -48,3 +48,39 @@ def test_a_cadence_finer_than_the_loop_can_hold_is_rejected() -> None:
     for bad in ("0", "0.5", "0.001", "0.0001"):
         with pytest.raises(argparse.ArgumentTypeError):
             cli._placement_interval_ms_arg(bad)
+
+
+def test_the_noise_filter_covers_both_chatty_loggers() -> None:
+    """Expected knocking replies and lifetime kills are routine traffic,
+    fully recorded in attempts.jsonl; the human log must not drown in
+    them - run25 wrote three hundred thousand blank-reason lines in one
+    night. Real errors must still pass."""
+    import logging
+
+    from polymarket_bot.cli import _ExpectedOrderEngineFilter
+
+    noise_filter = _ExpectedOrderEngineFilter()
+
+    def record(name, message):
+        return logging.LogRecord(name, logging.ERROR, "", 0, message, (), None)
+
+    submitter = "polymarket_bot.async_submitter"
+    helpers = "py_clob_client_v2.http_helpers.helpers"
+
+    # routine traffic: silenced
+    assert not noise_filter.filter(
+        record(submitter, "[async-submitter] request error: TimeoutError")
+    )
+    assert not noise_filter.filter(
+        record(submitter, 'request error status=400 body={"error":"invalid token id"}')
+    )
+    assert not noise_filter.filter(record(helpers, "... market not found ..."))
+
+    # real trouble: passes
+    assert noise_filter.filter(
+        record(submitter, "[async-submitter] request error: ConnectError")
+    )
+    assert noise_filter.filter(record(helpers, "request error status=500 boom"))
+
+    # unrelated loggers: untouched
+    assert noise_filter.filter(record("polymarket_bot", "market not found"))
