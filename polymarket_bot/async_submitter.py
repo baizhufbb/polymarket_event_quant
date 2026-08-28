@@ -60,7 +60,7 @@ logger = logging.getLogger(__name__)
 # moment it was sent for; the venue's trickling replies lived up to 69 s in
 # the field. Cancelling is not losing the order: the next send returns
 # "Duplicated" with the order's id, and the user streams report placements.
-TOTAL_LIFETIME_SECONDS = 3.0
+TOTAL_LIFETIME_SECONDS = 30.0
 _VERSION_HEAL_INTERVAL_SECONDS = 30.0
 
 
