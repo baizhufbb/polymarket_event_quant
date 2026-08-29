@@ -48,19 +48,15 @@ FLEET_ACCOUNTS = 5
 WORST_REPLY_SECONDS = 1.0
 FASTEST_INTERVAL_SECONDS = 0.025
 WARM_CONNECTIONS = 48
-MAX_CONNECTIONS = 1280
+MAX_CONNECTIONS = 512
 # The sync pool no longer carries placements - those go through the event
 # loop's own pool, sized by MAX_CONNECTIONS above. What is left here is
 # cancels, reconciliation reads and the warm-up: small, bursty at market
 # end, never hundreds deep.
 SYNC_POOL_CONNECTIONS = 64
-# Sized from what the venue actually answers: 97% of sends get a real
-# reply, median 3.7s, mean about 6.5s. At 40 sends a second that is
-# ~260 outstanding per account in steady state, so a 154 cap made the
-# send loop skip a quarter of its slots - and a skipped slot punches a
-# 25-60ms hole in the fleet's knocking, which the venue's backlog then
-# amplifies into hundreds of milliseconds of queue position.
-ACCOUNT_BUDGET_CEILING = 400
+# No account needs more outstanding requests than a 4-second spell fills;
+# past the ceiling the extra would only buy thread count, not coverage.
+ACCOUNT_BUDGET_CEILING = 160
 
 
 def in_flight_budget(accounts: int) -> int:
@@ -68,8 +64,9 @@ def in_flight_budget(accounts: int) -> int:
 
     What is left of the pool once the warm-up has its slice, divided by the
     accounts actually running - not by a constant, so a fleet of any size
-    gets an honest share - and clipped at the ceiling, which is set from
-    the reply times the venue actually produces.
+    gets an honest share - and clipped at the ceiling, because outstanding
+    requests cost threads and nothing above a 4-second spell's worth of
+    them buys any coverage.
     """
     usable = MAX_CONNECTIONS - WARM_CONNECTIONS
     return max(4, min(usable // max(1, accounts), ACCOUNT_BUDGET_CEILING))

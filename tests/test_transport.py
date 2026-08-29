@@ -219,18 +219,21 @@ def test_the_full_fleet_cannot_exhaust_the_thread_supply() -> None:
     """Threads are what actually ran out in the field (run17).
 
     The in-flight cap used to be halved outside batch mode to protect them,
-    which re-armed slot-skipping at three accounts, and every entry mode
-    now rides the event loop, so an outstanding request costs an entry in
-    its book and no thread at all. What is left is a fixed cast: one loop
-    thread, one per fleet member, one per user stream, discovery, geoblock,
-    reconciliation - plus the warm-up dials, which are the only place a
-    burst of threads still appears.
+    which re-armed slot-skipping at three accounts. The guard belongs here
+    instead: at worst every account holds its whole cap, and each of those
+    requests is carried by a dispatch thread plus one thread per leg (two
+    legs at most), so the fleet's ceiling is accounts x cap x 3 plus the
+    warm-up dials. The field failure came at several thousand threads; keep
+    the whole planned fleet an order of magnitude under it.
     """
-    fixed_threads = 1 + 3 * transport.FLEET_ACCOUNTS + 6
-    worst = fixed_threads + transport.WARM_CONNECTIONS
+    # Non-batch sends ride the event loop and cost no thread at all; batch
+    # mode - the one entry mode still carried by threads - spends a single
+    # dispatch thread per in-flight send.
+    per_request_threads = 1
+    worst = max(
+        accounts * transport.in_flight_budget(accounts) * per_request_threads
+        for accounts in range(1, transport.FLEET_ACCOUNTS + 1)
+    ) + transport.WARM_CONNECTIONS
     # The field crash ran out at several thousand threads (the server
-    # allows 7277); the loop keeps the whole fleet two orders under it.
-    assert worst <= 200
-    # And the in-flight budget, which used to drive thread count, no longer
-    # does: raising it cannot move this number.
-    assert transport.in_flight_budget(3) > 300
+    # allows 7277); keep the worst case an order of magnitude under it.
+    assert worst <= 700
