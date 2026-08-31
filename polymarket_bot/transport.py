@@ -49,6 +49,22 @@ WORST_REPLY_SECONDS = 1.0
 FASTEST_INTERVAL_SECONDS = 0.025
 WARM_CONNECTIONS = 48
 MAX_CONNECTIONS = 512
+# Idle connections are pruned by three rules, and only one of them is prompt.
+# A connection the venue closed while it sat idle stays "idle" to us - our
+# state machine never learns of the peer's FIN until something tries to use
+# the socket - so is_closed() does not catch it, and has_expired() waits out
+# the full keepalive. That leaves "close surplus idle connections", which
+# fires only when the idle count exceeds this number. Setting it equal to
+# MAX_CONNECTIONS made the condition unreachable: the idle count is bounded
+# by the pool size, so it can never exceed it, and every venue-closed socket
+# held a slot for the whole 300s expiry. Run31 (six hours, three accounts)
+# ended with 365 of 512 slots in CLOSE-WAIT and only 147 usable against a
+# demand of 460; the pool scan that runs on every request add and remove
+# walked all of them, 120 times a second. Keeping the ceiling just above the
+# warm-up's WARM_CONNECTIONS lets the rule prune promptly while the dials
+# paid for before the open survive. Concurrency is unchanged - this bounds
+# what may sit idle, not what may be in flight.
+MAX_KEEPALIVE_CONNECTIONS = 64
 # The sync pool no longer carries placements - those go through the event
 # loop's own pool, sized by MAX_CONNECTIONS above. What is left here is
 # cancels, reconciliation reads and the warm-up: small, bursty at market

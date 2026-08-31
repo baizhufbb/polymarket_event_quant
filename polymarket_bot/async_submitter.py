@@ -51,6 +51,7 @@ from py_clob_client_v2.order_utils.model.order_data_v2 import order_to_json_v2
 from .transport import (
     CLOB_TIME_URL,
     MAX_CONNECTIONS,
+    MAX_KEEPALIVE_CONNECTIONS,
     WORST_REPLY_SECONDS,
 )
 
@@ -150,7 +151,7 @@ class AsyncSubmitter:
             transport=self._transport,
             limits=httpx.Limits(
                 max_connections=MAX_CONNECTIONS,
-                max_keepalive_connections=MAX_CONNECTIONS,
+                max_keepalive_connections=MAX_KEEPALIVE_CONNECTIONS,
                 keepalive_expiry=300.0,
             ),
             timeout=httpx.Timeout(WORST_REPLY_SECONDS),

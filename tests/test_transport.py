@@ -153,6 +153,32 @@ def test_the_pool_covers_the_warm_up_and_every_account_at_the_open():
     assert transport.MAX_CONNECTIONS >= needed
 
 
+def test_idle_connections_can_actually_be_pruned():
+    """The surplus-idle rule must be reachable, and the warm-up must survive.
+
+    The pool closes an idle connection promptly only when the idle count
+    exceeds max_keepalive_connections. Setting that equal to the pool size
+    makes the condition unreachable - the idle count is bounded by the pool -
+    so a socket the venue closed while idle keeps its slot for the whole
+    keepalive expiry. Run31 ended with 365 of 512 slots held that way. The
+    ceiling must therefore sit below the pool, and above the warm-up, whose
+    dials are paid for before the open and must not be pruned between
+    markets.
+    """
+    assert transport.MAX_KEEPALIVE_CONNECTIONS < transport.MAX_CONNECTIONS
+    assert transport.MAX_KEEPALIVE_CONNECTIONS >= transport.WARM_CONNECTIONS
+
+
+def test_the_placement_pool_uses_the_keepalive_ceiling():
+    """The submitter's own client is the one that carries placements."""
+    import inspect
+
+    from polymarket_bot import async_submitter
+
+    source = inspect.getsource(async_submitter.AsyncSubmitter._run)
+    assert "max_keepalive_connections=MAX_KEEPALIVE_CONNECTIONS" in source
+
+
 def test_each_account_gets_a_share_of_what_the_warm_up_leaves():
     """A share of the pool, from the fleet actually running - not a constant.
 
