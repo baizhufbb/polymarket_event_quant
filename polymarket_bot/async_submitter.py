@@ -146,8 +146,23 @@ class AsyncSubmitter:
     def _run(self) -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        # HTTP/2 multiplexes every in-flight order onto a handful of
+        # connections (the venue allows 100 concurrent streams per
+        # connection), so the pool no longer grows one socket per request
+        # and cancelling a request costs a RST_STREAM frame instead of a
+        # dead socket. The original HTTP/2 concern - one slow reply
+        # blocking every other reply behind a read lock - was diagnosed in
+        # the *sync* httpcore transport; the async transport pumps one
+        # network read per lock acquisition and dispatches to every
+        # stream, so it does not head-of-line block the same way. The
+        # cancel-and-redial storm and the O(connections) pool scan that
+        # collapsed run30 (pool 512->1280) both disappear when there are
+        # only a few connections to scan. Measured 2026-09-01: from the
+        # same box at the same moment, an authenticated request bypassing
+        # this pool answered in 33ms while orders through it took 3554ms -
+        # the bottleneck is this transport, not the venue.
         client = httpx.AsyncClient(
-            http2=False,
+            http2=True,
             transport=self._transport,
             limits=httpx.Limits(
                 max_connections=MAX_CONNECTIONS,
