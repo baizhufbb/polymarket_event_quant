@@ -124,11 +124,12 @@ def test_warm_connections_runs_once_per_window(monkeypatch):
 
 
 def test_the_process_lifts_its_own_fd_limit_as_far_as_the_pool_needs():
-    """runuser's PAM resets the soft fd limit to 1024; the pool holds 512.
+    """runuser's PAM resets the soft fd limit to 1024 after launch.
 
     The launcher cannot fix this from outside - the reset happens after it -
-    so the process must, and a soft limit below the pool plus daily overhead
-    would surface as connection errors at the open.
+    so the process must. Over HTTP/2 the pool is far under 1024 anyway; the
+    lift stays because it costs nothing and connection errors at the open
+    are the one failure the strategy cannot absorb.
     """
     transport._raise_file_descriptor_limit()
     try:
@@ -143,29 +144,35 @@ def test_the_process_lifts_its_own_fd_limit_as_far_as_the_pool_needs():
 def test_the_pool_covers_the_warm_up_and_every_account_at_the_open():
     """One pool serves the whole process: the warm-up and every account.
 
-    It was sized for a single account. Two things then grew past it at once -
-    a true 25 ms cadence on two accounts, and a warm-up that now dials while
-    the accounts send - so requests queued inside the pool at the one moment
-    the strategy is entirely about.
+    Over HTTP/2 a request in flight is a stream, and the venue allows
+    STREAMS_PER_CONNECTION of them per connection. The pool must hold the
+    warm-up plus enough connections for the whole planned fleet's worst
+    in-flight count, and then some, because the venue retires a connection
+    after 10,000 streams with GOAWAY and a replacement has to be dialable
+    while the old one drains.
     """
-    per_account = transport.WORST_REPLY_SECONDS / transport.FASTEST_INTERVAL_SECONDS
-    needed = transport.WARM_CONNECTIONS + transport.FLEET_ACCOUNTS * per_account
+    import math
+
+    worst_in_flight = transport.FLEET_ACCOUNTS * transport.ACCOUNT_BUDGET_CEILING
+    needed = transport.WARM_CONNECTIONS + math.ceil(
+        worst_in_flight / transport.STREAMS_PER_CONNECTION
+    )
     assert transport.MAX_CONNECTIONS >= needed
+    # ...and the pool is still a handful, not the hundreds HTTP/1.1 needed.
+    assert transport.MAX_CONNECTIONS <= 64
 
 
 def test_idle_connections_can_actually_be_pruned():
-    """The surplus-idle rule must be reachable, and the warm-up must survive.
+    """The keepalive ceiling is valid for httpx and keeps the warm-up.
 
-    The pool closes an idle connection promptly only when the idle count
-    exceeds max_keepalive_connections. Setting that equal to the pool size
-    makes the condition unreachable - the idle count is bounded by the pool -
-    so a socket the venue closed while idle keeps its slot for the whole
-    keepalive expiry. Run31 ended with 365 of 512 slots held that way. The
-    ceiling must therefore sit below the pool, and above the warm-up, whose
-    dials are paid for before the open and must not be pruned between
+    Over HTTP/1.1 this had to sit strictly below the pool so the surplus-idle
+    prune could fire on sockets the venue closed (run31: 365 of 512 slots
+    stuck in CLOSE-WAIT). Over HTTP/2 there are a few connections and an idle
+    one is harmless, so the ceiling may equal the pool; httpx only requires
+    it not exceed the pool, and the warm-up must never be pruned between
     markets.
     """
-    assert transport.MAX_KEEPALIVE_CONNECTIONS < transport.MAX_CONNECTIONS
+    assert transport.MAX_KEEPALIVE_CONNECTIONS <= transport.MAX_CONNECTIONS
     assert transport.MAX_KEEPALIVE_CONNECTIONS >= transport.WARM_CONNECTIONS
 
 
@@ -179,35 +186,25 @@ def test_the_placement_pool_uses_the_keepalive_ceiling():
     assert "max_keepalive_connections=MAX_KEEPALIVE_CONNECTIONS" in source
 
 
-def test_each_account_gets_a_share_of_what_the_warm_up_leaves():
-    """A share of the pool, from the fleet actually running - not a constant.
+def test_the_in_flight_ceiling_is_a_safety_net_no_fleet_size_reaches():
+    """Every account gets the ceiling; the lifetime keeps it out of reach.
 
-    Dividing by a fixed account count gave a solo account half the pool it
-    owned, and a fleet larger than that count more than the pool has. The
-    share is clipped at the ceiling: outstanding requests cost threads, and
-    nothing past a 4-second spell's worth of them buys any coverage.
+    Over HTTP/1.1 the cap was each account's share of a socket pool, so a
+    larger fleet meant a smaller cap and, at three accounts, one the send
+    loop actually hit. Over HTTP/2 a request costs a stream, nothing is
+    shared, and the cap only exists so a venue answering slower than the
+    hard lifetime makes the loop skip slots instead of deepening a queue.
     """
-    usable = transport.MAX_CONNECTIONS - transport.WARM_CONNECTIONS
-    per_account = transport.WORST_REPLY_SECONDS / transport.FASTEST_INTERVAL_SECONDS
+    from polymarket_bot import async_submitter
 
-    # A solo account gets the ceiling, not the whole pool.
-    assert transport.in_flight_budget(1) == transport.ACCOUNT_BUDGET_CEILING
-    # The ceiling covers a 4-second spell at the fastest cadence.
-    assert (
-        transport.ACCOUNT_BUDGET_CEILING * transport.FASTEST_INTERVAL_SECONDS
-        >= 4.0
-    )
-    # No fleet size can promise more than the pool holds.
-    for accounts in range(1, transport.FLEET_ACCOUNTS + 1):
-        assert transport.in_flight_budget(accounts) * accounts <= usable
-    # And up to the fleet this is sized for, the share still covers an open.
-    assert transport.in_flight_budget(transport.FLEET_ACCOUNTS) >= per_account
-    # Three accounts must ride out the spells run21 actually measured: a
-    # sustained 2.2s of slow replies demands 264 connections and the old
-    # 256-connection pool queued our own sends at the door (57% of sends
-    # left with 200+ in flight).
-    spell_demand = 3 * 2.2 / transport.FASTEST_INTERVAL_SECONDS
-    assert 3 * transport.in_flight_budget(3) >= spell_demand
+    # Fleet size no longer changes the cap.
+    caps = {transport.in_flight_budget(n) for n in range(1, transport.FLEET_ACCOUNTS + 1)}
+    assert caps == {transport.ACCOUNT_BUDGET_CEILING}
+    # The most a request can accumulate before the hard lifetime cancels it
+    # is lifetime / interval; the ceiling sits above that, so in normal
+    # operation the cap is never the binding limit.
+    most_alive = async_submitter.TOTAL_LIFETIME_SECONDS / transport.FASTEST_INTERVAL_SECONDS
+    assert transport.ACCOUNT_BUDGET_CEILING > most_alive
     # Nonsense input cannot produce a nonsense cap.
     assert transport.in_flight_budget(0) >= 4
 
@@ -252,10 +249,10 @@ def test_the_full_fleet_cannot_exhaust_the_thread_supply() -> None:
     warm-up dials. The field failure came at several thousand threads; keep
     the whole planned fleet an order of magnitude under it.
     """
-    # Non-batch sends ride the event loop and cost no thread at all; batch
-    # mode - the one entry mode still carried by threads - spends a single
-    # dispatch thread per in-flight send.
-    per_request_threads = 1
+    # Sends ride the event loop and cost no thread at all: batch mode, the
+    # last entry mode carried by threads, was removed on 2026-08-27. What
+    # remains is the warm-up's one daemon thread per dial.
+    per_request_threads = 0
     worst = max(
         accounts * transport.in_flight_budget(accounts) * per_request_threads
         for accounts in range(1, transport.FLEET_ACCOUNTS + 1)

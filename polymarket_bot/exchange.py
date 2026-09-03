@@ -191,17 +191,15 @@ class Exchange:
 
     @property
     def max_requests_in_flight(self) -> int:
-        """Outstanding requests this account may hold at once: its pool share.
+        """Outstanding requests this account may hold at once.
 
-        This used to be halved outside batch mode to protect the thread
-        supply - each request there is carried by a dispatch thread plus one
-        thread per leg, and threads are what ran out in the field. But the
-        halving was priced in connections, not threads, and at three or more
-        accounts it pushed the cap below the ~40 requests a one-second reply
-        timeout lets accumulate, re-arming the slot-skipping it was never
-        meant to cause. The thread supply is guarded where it is spent: a
-        transport test holds the whole planned fleet's worst-case thread
-        count far under the limit the field run exhausted.
+        A safety net on the send loop, not a share of a pool: orders travel
+        over HTTP/2, where a request in flight costs a stream rather than a
+        socket, so there is nothing scarce to divide between accounts. The
+        ceiling sits above what the hard request lifetime lets accumulate,
+        so in normal operation the loop never gives up a slot for want of
+        one; if it ever does, that is the venue answering slower than the
+        lifetime, and skipping the slot is the right call (see place_dual).
         """
         return in_flight_budget(self.accounts_sharing_the_pool)
 

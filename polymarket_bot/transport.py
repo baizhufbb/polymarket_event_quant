@@ -24,68 +24,70 @@ import httpx
 import py_clob_client_v2.http_helpers.helpers as _helpers
 
 CLOB_TIME_URL = "https://clob.polymarket.com/time"
-# The venue has slow spells, whole markets at a time: reply medians sit at
-# 30ms for clean markets and jump to 1.2-2.2s for spell markets, flat from
-# the first knock to the last (run20: 16/72 markets, run21: 56/72). During a
-# spell the fleet's demand for connections is
-#   accounts x spell_seconds / interval
-# and when that passes the pool, new sends wait at our own door before they
-# even leave - latency added at exactly the moment the strategy is about
-# queueing. Run21 (3 accounts, 2.2s spells) demanded 264 of the old 208
-# usable connections: 57% of the session's sends left with 200+ already in
-# flight, at 2.2s median lifetimes.
+# Orders travel over HTTP/2 (async_submitter.py), where one connection
+# carries many requests at once: the venue's SETTINGS_MAX_CONCURRENT_STREAMS
+# is 100 (measured 2026-09-01). A request in flight therefore costs a
+# stream, not a socket, and the pool below is sized in connections that
+# each hold STREAMS_PER_CONNECTION requests - a handful, not hundreds.
 #
-# The pool is therefore sized for spells, not for the happy path: the
-# warm-up gets WARM_CONNECTIONS and the accounts share the rest, which at
-# three accounts covers a sustained 154 x 25ms = 3.85s spell. The deep tail
-# (p90 spells reach ~7s) still trips the in-flight cap and skips slots -
-# that is the designed protection, the pool does not chase 23-second tails.
+# That ends the arithmetic that used to live here. Over HTTP/1.1 every
+# outstanding request held its own socket, so the pool had to be sized for
+# accounts x slow-spell seconds / interval (512 for three accounts riding a
+# 3.85 s spell), the pool's own bookkeeping walked every socket on every
+# event, and raising the pool to chase deeper spells made that walk slower
+# than the spell (run30: 512 -> 1280 collapsed from the first minute). None
+# of that scales with streams.
 #
-# WORST_REPLY_SECONDS is the httpx timeout. It is per-phase (connect, write,
-# read-gap), NOT a lifetime bound: a reply that trickles never sits silent
-# for a second and can live many times longer (run21 p99 lifetime 11.5s).
+# What still matters: the venue retires a connection after 10,000 streams
+# with GOAWAY, so a replacement must be dialable while the old one drains -
+# hence a pool a few times larger than the streams alone require.
+#
+# WORST_REPLY_SECONDS is the httpx per-phase timeout (connect, write,
+# read-gap), not a lifetime bound; the hard lifetime is
+# async_submitter.TOTAL_LIFETIME_SECONDS.
 FLEET_ACCOUNTS = 5
 WORST_REPLY_SECONDS = 1.0
 FASTEST_INTERVAL_SECONDS = 0.025
-WARM_CONNECTIONS = 48
-MAX_CONNECTIONS = 512
-# Idle connections are pruned by three rules, and only one of them is prompt.
-# A connection the venue closed while it sat idle stays "idle" to us - our
-# state machine never learns of the peer's FIN until something tries to use
-# the socket - so is_closed() does not catch it, and has_expired() waits out
-# the full keepalive. That leaves "close surplus idle connections", which
-# fires only when the idle count exceeds this number. Setting it equal to
-# MAX_CONNECTIONS made the condition unreachable: the idle count is bounded
-# by the pool size, so it can never exceed it, and every venue-closed socket
-# held a slot for the whole 300s expiry. Run31 (six hours, three accounts)
-# ended with 365 of 512 slots in CLOSE-WAIT and only 147 usable against a
-# demand of 460; the pool scan that runs on every request add and remove
-# walked all of them, 120 times a second. Keeping the ceiling just above the
-# warm-up's WARM_CONNECTIONS lets the rule prune promptly while the dials
-# paid for before the open survive. Concurrency is unchanged - this bounds
-# what may sit idle, not what may be in flight.
-MAX_KEEPALIVE_CONNECTIONS = 64
+STREAMS_PER_CONNECTION = 100
+# One warm connection per planned account is plenty over HTTP/2; the warm-up
+# exists so the first sends at the open do not pay a TLS handshake, and a
+# single h2 connection already carries an account's whole burst.
+WARM_CONNECTIONS = 3
+MAX_CONNECTIONS = 16
+# Over HTTP/1.1 this had to sit strictly below MAX_CONNECTIONS: the pool
+# prunes an idle connection promptly only when the idle count exceeds it,
+# and with the two equal that rule was unreachable, so sockets the venue had
+# closed sat in CLOSE-WAIT for the whole keepalive expiry (run31: 365 of 512
+# slots). Over HTTP/2 there are a few connections, each kept busy by the
+# streams on it, and an idle one costs nothing to keep - the rule is inert
+# rather than needed, so this simply matches the pool.
+MAX_KEEPALIVE_CONNECTIONS = MAX_CONNECTIONS
 # The sync pool no longer carries placements - those go through the event
 # loop's own pool, sized by MAX_CONNECTIONS above. What is left here is
 # cancels, reconciliation reads and the warm-up: small, bursty at market
 # end, never hundreds deep.
 SYNC_POOL_CONNECTIONS = 64
-# No account needs more outstanding requests than a 4-second spell fills;
-# past the ceiling the extra would only buy thread count, not coverage.
+# The most requests one account may hold outstanding. A safety net on the
+# send loop, not a share of anything: at TOTAL_LIFETIME_SECONDS a request
+# lives at most lifetime / interval sends (3 s / 25 ms = 120), so at this
+# ceiling the loop never has to skip a slot for want of a request slot.
 ACCOUNT_BUDGET_CEILING = 160
 
 
 def in_flight_budget(accounts: int) -> int:
     """How many requests one account may have outstanding at once.
 
-    What is left of the pool once the warm-up has its slice, divided by the
-    accounts actually running - not by a constant, so a fleet of any size
-    gets an honest share - and clipped at the ceiling, because outstanding
-    requests cost threads and nothing above a 4-second spell's worth of
-    them buys any coverage.
+    Over HTTP/1.1 this was the account's share of a socket pool - the pool
+    minus the warm-up, divided by the accounts running, clipped at the
+    ceiling - because a request in flight owned a socket. Over HTTP/2 it
+    does not, so there is nothing to share: every account gets the ceiling,
+    which the hard request lifetime keeps unreachable in normal operation.
+    The argument is kept so callers and tests that pass a fleet size still
+    read naturally; only nonsense input is guarded.
     """
-    usable = MAX_CONNECTIONS - WARM_CONNECTIONS
-    return max(4, min(usable // max(1, accounts), ACCOUNT_BUDGET_CEILING))
+    if accounts < 1:
+        return max(4, ACCOUNT_BUDGET_CEILING)
+    return ACCOUNT_BUDGET_CEILING
 # A market handed back by signing re-enters place_dual every loop tick, and
 # each entry asks to warm the pool; the pool is process-wide, so one warm-up
 # per window serves every member and every re-entry of that market.
@@ -101,11 +103,12 @@ _warm_lock = Lock()
 def _raise_file_descriptor_limit(target: int = 8192) -> None:
     """Lift this process's own fd soft limit toward `target`.
 
-    The 512-connection pool holds one descriptor per socket, and the launch
-    path runs through runuser, whose PAM session resets the soft limit to
-    the 1024 default no matter what the calling shell set. A process may
-    raise its own soft limit up to the hard limit without privilege, so the
-    bot does it here rather than trusting any launcher to.
+    The launch path runs through runuser, whose PAM session resets the soft
+    limit to the 1024 default no matter what the calling shell set. Over
+    HTTP/2 the pool needs a few dozen descriptors, so 1024 would do; this
+    stays because a process may raise its own soft limit without privilege
+    and the cost is nothing, while the failure mode - connection errors at
+    the open - is the one thing the strategy cannot absorb.
     """
     try:
         import resource
