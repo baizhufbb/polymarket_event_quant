@@ -58,10 +58,28 @@ from .transport import (
 logger = logging.getLogger(__name__)
 
 # A reply we are still waiting on after this long has already lost us the
-# moment it was sent for; the venue's trickling replies lived up to 69 s in
-# the field. Cancelling is not losing the order: the next send returns
-# "Duplicated" with the order's id, and the user streams report placements.
-TOTAL_LIFETIME_SECONDS = 30.0
+# moment it was sent for. Cancelling is not losing the order: the next send
+# returns "Duplicated" with the order's id, and the user streams report
+# placements.
+#
+# This sat at 30 s from 2026-08-28 to 2026-09-02, and not because 30 s was a
+# good number: over HTTP/1.1 a cancelled request killed its socket (the
+# reply left half-read cannot be reused), so every cancel was a redial, and
+# a cancel landing between the pool assigning a connection and the request
+# driving it stranded that connection for good (run23, 5.5 h). Cancelling
+# often was the disease, so the lifetime was stretched until almost nothing
+# was cancelled - at the cost of a request holding its in-flight slot for
+# 30 s while the venue thought about it, which is what pinned in-flight at
+# the cap and skipped a quarter of the send slots (run31-34).
+#
+# Over HTTP/2 a cancel is one RST_STREAM frame on a connection that keeps
+# serving, and the stranded-connection window closes (an undriven h2
+# connection is `is_available()`, so the pool reuses it). With cancels
+# cheap again the lifetime can be what the strategy actually wants: a
+# request the venue has not answered in a few seconds is not going to be
+# the one that wins the queue, and holding it only deepens the backlog
+# during a slow spell.
+TOTAL_LIFETIME_SECONDS = 3.0
 _VERSION_HEAL_INTERVAL_SECONDS = 30.0
 
 
