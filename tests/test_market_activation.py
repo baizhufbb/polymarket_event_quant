@@ -256,3 +256,35 @@ def test_zero_window_seeds_cursor_without_registering_existing_market() -> None:
     ]
     assert tuple(activation._candidates) == (next_market.slug,)
     assert NEWER.slug not in activation._handled_slugs
+
+
+def test_clob_accepting_order_timestamp_rides_along_with_the_market() -> None:
+    """The listing's `aot` reaches the placement loop on the market itself."""
+    activation = worker()
+    activation._register_candidates([ACTIVE], market_discovered_ts_ms=1)
+    activation.market_session.close()
+    activation.market_session = MarketSession(
+        [Response({**market_payload(ACTIVE), "aot": "2026-09-03T03:17:46Z"})]
+    )
+
+    assert activation._poll_market_parameters() is True
+    update = activation.drain()[0]
+    assert update.market.accepting_orders_ts == 1_788_405_466
+    assert update.market.slug == ACTIVE.slug
+    assert update.market.up_token_id == ACTIVE.up_token_id
+
+
+def test_a_listing_without_a_usable_aot_leaves_the_market_ungated() -> None:
+    activation = worker()
+    activation._register_candidates([ACTIVE, FUTURE], market_discovered_ts_ms=1)
+    activation.market_session.close()
+    activation.market_session = MarketSession(
+        [
+            Response(market_payload(ACTIVE)),
+            Response({**market_payload(FUTURE), "aot": "not a timestamp"}),
+        ]
+    )
+
+    assert activation._poll_market_parameters() is True
+    updates = activation.drain()
+    assert [update.market.accepting_orders_ts for update in updates] == [None, None]

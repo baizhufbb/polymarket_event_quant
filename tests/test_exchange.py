@@ -1,3 +1,4 @@
+import dataclasses
 import time
 from decimal import Decimal
 from threading import Event, Lock, Thread
@@ -6,6 +7,7 @@ import httpx
 import pytest
 
 from polymarket_bot.exchange import (
+    DOOR_OPENS_AFTER_AOT_SECONDS,
     AmbiguousPlacementError,
     Exchange,
     submission_slot,
@@ -1279,3 +1281,62 @@ def replace_market_end(market: Market, *, end_in_seconds: int) -> Market:
     return dataclasses.replace(
         market, end_ts=int(time_module.time()) + end_in_seconds
     )
+
+
+def _first_send_wall_clock(market, budget: int = 2) -> tuple[float, float]:
+    """Place on `market` with a client that accepts on the `budget`-th send.
+
+    Returns the wall-clock moments the placement was called and the first
+    send left; the spread between them is the hold the aot gate imposed.
+    """
+    exchange = Exchange.__new__(Exchange)
+    exchange.client = _SlowFirstReplyClient(stall=0.0, budget=budget)
+    sent: list[float] = []
+    dispatch = Exchange._submit_placement_request
+
+    def record(self, payload):
+        sent.append(time.time())
+        return dispatch(self, payload)
+
+    exchange._submit_placement_request = record.__get__(exchange, Exchange)
+    called = time.time()
+    result = exchange.place_dual(
+        market,
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        submission_interval_ms=Decimal("50"),
+    )
+    assert result.complete
+    return called, sent[0]
+
+
+def test_the_first_send_waits_for_the_book_to_be_due() -> None:
+    """With `aot` known, nothing is sent before aot + DOOR_OPENS_AFTER_AOT_SECONDS.
+
+    The hold lands somewhere inside the next second (aot is whole seconds),
+    so the test pins the first send to the computed moment rather than to a
+    fixed delay.
+    """
+    aot = int(time.time()) - int(DOOR_OPENS_AFTER_AOT_SECONDS) + 1
+    gated = replace_market_end(
+        dataclasses.replace(MARKET, accepting_orders_ts=aot), end_in_seconds=120
+    )
+    due = aot + DOOR_OPENS_AFTER_AOT_SECONDS
+
+    called, first_send = _first_send_wall_clock(gated)
+
+    assert called < due, "the fixture should start before the book is due"
+    assert first_send >= due - 0.02
+    assert first_send <= due + 0.25
+
+
+def test_a_book_already_due_is_knocked_at_once() -> None:
+    """An `aot` in the past - a late listing, or a degraded day - holds nothing."""
+    stale = replace_market_end(
+        dataclasses.replace(MARKET, accepting_orders_ts=int(time.time()) - 600),
+        end_in_seconds=120,
+    )
+
+    called, first_send = _first_send_wall_clock(stale)
+
+    assert first_send - called < 0.25

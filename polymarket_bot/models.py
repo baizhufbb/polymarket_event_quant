@@ -82,6 +82,9 @@ class Market:
     down_token_id: str
     min_size: Decimal
     tick_size: Decimal
+    # The venue's `aot` (accepting-order timestamp, whole seconds), read off
+    # the CLOB market listing; None when the listing does not carry it.
+    accepting_orders_ts: int | None = None
 
 
 @dataclass(frozen=True)
