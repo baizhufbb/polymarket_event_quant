@@ -1,10 +1,13 @@
 import time
+from dataclasses import replace
 from decimal import Decimal
 
 from polymarket_bot.market_activation import (
+    AOT_WAIT_SECONDS,
     CLOB_MARKETS,
     MARKET_SECONDS,
     MarketActivationWorker,
+    _Candidate,
 )
 from polymarket_bot.models import Market
 
@@ -26,6 +29,7 @@ def market(offset: int, name: str) -> Market:
     )
 
 
+AOT_TS = 1_788_405_466  # market_payload()'s default aot, 2026-09-03T03:17:46Z
 ACTIVE = market(0, "active")
 FUTURE = market(300, "future")
 NEWER = market(600, "newer")
@@ -77,13 +81,16 @@ def worker() -> MarketActivationWorker:
     )
 
 
-def market_payload(item: Market) -> dict:
-    return {
+def market_payload(item: Market, aot: str | None = "2026-09-03T03:17:46Z") -> dict:
+    payload = {
         "t": [
             {"t": item.up_token_id},
             {"t": item.down_token_id},
         ]
     }
+    if aot is not None:
+        payload["aot"] = aot
+    return payload
 
 
 def test_gamma_registration_tracks_each_unexpired_market() -> None:
@@ -125,7 +132,7 @@ def test_complete_clob_parameters_emit_market() -> None:
     assert activation._poll_market_parameters() is True
     after_poll_ts_ms = int(time.time() * 1000)
     update = activation.drain()[0]
-    assert update.market == ACTIVE
+    assert update.market == replace(ACTIVE, accepting_orders_ts=AOT_TS)
     assert update.market_discovered_ts_ms == 1_999_999_000_000
     assert (
         before_poll_ts_ms
@@ -168,11 +175,11 @@ def test_out_of_order_activation_keeps_each_market_independent() -> None:
     )
 
     activation._poll_market_parameters()
-    assert activation.drain()[0].market == NEWER
+    assert activation.drain()[0].market == replace(NEWER, accepting_orders_ts=AOT_TS)
     assert tuple(activation._candidates) == (ACTIVE.slug, FUTURE.slug)
 
     activation._poll_market_parameters()
-    assert activation.drain()[0].market == FUTURE
+    assert activation.drain()[0].market == replace(FUTURE, accepting_orders_ts=AOT_TS)
     assert tuple(activation._candidates) == (ACTIVE.slug,)
     assert activation._handled_slugs == {FUTURE.slug, NEWER.slug}
 
@@ -263,9 +270,7 @@ def test_clob_accepting_order_timestamp_rides_along_with_the_market() -> None:
     activation = worker()
     activation._register_candidates([ACTIVE], market_discovered_ts_ms=1)
     activation.market_session.close()
-    activation.market_session = MarketSession(
-        [Response({**market_payload(ACTIVE), "aot": "2026-09-03T03:17:46Z"})]
-    )
+    activation.market_session = MarketSession([Response(market_payload(ACTIVE))])
 
     assert activation._poll_market_parameters() is True
     update = activation.drain()[0]
@@ -274,17 +279,47 @@ def test_clob_accepting_order_timestamp_rides_along_with_the_market() -> None:
     assert update.market.up_token_id == ACTIVE.up_token_id
 
 
-def test_a_listing_without_a_usable_aot_leaves_the_market_ungated() -> None:
+def test_tokens_without_aot_wait_for_it_before_the_market_is_emitted() -> None:
+    """The venue writes `aot` seconds after the tokens; the loop needs both."""
     activation = worker()
-    activation._register_candidates([ACTIVE, FUTURE], market_discovered_ts_ms=1)
+    activation._register_candidates([ACTIVE], market_discovered_ts_ms=1)
     activation.market_session.close()
     activation.market_session = MarketSession(
         [
+            Response(market_payload(ACTIVE, aot=None)),
+            Response(market_payload(ACTIVE, aot="not a timestamp")),
             Response(market_payload(ACTIVE)),
-            Response({**market_payload(FUTURE), "aot": "not a timestamp"}),
         ]
     )
 
     assert activation._poll_market_parameters() is True
-    updates = activation.drain()
-    assert [update.market.accepting_orders_ts for update in updates] == [None, None]
+    assert activation.drain() == []
+    first_seen = activation._candidates[ACTIVE.slug].parameters_seen_ts_ms
+    assert first_seen is not None
+
+    assert activation._poll_market_parameters() is True
+    assert activation.drain() == []
+    assert activation._candidates[ACTIVE.slug].parameters_seen_ts_ms == first_seen
+
+    assert activation._poll_market_parameters() is True
+    update = activation.drain()[0]
+    assert update.market.accepting_orders_ts == 1_788_405_466
+    assert update.market_parameters_detected_ts_ms == first_seen
+    assert activation._candidates == {}
+
+
+def test_a_listing_that_never_shows_aot_is_emitted_ungated_after_the_wait() -> None:
+    activation = worker()
+    activation._register_candidates([ACTIVE], market_discovered_ts_ms=1)
+    long_ago = int(time.time() * 1000) - int(AOT_WAIT_SECONDS * 1000) - 1
+    activation._candidates[ACTIVE.slug] = _Candidate(ACTIVE, 1, long_ago)
+    activation.market_session.close()
+    activation.market_session = MarketSession(
+        [Response(market_payload(ACTIVE, aot=None))]
+    )
+
+    assert activation._poll_market_parameters() is True
+    update = activation.drain()[0]
+    assert update.market.accepting_orders_ts is None
+    assert update.market_parameters_detected_ts_ms == long_ago
+    assert activation._candidates == {}

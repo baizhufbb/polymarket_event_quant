@@ -16,6 +16,15 @@ CLOB_MARKETS = "https://clob.polymarket.com/clob-markets"
 MARKET_SECONDS = 300
 DISCOVERY_POLL_SECONDS = 1.0
 ACTIVATION_POLL_SECONDS = 0.25
+# The venue creates a market, fills in its tokens, and only then - 8 .. 16 s
+# later on 2026-09-04 - writes `aot`, the accepting-order timestamp the
+# placement loop keys its first send on (the book opens 48.9 s after it).
+# Emitting on the tokens alone handed the loop a market without `aot`, so it
+# knocked from discovery as before. A market whose tokens are known therefore
+# waits this long for `aot` before it is emitted without one; the book never
+# opens earlier than aot + 47.6 s, so the wait costs nothing on a normal day
+# and only delays the blind knocking by this much on a degraded one.
+AOT_WAIT_SECONDS = 30.0
 
 
 def parse_accepting_orders_ts(value: object) -> int | None:
@@ -50,6 +59,8 @@ class MarketActivationUpdate:
 class _Candidate:
     market: Market
     market_discovered_ts_ms: int
+    # When the CLOB listing first showed both tokens; None until it did.
+    parameters_seen_ts_ms: int | None = None
 
 
 class MarketActivationWorker:
@@ -237,10 +248,21 @@ class MarketActivationWorker:
             }.issubset(tokens):
                 continue
 
-            detected_ts_ms = int(time.time() * 1000)
+            now_ms = int(time.time() * 1000)
+            seen_ts_ms = candidate.parameters_seen_ts_ms or now_ms
             accepting_orders_ts = parse_accepting_orders_ts(payload.get("aot"))
             if accepting_orders_ts is not None:
                 market = replace(market, accepting_orders_ts=accepting_orders_ts)
+            elif now_ms - seen_ts_ms < AOT_WAIT_SECONDS * 1000:
+                # Tokens are up but `aot` is not written yet: keep the
+                # candidate and come back next poll.
+                with self._candidate_lock:
+                    if market.slug in self._candidates:
+                        self._candidates[market.slug] = _Candidate(
+                            market, candidate.market_discovered_ts_ms, seen_ts_ms
+                        )
+                continue
+            detected_ts_ms = seen_ts_ms
             with self._candidate_lock:
                 if self._candidates.pop(market.slug, None) is None:
                     continue
