@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from queue import Empty, SimpleQueue
 from threading import Event, Lock, Thread
 
@@ -16,19 +15,6 @@ CLOB_MARKETS = "https://clob.polymarket.com/clob-markets"
 MARKET_SECONDS = 300
 DISCOVERY_POLL_SECONDS = 1.0
 ACTIVATION_POLL_SECONDS = 0.25
-
-
-def parse_accepting_orders_ts(value: object) -> int | None:
-    """The CLOB listing's `aot`, e.g. "2026-09-03T03:17:46Z", as unix seconds."""
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
-    return int(moment.timestamp())
 
 
 @dataclass(frozen=True)
@@ -238,9 +224,6 @@ class MarketActivationWorker:
                 continue
 
             detected_ts_ms = int(time.time() * 1000)
-            accepting_orders_ts = parse_accepting_orders_ts(payload.get("aot"))
-            if accepting_orders_ts is not None:
-                market = replace(market, accepting_orders_ts=accepting_orders_ts)
             with self._candidate_lock:
                 if self._candidates.pop(market.slug, None) is None:
                     continue

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import math
 import re
 import time
@@ -42,19 +41,6 @@ ORDER_ENGINE_NOT_READY_ERRORS = {
     (400, "invalid token id"),
     (404, "market not found"),
 }
-# The venue publishes each market's `aot` (accepting-order timestamp, whole
-# seconds) before the book opens, and the 1c queue appears a stable 48.9 s
-# after it: 324 markets over six days (08-30 .. 09-03) mean 48.8 s, standard
-# deviation 0.5 s, range 47.6 .. 50.6 s. Every send before aot + 46 s only
-# buys a "not ready" reply - 92.6% of the ~6000 sends a market cost when the
-# knocking started at discovery - so the first slot waits for that moment.
-# There is no far edge: past it the loop knocks on as it always did, which is
-# also the fallback for the venue's degraded days, when the book has opened
-# 143 .. 1504 s after aot and Gamma listed the market later still.
-DOOR_OPENS_AFTER_AOT_SECONDS = 46.0
-
-logger = logging.getLogger(__name__)
-
 DEFAULT_PLACEMENT_INTERVAL_MS = Decimal("20")
 # The client asks the venue for the market's tick size before signing, and a
 # freshly announced market answers 404 "market not found" for its first tens
@@ -308,14 +294,10 @@ class Exchange:
 
         if submission_interval_ms is None or submission_interval_ms <= 0:
             raise ValueError("submission_interval_ms must be above 0")
-        not_before_ts = None
-        if market.accepting_orders_ts is not None:
-            not_before_ts = market.accepting_orders_ts + DOOR_OPENS_AFTER_AOT_SECONDS
         return self._place_dual_staggered(
             specifications,
             signed,
             price=price,
-            not_before_ts=not_before_ts,
             size=size,
             submission_interval_ms=submission_interval_ms,
             grid_origin=grid_origin,
@@ -338,13 +320,8 @@ class Exchange:
         submissions: dict[tuple, list[PostOrdersV2Args]],
         grid_origin: float | None = None,
         phase_offset_ms: Decimal = Decimal(0),
-        not_before_ts: float | None = None,
     ) -> PlacementResult:
         """Submit one immutable signed pair on this member's timetable.
-
-        `not_before_ts` (wall clock) holds the first send until the moment the
-        book is due to open; the timetable itself is untouched, so the fleet's
-        offsets survive the hold and the first sends land on their own slots.
 
         Every send falls on `grid_origin + phase_offset + k * interval`. The
         fleet hands all members one origin, so their offsets hold whatever
@@ -361,12 +338,6 @@ class Exchange:
         # the two readings differ, which they usually do.
         started = time.monotonic()
         origin = started if grid_origin is None else grid_origin
-        hold_until = started
-        if not_before_ts is not None:
-            hold = not_before_ts - time.time()
-            if hold > 0 and not_before_ts < market_end_ts:
-                hold_until = started + hold
-                logger.info("aot gate: first send held for %.1f s", hold)
 
         def slot_at_or_after(moment: float) -> float:
             return submission_slot(
@@ -392,7 +363,7 @@ class Exchange:
         in_flight_cap = self.max_requests_in_flight
         registered_ts_ms: int | None = None
         next_submission = slot_at_or_after(
-            max(started, self._next_placement_submission, hold_until)
+            max(started, self._next_placement_submission)
         )
         stop_submitting = False
         drain_deadline: float | None = None
