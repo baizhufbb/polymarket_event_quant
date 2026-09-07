@@ -75,3 +75,73 @@ def test_each_probe_writes_its_own_file() -> None:
     assert path.suffix == ".jsonl"
     # and the reading side can still find them all
     assert path.match(f"{queue_probe.OUTPUT_PREFIX}*.jsonl")
+
+
+def test_a_dropped_socket_is_reconnected_and_the_opening_still_recorded(monkeypatch, tmp_path) -> None:
+    """The venue drops idle sockets; a book that opens hours later must still be caught."""
+    import asyncio
+    import io
+    import json
+    import websockets
+    from polymarket_bot import queue_probe
+    from polymarket_bot.market_activation import MarketActivationUpdate
+    from decimal import Decimal
+    from polymarket_bot.models import Market
+
+    market = Market(
+        slug="btc-updown-5m-1",
+        condition_id="0xc",
+        start_ts=1_800_000_000,
+        end_ts=1_800_000_300,
+        up_token_id="up-token",
+        down_token_id="down-token",
+        min_size=Decimal("5"),
+        tick_size=Decimal("0.01"),
+    )
+    update = MarketActivationUpdate(
+        market=market, market_discovered_ts_ms=1, market_parameters_detected_ts_ms=2
+    )
+    book = lambda asset, size: json.dumps(  # noqa: E731
+        {"event_type": "book", "asset_id": asset, "timestamp": "1800000000000",
+         "bids": [{"price": "0.01", "size": size}], "asks": []}
+    )
+    scripts = [
+        ["closed"],                                   # first connection dies at once
+        [book("up-token", "300"), book("down-token", "91")],  # second one sees the opening
+    ]
+    connections = []
+
+    class FakeSocket:
+        def __init__(self, script):
+            self.script = list(script)
+            self.sent = []
+        async def send(self, data):
+            self.sent.append(data)
+        async def recv(self):
+            if not self.script:
+                await asyncio.sleep(3600)
+            item = self.script.pop(0)
+            if item == "closed":
+                raise websockets.ConnectionClosedError(None, None)
+            return item
+
+    class FakeConnect:
+        def __init__(self, *args, **kwargs):
+            self.socket = FakeSocket(scripts[len(connections)])
+            connections.append(self.socket)
+        async def __aenter__(self):
+            return self.socket
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(queue_probe.websockets, "connect", FakeConnect)
+    monkeypatch.setattr(queue_probe, "RECONNECT_DELAY_SECONDS", 0)
+    output = io.StringIO()
+
+    asyncio.run(queue_probe._monitor_market(update, output, opening_window_seconds=0.05))
+
+    assert len(connections) == 2
+    assert all(json.loads(c.sent[0])["type"] == "market" for c in connections)
+    rows = [json.loads(line) for line in output.getvalue().splitlines()]
+    # nothing is recorded until both sides of the book have been seen
+    assert [(r["up_queue_shares"], r["down_queue_shares"]) for r in rows] == [("300", "91")]

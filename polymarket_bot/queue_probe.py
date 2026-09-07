@@ -14,9 +14,18 @@ from polymarket import PRODUCTION
 
 from .market_activation import MarketActivationUpdate, MarketActivationWorker
 
+logger = logging.getLogger(__name__)
+
 
 TARGET_PRICE = Decimal("0.01")
-BOOK_WAIT_SECONDS = 120
+# How long a market's book may take to appear after the listing shows its
+# tokens. Until 2026-09-05 ~17:00 UTC that was about a minute (52.7 .. 103 s
+# over 42 markets on 09-04) and 120 s covered it. Since then the venue opens
+# books 100 s .. 6+ h after creation with no pattern (169 markets over 14 h:
+# p50 3094 s, p90 9354 s, max 22682 s), so a market is watched for up to this
+# long, reconnecting whenever the venue drops the idle socket.
+BOOK_WAIT_SECONDS = 12 * 3600
+RECONNECT_DELAY_SECONDS = 5
 OPENING_WINDOW_SECONDS = 2
 OUTPUT_DIRECTORY = Path(__file__).resolve().parents[1] / "logs"
 OUTPUT_PREFIX = "queue_probe_opening"
@@ -124,6 +133,56 @@ async def _monitor_market(
         market.down_token_id: "down",
     }
     queues: dict[str, Decimal] = {}
+    loop = asyncio.get_running_loop()
+    book_deadline = loop.time() + BOOK_WAIT_SECONDS
+    opening_deadline: float | None = None
+    while True:
+        try:
+            opening_deadline = await _watch_book(
+                market.slug,
+                token_outcomes=token_outcomes,
+                queues=queues,
+                output=output,
+                update=update,
+                book_deadline=book_deadline,
+                opening_deadline=opening_deadline,
+                opening_window_seconds=opening_window_seconds,
+            )
+            return
+        except (websockets.ConnectionClosed, OSError, TimeoutError) as exc:
+            # The venue drops sockets that sit idle for long enough, and a
+            # book that opens hours after the listing means sitting idle for
+            # hours. Reconnect until the market's deadline, keeping whatever
+            # queue state the earlier connection already saw.
+            remaining = book_deadline - loop.time()
+            if remaining <= 0:
+                logger.info("%s: gave up, no book within %.0f s", market.slug, BOOK_WAIT_SECONDS)
+                return
+            logger.info(
+                "%s: socket lost (%s: %s), reconnecting in %d s, %.0f s left",
+                market.slug, type(exc).__name__, str(exc)[:80], RECONNECT_DELAY_SECONDS, remaining,
+            )
+            await asyncio.sleep(min(RECONNECT_DELAY_SECONDS, max(0.0, remaining)))
+
+
+async def _watch_book(
+    slug: str,
+    *,
+    token_outcomes: dict[str, str],
+    queues: dict[str, Decimal],
+    output,
+    update: MarketActivationUpdate,
+    book_deadline: float,
+    opening_deadline: float | None,
+    opening_window_seconds: float,
+) -> float | None:
+    """One connection's worth of watching; returns when the market is done.
+
+    Raises the socket's own exception when the venue drops the connection so
+    the caller can reconnect; returns normally when the opening window has
+    been recorded or the book deadline passed.
+    """
+    loop = asyncio.get_running_loop()
     async with websockets.connect(
         PRODUCTION.clob_market_ws_url,
         ping_interval=None,
@@ -141,18 +200,19 @@ async def _monitor_market(
         )
         heartbeat = asyncio.create_task(_heartbeat(socket))
         try:
-            loop = asyncio.get_running_loop()
-            book_deadline = loop.time() + BOOK_WAIT_SECONDS
-            opening_deadline: float | None = None
             while True:
                 deadline = opening_deadline or book_deadline
                 remaining = deadline - loop.time()
                 if remaining <= 0:
-                    break
+                    if opening_deadline is None:
+                        logger.info("%s: gave up, no book within %.0f s", slug, BOOK_WAIT_SECONDS)
+                    return opening_deadline
                 try:
                     raw = await asyncio.wait_for(socket.recv(), timeout=remaining)
                 except TimeoutError:
-                    break
+                    if opening_deadline is None:
+                        logger.info("%s: gave up, no book within %.0f s", slug, BOOK_WAIT_SECONDS)
+                    return opening_deadline
                 if raw == "PONG":
                     continue
                 payload = json.loads(raw)
