@@ -26,6 +26,14 @@ TARGET_PRICE = Decimal("0.01")
 # long, reconnecting whenever the venue drops the idle socket.
 BOOK_WAIT_SECONDS = 12 * 3600
 RECONNECT_DELAY_SECONDS = 5
+# While the book has not appeared, a healthy socket answers every 10-second
+# PING with a PONG, so this long without any message means the connection is
+# dead even though it never closed: on 2026-09-19 such sockets sat "open" for
+# 1-3 hours past the door and 19 of 23 openings were missed. Take a fresh
+# subscription now and then as well, in case a live socket stops delivering
+# for a subscription while still answering PONGs.
+SILENCE_SECONDS = 30
+RESUBSCRIBE_SECONDS = 600
 OPENING_WINDOW_SECONDS = 2
 OUTPUT_DIRECTORY = Path(__file__).resolve().parents[1] / "logs"
 OUTPUT_PREFIX = "queue_probe_opening"
@@ -199,6 +207,8 @@ async def _watch_book(
             )
         )
         heartbeat = asyncio.create_task(_heartbeat(socket))
+        connected_at = loop.time()
+        last_message_at = connected_at
         try:
             while True:
                 deadline = opening_deadline or book_deadline
@@ -207,12 +217,26 @@ async def _watch_book(
                     if opening_deadline is None:
                         logger.info("%s: gave up, no book within %.0f s", slug, BOOK_WAIT_SECONDS)
                     return opening_deadline
+                timeout = remaining
+                if opening_deadline is None:
+                    # Still waiting for the book. Silence means the socket is
+                    # dead even though it never closed, and a subscription
+                    # can go stale on a live socket: raise so the caller
+                    # reconnects, the same way it does for a dropped socket.
+                    silence_left = last_message_at + SILENCE_SECONDS - loop.time()
+                    if silence_left <= 0:
+                        raise TimeoutError(f"no message for {SILENCE_SECONDS} s")
+                    resubscribe_left = connected_at + RESUBSCRIBE_SECONDS - loop.time()
+                    if resubscribe_left <= 0:
+                        raise TimeoutError(f"resubscribing after {RESUBSCRIBE_SECONDS} s")
+                    timeout = min(remaining, silence_left, resubscribe_left)
                 try:
-                    raw = await asyncio.wait_for(socket.recv(), timeout=remaining)
+                    raw = await asyncio.wait_for(socket.recv(), timeout=timeout)
                 except TimeoutError:
-                    if opening_deadline is None:
-                        logger.info("%s: gave up, no book within %.0f s", slug, BOOK_WAIT_SECONDS)
-                    return opening_deadline
+                    # Whichever limit ran out, the top of the loop decides:
+                    # the deadline gives up, the other two reconnect.
+                    continue
+                last_message_at = loop.time()
                 if raw == "PONG":
                     continue
                 payload = json.loads(raw)
