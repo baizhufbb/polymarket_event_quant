@@ -199,6 +199,7 @@ def _opening_of(monkeypatch, scripts, **limits):
     class FakeConnect:
         def __init__(self, *args, **kwargs):
             self.socket = FakeSocket(scripts[len(connections)])
+            self.socket.connect_kwargs = kwargs
             connections.append(self.socket)
         async def __aenter__(self):
             return self.socket
@@ -271,3 +272,26 @@ def test_the_opening_window_is_not_cut_short_by_the_waiting_limits(monkeypatch) 
 
     assert len(connections) == 1
     assert rows == [("300", "91"), ("500", "91")]
+
+
+def test_every_connection_shares_one_tls_context(monkeypatch) -> None:
+    """A fresh default context per connect() loads the CA bundle every time.
+
+    With dozens of markets waiting and each reconnecting on a schedule, that
+    churn took the probe from 70 MB to 263 MB in three hours on a 463 MB box.
+    """
+    from polymarket_bot import queue_probe
+
+    connections, rows = _opening_of(
+        monkeypatch,
+        [
+            [],                                             # silent, replaced
+            [_book("up-token", "300"), _book("down-token", "91")],
+        ],
+        SILENCE_SECONDS=0.05,
+    )
+
+    contexts = {id(c.connect_kwargs["ssl"]) for c in connections}
+    assert len(connections) == 2 and len(contexts) == 1
+    assert connections[0].connect_kwargs["ssl"] is queue_probe._ssl_context()
+    assert rows == [("300", "91")]

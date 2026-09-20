@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import ssl
 import time
 from decimal import Decimal
 from pathlib import Path
@@ -33,7 +34,20 @@ RECONNECT_DELAY_SECONDS = 5
 # subscription now and then as well, in case a live socket stops delivering
 # for a subscription while still answering PONGs.
 SILENCE_SECONDS = 30
-RESUBSCRIBE_SECONDS = 600
+RESUBSCRIBE_SECONDS = 1800
+# One TLS context for every connection. websockets builds a fresh default
+# context per connect(), which loads the whole CA bundle each time; with
+# dozens of markets waiting and each reconnecting on the schedule above,
+# that churn took the probe from 70 MB to 263 MB in three hours on the
+# 463 MB Hong Kong box (2026-09-20) and the box had already hung once.
+_SSL_CONTEXT: ssl.SSLContext | None = None
+
+
+def _ssl_context() -> ssl.SSLContext:
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is None:
+        _SSL_CONTEXT = ssl.create_default_context()
+    return _SSL_CONTEXT
 OPENING_WINDOW_SECONDS = 2
 OUTPUT_DIRECTORY = Path(__file__).resolve().parents[1] / "logs"
 OUTPUT_PREFIX = "queue_probe_opening"
@@ -193,6 +207,7 @@ async def _watch_book(
     loop = asyncio.get_running_loop()
     async with websockets.connect(
         PRODUCTION.clob_market_ws_url,
+        ssl=_ssl_context(),
         ping_interval=None,
         close_timeout=5,
         open_timeout=10,
