@@ -89,7 +89,7 @@ class RetryPlacementExchange(FakeExchange):
         self.place_calls = 0
         self.failures = failures
 
-    def place_dual(self, market, *, price, size, submission_interval_ms):
+    def place_dual(self, market, *, price, size, submission_interval_ms, knock_until_ts=None):
         self.place_calls += 1
         if self.place_calls <= self.failures:
             return PlacementResult(
@@ -122,7 +122,7 @@ class RetryPlacementExchange(FakeExchange):
 
 
 class AmbiguousRetryPlacementExchange(RetryPlacementExchange):
-    def place_dual(self, market, *, price, size, submission_interval_ms):
+    def place_dual(self, market, *, price, size, submission_interval_ms, knock_until_ts=None):
         if self.place_calls == 0:
             self.place_calls = 1
             raise AmbiguousPlacementError("network interrupted")
@@ -1532,3 +1532,128 @@ def test_an_adopted_row_carries_the_size_and_side_the_venue_reported(tmp_path) -
     assert sold is not None
     assert sold["side"] == "sell"
     assert sold["role"] == "exit"
+
+
+class OpenDoorExchange(FakeExchange):
+    """The book already exists when the market's turn comes."""
+
+    def __init__(self):
+        super().__init__()
+        self.readiness_calls = []
+
+    def order_books_ready(self, market):
+        self.readiness_calls.append(market.slug)
+        return True
+
+    def place_dual(self, market, **kwargs):
+        raise AssertionError("a market whose door is already open must not be knocked")
+
+
+class GivesUpExchange(FakeExchange):
+    """Knocks out its whole budget without one acceptance."""
+
+    def __init__(self):
+        super().__init__()
+        self.place_calls = 0
+        self.knock_until_ts = None
+
+    def order_books_ready(self, market):
+        return False
+
+    def place_dual(self, market, *, price, size, submission_interval_ms, knock_until_ts=None):
+        self.place_calls += 1
+        self.knock_until_ts = knock_until_ts
+        return PlacementResult(
+            (), "no acceptance within the knocking budget",
+            retryable=False, attempts=9600, held_back=0, gave_up=True,
+        )
+
+
+def _activation_service(database, exchange, run_id):
+    service = BotService.__new__(BotService)
+    service.database = database
+    service.plan = TradePlan(Decimal("0.01"), (), Decimal("1"))
+    service.max_reserved_usd = None
+    service.max_daily_filled_cost = None
+    service.exchange = exchange
+    service.market_activation_worker = SimpleNamespace()
+    service.activation_market_updates = []
+    service._placement_retries = {}
+    service.wake_event = Event()
+    service.run_id = run_id
+    service.run_started_ts = 0
+    service.live = True
+    service.logger = logging.getLogger("test")
+    return service
+
+
+ACTIVATION_DETAILS = {
+    "market_discovered_ts_ms": 1_999_999_000_000,
+    "market_parameters_detected_ts_ms": 1_999_999_000_125,
+}
+
+
+def test_a_market_whose_door_is_already_open_when_its_turn_comes_is_skipped(tmp_path) -> None:
+    """A ticket behind a queue of tens of thousands is worthless: skip, never knock."""
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        run_id = database.start_run("live")
+        exchange = OpenDoorExchange()
+        service = _activation_service(database, exchange, run_id)
+
+        service._consider_market(
+            MARKET,
+            now_ts=1_999_999_000,
+            trigger="market_parameters_activation",
+            orderbook_ready=True,
+            trigger_details=ACTIVATION_DETAILS,
+        )
+
+        row = database.connection.execute(
+            "SELECT state, error FROM markets WHERE slug=?", (MARKET.slug,)
+        ).fetchone()
+        assert row["state"] == "skipped"
+        assert "already open" in row["error"]
+        assert exchange.readiness_calls == [MARKET.slug]
+        assert service.activation_market_updates == []
+        events = database.connection.execute(
+            "SELECT event_type FROM events WHERE slug=? ORDER BY id", (MARKET.slug,)
+        ).fetchall()
+        assert [row["event_type"] for row in events] == ["market_skipped"]
+
+
+def test_knocking_out_the_budget_skips_the_market_instead_of_retrying(tmp_path) -> None:
+    """Given up is final: no requeue, no error state, the next market gets its turn."""
+    import json as json_module
+    import time as time_module
+
+    from polymarket_bot.exchange import KNOCK_SECONDS
+
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        run_id = database.start_run("live")
+        exchange = GivesUpExchange()
+        service = _activation_service(database, exchange, run_id)
+        before = time_module.time()
+
+        service._consider_market(
+            MARKET,
+            now_ts=1_999_999_000,
+            trigger="market_parameters_activation",
+            orderbook_ready=True,
+            trigger_details=ACTIVATION_DETAILS,
+        )
+
+        assert exchange.place_calls == 1
+        # the budget runs from this first attempt
+        assert before - 0.001 + KNOCK_SECONDS <= exchange.knock_until_ts <= time_module.time() + KNOCK_SECONDS
+        row = database.connection.execute(
+            "SELECT state, error FROM markets WHERE slug=?", (MARKET.slug,)
+        ).fetchone()
+        assert row["state"] == "skipped"
+        assert "240 s" in row["error"]
+        assert service.activation_market_updates == []
+        assert service._placement_retries == {}
+        details = json_module.loads(database.connection.execute(
+            "SELECT details_json FROM events WHERE slug=? AND event_type='market_skipped'",
+            (MARKET.slug,),
+        ).fetchone()["details_json"])
+        assert details["submission_attempts"] == 9600

@@ -107,6 +107,7 @@ class PlacementResult:
     expected: int = 2
     registered_ts_ms: int | None = None
     held_back: int = 0
+    gave_up: bool = False
 
     @property
     def complete(self) -> bool:

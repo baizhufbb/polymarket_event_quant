@@ -12,6 +12,7 @@ from .config import BotConfig
 from .database import BotDatabase
 from .discovery import MarketDiscovery, is_eligible
 from .exchange import (
+    KNOCK_SECONDS,
     DEFAULT_PLACEMENT_INTERVAL_MS,
     AmbiguousPlacementError,
     Exchange,
@@ -819,7 +820,10 @@ class BotService:
         self._place(market, trigger=trigger, trigger_details=trigger_details)
         return True
 
-    def _skip_market(self, market: Market, reason: str) -> None:
+    def _skip_market(
+        self, market: Market, reason: str, details: dict | None = None
+    ) -> None:
+        self._placement_retries.pop(market.slug, None)
         self.database.prepare_market(self.run_id, market, state="skipped")
         self.database.set_market_state(market.slug, "skipped", reason)
         self.database.event(
@@ -827,8 +831,33 @@ class BotService:
             "WARNING",
             "market_skipped",
             slug=market.slug,
-            details={"reason": reason},
+            details={"reason": reason, **(details or {})},
         )
+        self.logger.info("LIVE %s: skipped, %s", market.slug, reason)
+
+    def _door_already_open(self, market: Market) -> bool:
+        """Is the book there before we have knocked once?
+
+        A market that waited in the queue behind a slow door, or a listing
+        the venue opened together with the record, already has a queue of
+        thousands to a hundred thousand shares; a ticket at the back of it
+        is worthless and is skipped rather than placed. Unsure means knock.
+        """
+        exchange = self.fleet.primary.exchange if self.fleet else self.exchange
+        ready = getattr(exchange, "order_books_ready", None)
+        if ready is None:
+            return False
+        try:
+            return bool(ready(market))
+        except Exception as exc:
+            self.database.event(
+                self.run_id,
+                "ERROR",
+                "orderbook_check_failed",
+                slug=market.slug,
+                details={"error": f"{type(exc).__name__}: {exc}"},
+            )
+            return False
 
     def _place(
         self,
@@ -838,6 +867,26 @@ class BotService:
         trigger_details: dict | None = None,
     ) -> None:
         placement_retry = self._placement_retries.get(market.slug)
+        # Knock for at most KNOCK_SECONDS from the first attempt, whatever
+        # the retries in between; a market past that is skipped, not retried.
+        first_started_ts_ms = (
+            placement_retry.first_started_ts_ms
+            if placement_retry is not None
+            else int(time.time() * 1000)
+        )
+        knock_until_ts = first_started_ts_ms / 1000 + KNOCK_SECONDS
+        if self.live and trigger == "market_parameters_activation":
+            if time.time() >= knock_until_ts:
+                self._skip_market(
+                    market,
+                    f"knocking budget of {KNOCK_SECONDS:g} s used up before its turn",
+                )
+                return
+            if self._door_already_open(market):
+                self._skip_market(
+                    market, "order book already open when its turn came"
+                )
+                return
         if placement_retry is None:
             self.database.prepare_market(self.run_id, market)
         if not self.live:
@@ -876,6 +925,7 @@ class BotService:
                 trigger=trigger,
                 trigger_details=trigger_details,
                 placement_retry=placement_retry,
+                knock_until_ts=knock_until_ts,
             )
             return
 
@@ -888,6 +938,7 @@ class BotService:
                 price=self.plan.buy_price,
                 size=self.plan.order_size,
                 submission_interval_ms=self.placement_interval_ms,
+                knock_until_ts=knock_until_ts,
             )
         except AmbiguousPlacementError as exc:
             submission_error = f"{type(exc).__name__}: {exc}"
@@ -969,6 +1020,13 @@ class BotService:
             )
             self.logger.info("LIVE %s: both orders accepted", market.slug)
         else:
+            if result.gave_up and not result.orders:
+                self._skip_market(
+                    market,
+                    f"no acceptance within {KNOCK_SECONDS:g} s of knocking",
+                    details=placement_details,
+                )
+                return
             if self._requeue_placement(
                 market,
                 result=result,
@@ -1023,6 +1081,7 @@ class BotService:
         trigger: str,
         trigger_details: dict | None,
         placement_retry: _PlacementRetryState | None,
+        knock_until_ts: float | None = None,
     ) -> None:
         placement_started_ts_ms = int(time.time() * 1000)
         placement = None
@@ -1032,6 +1091,7 @@ class BotService:
                 market,
                 price=self.plan.buy_price,
                 submission_interval_ms=self.placement_interval_ms,
+                knock_until_ts=knock_until_ts,
             )
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -1078,6 +1138,14 @@ class BotService:
                 market.slug,
                 placement.kept,
                 len(placement.cancelled_order_ids),
+            )
+            return
+
+        if placement.gave_up:
+            self._skip_market(
+                market,
+                f"no acceptance within {KNOCK_SECONDS:g} s of knocking",
+                details=placement_details,
             )
             return
 

@@ -1279,3 +1279,37 @@ def replace_market_end(market: Market, *, end_in_seconds: int) -> Market:
     return dataclasses.replace(
         market, end_ts=int(time_module.time()) + end_in_seconds
     )
+
+
+def test_knocking_gives_up_after_its_budget_and_is_not_retried() -> None:
+    """A door that never opens must not pin the loop until the market ends.
+
+    Since 2026-09-05 the venue sometimes opens a book minutes to hours after
+    the listing; the loop's only exit was the market's end a day later, and
+    one such market pinned a whole session. Past the budget the market is
+    handed back as given up - not retryable - so the service skips it.
+    """
+    from polymarket_bot.exchange import KNOCK_BUDGET_ERROR
+
+    exchange = Exchange.__new__(Exchange)
+    exchange.entry_submission = "single"
+    exchange.client = _PerTokenClient(
+        {"up-token": "not_ready", "down-token": "not_ready"}
+    )
+    started = time.monotonic()
+
+    result = exchange.place_dual(
+        _staggered_market(end_in_seconds=60),
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        submission_interval_ms=Decimal("1"),
+        knock_until_ts=time.time() + 0.3,
+    )
+
+    assert time.monotonic() - started < 2.0
+    assert result.gave_up
+    assert not result.retryable
+    assert result.orders == ()
+    assert result.attempts >= 5
+    assert KNOCK_BUDGET_ERROR in (result.error or "")
+    assert exchange.client.canceled == []

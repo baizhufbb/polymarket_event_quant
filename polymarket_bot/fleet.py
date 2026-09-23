@@ -17,7 +17,7 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 from threading import Thread
 
-from .exchange import Exchange
+from .exchange import KNOCK_SECONDS, Exchange
 from .models import Market, PlacedOrder, PlacementResult
 
 
@@ -74,6 +74,16 @@ class FleetPlacement:
         return self.kept is None and all(
             placement.result is not None
             and placement.result.retryable
+            and not placement.result.orders
+            for placement in self.placements
+        )
+
+    @property
+    def gave_up(self) -> bool:
+        """Every member knocked out its budget with nothing accepted."""
+        return self.kept is None and all(
+            placement.result is not None
+            and placement.result.gave_up
             and not placement.result.orders
             for placement in self.placements
         )
@@ -196,6 +206,7 @@ class Fleet:
         *,
         price: Decimal,
         submission_interval_ms: Decimal,
+        knock_until_ts: float | None = None,
     ) -> FleetPlacement:
         outcomes: dict[str, MemberPlacement] = {}
         # One timetable for the whole fleet: every member sends only at
@@ -203,6 +214,9 @@ class Fleet:
         # offset before it started instead put the offset ahead of the
         # warm-up and signing, whose cost is far larger and varies per call.
         grid_origin = time.monotonic()
+        # And one knocking budget, so the members give up together.
+        if knock_until_ts is None:
+            knock_until_ts = time.time() + KNOCK_SECONDS
 
         def run(member: FleetMember) -> None:
             try:
@@ -213,6 +227,7 @@ class Fleet:
                     submission_interval_ms=submission_interval_ms,
                     grid_origin=grid_origin,
                     phase_offset_ms=member.phase_offset_ms,
+                    knock_until_ts=knock_until_ts,
                 )
             except Exception as exc:  # noqa: BLE001 - reported per member
                 outcomes[member.name] = MemberPlacement(

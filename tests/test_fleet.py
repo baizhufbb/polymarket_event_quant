@@ -34,7 +34,9 @@ class FakeExchange:
         cancel_exc=None,
         open_rows=(),
         orders_by_id=None,
+        gave_up=False,
     ):
+        self.gave_up = gave_up
         self.name = name
         self.registered_ts_ms = registered_ts_ms
         self.complete = complete
@@ -58,14 +60,21 @@ class FakeExchange:
         submission_interval_ms,
         grid_origin=None,
         phase_offset_ms=Decimal(0),
+        knock_until_ts=None,
     ):
         self.started_at = time.monotonic()
         self.grid_origin = grid_origin
+        self.knock_until_ts = knock_until_ts
         self.phase_offset_ms = phase_offset_ms
         self.sizes.append(size)
         time.sleep(0.02)
         if self.raise_exc:
             raise self.raise_exc
+        if self.gave_up:
+            return PlacementResult(
+                (), "no acceptance within the knocking budget",
+                retryable=False, attempts=3, expected=1, gave_up=True,
+            )
         if not self.complete:
             return PlacementResult((), "not ready", retryable=True, attempts=3, expected=1)
         order = PlacedOrder(
@@ -526,3 +535,27 @@ def test_the_cap_is_the_pool_share_in_every_submission_mode():
 
     assert batch.max_requests_in_flight == in_flight_budget(1)
     assert solo.max_requests_in_flight == in_flight_budget(1)
+
+
+def test_every_member_shares_one_knocking_budget():
+    """The members give up together, on the deadline the fleet was handed."""
+    fleet = Fleet([member("primary", 0), member("m1", 60), member("m2", 120)])
+    until = time.time() + 240
+
+    fleet.place(
+        MARKET, price=Decimal("0.01"), submission_interval_ms=Decimal("25"), knock_until_ts=until
+    )
+
+    assert [m.exchange.knock_until_ts for m in fleet.members] == [until, until, until]
+
+
+def test_the_fleet_gives_up_only_when_every_member_did():
+    everyone = Fleet([member("primary", 0, gave_up=True), member("m1", 60, gave_up=True)])
+    placement = place(everyone)
+    assert placement.gave_up
+    assert not placement.retryable
+
+    one_registered = Fleet([member("primary", 0, gave_up=True), member("m1", 60)])
+    placement = place(one_registered)
+    assert not placement.gave_up
+    assert placement.kept == "m1"

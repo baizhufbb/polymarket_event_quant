@@ -54,6 +54,13 @@ DEFAULT_PLACEMENT_INTERVAL_MS = Decimal("20")
 SIGNING_NOT_READY_RETRY_SECONDS = 0.5
 SIGNING_NOT_READY_POLL_SECONDS = 0.1
 DRAIN_TIMEOUT_SECONDS = 3.0
+# How long a market is knocked before it is given up as skipped. Doors open
+# 53..125 s after the listing on the venue's normal days (hourly p90 about
+# 110 s over 2026-09-22/23) and minutes to hours on its bad ones; 240 s takes
+# the whole normal distribution and bounds the damage of a bad one to four
+# minutes of not-ready replies instead of a session pinned on one market.
+KNOCK_SECONDS = 240.0
+KNOCK_BUDGET_ERROR = "no acceptance within the knocking budget"
 # A moment this close after a slot still counts as that slot. The monotonic
 # clock reads in the millions of seconds, where a double carries about a
 # nanosecond of noise, so without slack the arithmetic below rounds up at
@@ -268,7 +275,10 @@ class Exchange:
         submission_interval_ms: Decimal | None = None,
         grid_origin: float | None = None,
         phase_offset_ms: Decimal = Decimal(0),
+        knock_until_ts: float | None = None,
     ) -> PlacementResult:
+        if knock_until_ts is None:
+            knock_until_ts = time.time() + KNOCK_SECONDS
         warm_connections()
         # The hot path sends through the event loop's own pool, which
         # dials its own connections; warm it alongside the sync pool.
@@ -303,6 +313,7 @@ class Exchange:
             grid_origin=grid_origin,
             phase_offset_ms=phase_offset_ms,
             market_end_ts=market.end_ts,
+            knock_until_ts=knock_until_ts,
             submission_key=submission_key,
             submissions=submissions,
         )
@@ -316,6 +327,7 @@ class Exchange:
         size: Decimal,
         submission_interval_ms: Decimal,
         market_end_ts: int,
+        knock_until_ts: float,
         submission_key: tuple,
         submissions: dict[tuple, list[PostOrdersV2Args]],
         grid_origin: float | None = None,
@@ -366,12 +378,22 @@ class Exchange:
             max(started, self._next_placement_submission)
         )
         stop_submitting = False
+        gave_up = False
         drain_deadline: float | None = None
 
         while pending or not stop_submitting:
             now = time.monotonic()
             if not stop_submitting and time.time() >= market_end_ts:
                 errors.append("market ended before both orders were accepted")
+                stop_submitting = True
+            elif not stop_submitting and time.time() >= knock_until_ts:
+                # The door did not open inside the knocking budget. Stop here
+                # and let the caller mark the market skipped: since 2026-09-05
+                # the venue sometimes opens a book minutes to hours after the
+                # listing, and the loop's only other exit is the market's end
+                # a day later - one such market pinned a whole session.
+                errors.append(KNOCK_BUDGET_ERROR)
+                gave_up = True
                 stop_submitting = True
             if (
                 not stop_submitting
@@ -552,6 +574,7 @@ class Exchange:
                 attempts=attempts,
                 held_back=held_back,
                 expected=len(specifications),
+                gave_up=gave_up,
             )
         return self._finalize_dual_result(
             result,
