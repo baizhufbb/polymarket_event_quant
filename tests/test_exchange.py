@@ -1413,3 +1413,31 @@ def test_replies_landing_after_the_drain_are_still_recorded(monkeypatch) -> None
     while len(rows) < result.attempts and time.monotonic() < deadline:
         time.sleep(0.02)
     assert len(rows) == result.attempts
+
+
+def test_a_late_reply_is_recorded_as_whatever_it_turned_out_to_be() -> None:
+    """A reply that lands after the drain is written as it came back - a
+    failure as a failure - and a request that never ran leaves no row."""
+    from concurrent.futures import Future
+
+    rows = []
+    exchange = Exchange.__new__(Exchange)
+    exchange.attempt_trace = rows.append
+    specs = (("up", "up-token"),)
+
+    failed = Future()
+    failed.set_exception(PolyApiException(error_msg="Request exception!"))
+    exchange._trace_when_done(specs, 7, 1000, failed)
+    answered = Future()
+    answered.set_result(
+        [{"success": False, "errorMsg": "the market is not yet ready to process new orders"}]
+    )
+    exchange._trace_when_done(specs, 8, 1010, answered)
+    never_ran = Future()
+    never_ran.cancel()
+    exchange._trace_when_done(specs, 9, 1020, never_ran)
+
+    assert [(row["attempt"], row["sent_ts_ms"], row["results"]) for row in rows] == [
+        (7, 1000, ["transport_error"]),
+        (8, 1010, ["not_ready"]),
+    ]

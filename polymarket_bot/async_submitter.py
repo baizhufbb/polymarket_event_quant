@@ -64,6 +64,7 @@ from .transport import (
     ORDER_CONNECT_SECONDS,
     ORDER_CONNECTIONS,
     ORDER_SILENCE_SECONDS,
+    STREAMS_PER_CONNECTION,
 )
 
 logger = logging.getLogger(__name__)
@@ -127,10 +128,11 @@ class AsyncSubmitter:
     def __init__(self, transport: httpx.AsyncBaseTransport | None = None) -> None:
         self._transport = transport
         self._loop: asyncio.AbstractEventLoop | None = None
-        # One HTTP/2 connection each, used in turn; only the loop thread
-        # touches the list and the turn counter.
+        # One HTTP/2 connection each, and how many requests each is carrying
+        # right now. Both are built on the loop thread; the counts are only
+        # ever touched there.
         self._clients: list[httpx.AsyncClient] = []
-        self._next_client = 0
+        self._in_flight: list[int] = []
         self._ready = threading.Event()
         self._thread: threading.Thread | None = None
         self._prepared: dict[int, PreparedLeg] = {}
@@ -141,15 +143,20 @@ class AsyncSubmitter:
     # -- lifecycle ---------------------------------------------------------
 
     def start(self) -> None:
+        """Start the loop if needed; every caller returns only once it is up.
+
+        A caller that found the thread already alive used to return at once,
+        while the loop was still building its clients - in a fleet, every
+        member but the one that started the loop then failed its first send.
+        """
         with self._lock:
-            if self._thread is not None and self._thread.is_alive():
-                return
-            self._ready.clear()
-            self._thread = threading.Thread(
-                target=self._run, name="async-submitter", daemon=True
-            )
-            self._thread.start()
-        if not self._ready.wait(timeout=10.0):
+            if self._thread is None or not self._thread.is_alive():
+                self._ready.clear()
+                self._thread = threading.Thread(
+                    target=self._run, name="async-submitter", daemon=True
+                )
+                self._thread.start()
+        if not self._ready.wait(timeout=30.0):
             raise RuntimeError("async submitter loop failed to start")
 
     def _run(self) -> None:
@@ -160,9 +167,13 @@ class AsyncSubmitter:
         # connection), so the pool no longer grows one socket per request.
         # The original HTTP/2 concern - one slow reply
         # blocking every other reply behind a read lock - was diagnosed in
-        # the *sync* httpcore transport; the async transport pumps one
-        # network read per lock acquisition and dispatches to every
-        # stream, so it does not head-of-line block the same way. The
+        # the *sync* httpcore transport. The async transport has a milder
+        # form: a reply that has arrived reaches its request only when the
+        # read in progress returns, i.e. with the connection's next bytes -
+        # a few ms on a busy connection, tens on a quiet one. The fleet
+        # keeps the order whose acceptance came back first, and its members
+        # are 5 ms apart, so sends fill one connection before spilling onto
+        # the next (_pick_client) rather than spreading thin. The
         # cancel-and-redial storm and the O(connections) pool scan that
         # collapsed run30 (pool 512->1280) both disappear when there are
         # only a few connections to scan. Measured 2026-09-01: from the
@@ -175,10 +186,13 @@ class AsyncSubmitter:
         # streams run out, then makes the rest wait (see
         # transport.ORDER_CONNECTIONS). No timeout here may fire on a merely
         # slow venue - over HTTP/2 a read or write timeout fails the whole
-        # connection.
+        # connection. One TLS context for all of them: each client would
+        # otherwise load the CA bundle itself, about half a second apiece.
+        tls = httpx.create_ssl_context()
         clients = [
             httpx.AsyncClient(
                 http2=True,
+                verify=tls,
                 transport=self._transport,
                 limits=httpx.Limits(
                     max_connections=ORDER_CLIENT_CONNECTIONS,
@@ -193,7 +207,7 @@ class AsyncSubmitter:
         ]
         self._loop = loop
         self._clients = clients
-        self._next_client = 0
+        self._in_flight = [0] * len(clients)
         self._ready.set()
         try:
             loop.run_forever()
@@ -214,7 +228,7 @@ class AsyncSubmitter:
         with self._lock:
             self._loop = None
             self._clients = []
-            self._next_client = 0
+            self._in_flight = []
             self._prepared.clear()
         self._ready.clear()
 
@@ -262,16 +276,27 @@ class AsyncSubmitter:
             self._heal_order_version(leg.client)
         return response
 
-    def _next_order_client(self) -> httpx.AsyncClient:
-        """The next client in turn; called on the loop thread only."""
-        client = self._clients[self._next_client % len(self._clients)]
-        self._next_client += 1
-        return client
+    def _pick_client(self) -> int:
+        """The first connection with a stream to spare; loop thread only.
+
+        Filling one connection before the next keeps a normal market's
+        traffic on a single busy connection, where an arrived reply is
+        read within a few ms; the others take the overflow of a slow spell.
+        If every connection is full the least loaded one queues the request
+        - the send loop's per-account ceiling is sized so it never gets
+        there.
+        """
+        for index, carrying in enumerate(self._in_flight):
+            if carrying < STREAMS_PER_CONNECTION:
+                return index
+        return min(range(len(self._in_flight)), key=self._in_flight.__getitem__)
 
     async def _request(self, leg: PreparedLeg) -> object:
         assert self._clients
+        index = self._pick_client()
+        self._in_flight[index] += 1
         try:
-            response = await self._next_order_client().post(
+            response = await self._clients[index].post(
                 leg.url, content=leg.body_bytes, headers=leg.headers()
             )
         except httpx.RequestError as exc:
@@ -280,6 +305,8 @@ class AsyncSubmitter:
                 str(exc) or type(exc).__name__,
             )
             raise PolyApiException(error_msg="Request exception!")
+        finally:
+            self._in_flight[index] -= 1
         if response.status_code != 200:
             logger.error(
                 "[async-submitter] request error status=%s url=%s body=%s",

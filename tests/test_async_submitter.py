@@ -10,6 +10,7 @@ the open.
 
 import asyncio
 import json
+import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, wait
 
@@ -128,26 +129,71 @@ def test_a_slow_reply_is_waited_for_not_cancelled(flat_headers):
         submitter.stop()
 
 
-def test_sends_take_the_order_connections_in_turn(flat_headers):
-    """One client keeps every request on its single HTTP/2 connection until
-    the streams run out; the room comes from using several in turn."""
+def test_sends_fill_one_connection_before_spilling_onto_the_next(flat_headers):
+    """A client never dials a second connection for room, so the room comes
+    from several clients. Spread thin, each connection goes quiet and an
+    arrived reply waits for that connection's next bytes before its request
+    sees it - noise larger than the 5 ms between fleet members, whose order
+    of acceptance decides which order the fleet keeps. So a normal market
+    stays on one busy connection and only a slow spell spills over."""
+    from polymarket_bot import transport
+
     submitter = _submitter(lambda request: httpx.Response(200, json={}))
     used = []
+    release = threading.Event()
 
-    class Recording:
+    class Holding:
         def __init__(self, index):
             self.index = index
 
         async def post(self, url, content, headers):
             used.append(self.index)
+            while not release.is_set():
+                await asyncio.sleep(0.005)
             return httpx.Response(200, json={})
 
     try:
         submitter.start()
-        submitter._clients = [Recording(index) for index in range(4)]
-        for _ in range(9):
-            submitter.submit([_leg()]).result(timeout=10)
-        assert used == [0, 1, 2, 3, 0, 1, 2, 3, 0]
+        submitter._clients = [Holding(index) for index in range(3)]
+        submitter._in_flight = [0, 0, 0]
+        waiting = transport.STREAMS_PER_CONNECTION + 3
+        futures = [submitter.submit([_leg()]) for _ in range(waiting)]
+        deadline = time.monotonic() + 10
+        while len(used) < waiting and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert used.count(0) == transport.STREAMS_PER_CONNECTION
+        assert used.count(1) == 3
+        release.set()
+        for future in futures:
+            future.result(timeout=10)
+        # Replies back, streams free: the next send is on the first again.
+        submitter.submit([_leg()]).result(timeout=10)
+        assert used[-1] == 0
+    finally:
+        release.set()
+        submitter.stop()
+
+
+def test_a_second_caller_waits_for_the_loop_to_be_ready(flat_headers, monkeypatch):
+    """Fleet members start the loop concurrently. One that found the thread
+    alive used to return while the clients were still being built, and its
+    first send then failed - every member but one sat out the first market."""
+    real_context = httpx.create_ssl_context
+
+    def slow_context(*args, **kwargs):
+        time.sleep(0.5)
+        return real_context(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "create_ssl_context", slow_context)
+    submitter = _submitter(lambda request: httpx.Response(200, json={"ok": True}))
+    try:
+        first = threading.Thread(target=submitter.start)
+        first.start()
+        time.sleep(0.1)  # the loop thread is alive and still building
+        submitter.start()
+        assert submitter._loop is not None and submitter._clients
+        assert submitter.submit([_leg()]).result(timeout=10) == [{"ok": True}]
+        first.join(timeout=10)
     finally:
         submitter.stop()
 
@@ -167,6 +213,9 @@ def test_order_connections_are_http2_and_outlast_a_slow_venue():
         for client in clients:
             pool = client._transport._pool
             assert pool._http2 is True
+            # Room for a replacement to dial while a connection the venue
+            # retired (GOAWAY after 10,000 streams) drains its streams.
+            assert pool._max_connections >= 2
             assert pool._max_connections == transport.ORDER_CLIENT_CONNECTIONS
             assert pool._max_keepalive_connections == transport.ORDER_CLIENT_CONNECTIONS
             assert client.timeout.read >= 10
