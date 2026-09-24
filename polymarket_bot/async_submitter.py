@@ -20,7 +20,7 @@ timestamp moves, and it is whole seconds.
 Response semantics mirror the sync stack exactly:
   - HTTP 200        -> parsed JSON (or raw text)
   - other statuses  -> PolyApiException(resp)        [helpers.request]
-  - network errors  -> PolyApiException("Request exception!")
+  - any failure of the send itself -> PolyApiException("Request exception!")
   - non-transient PolyApiException per leg -> {"errorMsg": ..., "success":
     False}                                           [Exchange._post_single]
 
@@ -293,13 +293,25 @@ class AsyncSubmitter:
 
     async def _request(self, leg: PreparedLeg) -> object:
         assert self._clients
+        # Signing the headers is our own work: if it fails, that is our bug,
+        # and it propagates to stop the placement as it always did.
+        headers = leg.headers()
         index = self._pick_client()
         self._in_flight[index] += 1
         try:
             response = await self._clients[index].post(
-                leg.url, content=leg.body_bytes, headers=leg.headers()
+                leg.url, content=leg.body_bytes, headers=headers
             )
-        except httpx.RequestError as exc:
+        except Exception as exc:
+            # Anything the HTTP stack raises while sending is a failed send,
+            # not a verdict on the market. httpx does not wrap everything
+            # HTTP/2 can throw - h2's ProtocolError ("Invalid input
+            # ConnectionInputs.SEND_SETTINGS in state ConnectionState.CLOSED")
+            # and "semaphore released too many times" came through raw, the
+            # send loop took them for unknown trouble, and every member
+            # stopped knocking: two markets lost in run37, one in run38. As a
+            # network error the loop simply sends again - the same signed
+            # order, so the worst a resend earns is "Duplicated".
             logger.error(
                 "[async-submitter] request error: %s",
                 str(exc) or type(exc).__name__,

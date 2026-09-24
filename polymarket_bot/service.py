@@ -164,6 +164,22 @@ class BotService:
                         error,
                     )
             self.member_stream_workers = tuple(extras)
+            # The same streams tell the fleet which order the venue
+            # registered first, so it keeps that one (Fleet._choose).
+            streams = tuple(
+                worker
+                for worker in (self.user_stream_worker, *self.member_stream_workers)
+                if worker is not None
+            )
+
+            def registration_clock(order_id: str) -> int | None:
+                for worker in streams:
+                    stamp = worker.registered_ts_ms(order_id)
+                    if stamp is not None:
+                        return stamp
+                return None
+
+            self.fleet.registration_clock = registration_clock
         self.market_activation_worker = (
             MarketActivationWorker(
                 window_minutes=lookahead_minutes,

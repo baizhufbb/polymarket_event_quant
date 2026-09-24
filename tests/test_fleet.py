@@ -559,3 +559,70 @@ def test_the_fleet_gives_up_only_when_every_member_did():
     placement = place(one_registered)
     assert not placement.gave_up
     assert placement.kept == "m1"
+
+
+def test_the_venue_registration_time_decides_which_order_is_kept():
+    """The first acceptance reply to reach us is not the first registration:
+    in run38 keeping it picked a later registration in 10 of 70 markets,
+    412 shares deeper at the median."""
+    fleet = Fleet([
+        member("primary", registered_ts_ms=900),  # its reply came back first
+        member("m1", registered_ts_ms=1000),
+        member("m2", registered_ts_ms=1100),
+    ])
+    fleet.registration_clock = {
+        "primary-order": 5010,
+        "m1-order": 5003,
+        "m2-order": 5020,
+    }.get
+
+    placement = place(fleet)
+
+    assert placement.kept == "m1"
+    assert fleet.member("primary").exchange.canceled == ["primary-order"]
+    assert fleet.member("m1").exchange.canceled == []
+    details = placement.details()
+    assert details["kept_by"] == "venue"
+    assert details["members"]["m1"]["venue_registered_ts_ms"] == 5003
+
+
+def test_a_missing_venue_time_falls_back_to_the_reply_order_for_everyone(monkeypatch):
+    """The two clocks are never compared: without every registered member's
+    venue time, the reply order decides for all of them."""
+    import polymarket_bot.fleet as fleet_module
+
+    monkeypatch.setattr(fleet_module, "VENUE_STAMP_WAIT_SECONDS", 0.05)
+    fleet = Fleet([
+        member("primary", registered_ts_ms=900),
+        member("m1", registered_ts_ms=1000),
+    ])
+    fleet.registration_clock = {"m1-order": 5003}.get  # primary's never lands
+
+    placement = place(fleet)
+
+    assert placement.kept == "primary"
+    details = placement.details()
+    assert details["kept_by"] == "reply"
+    assert details["members"]["m1"]["venue_registered_ts_ms"] is None
+
+
+def test_a_venue_time_that_lands_during_the_wait_is_used():
+    fleet = Fleet([
+        member("primary", registered_ts_ms=900),
+        member("m1", registered_ts_ms=1000),
+    ])
+    landed = {"m1-order": 5003}
+    asked = []
+
+    def clock(order_id):
+        asked.append(order_id)
+        if len(asked) > 6:  # primary's push lands a few looks later
+            landed["primary-order"] = 5010
+        return landed.get(order_id)
+
+    fleet.registration_clock = clock
+
+    placement = place(fleet)
+
+    assert placement.kept == "m1"
+    assert placement.details()["kept_by"] == "venue"

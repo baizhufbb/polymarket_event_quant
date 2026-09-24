@@ -13,12 +13,19 @@ so exposure stays at one order per market.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from threading import Thread
 
 from .exchange import KNOCK_SECONDS, Exchange
 from .models import Market, PlacedOrder, PlacementResult
+
+# How long the choice of which order to keep may wait for the venue's own
+# registration times. In run38 each push reached us 10 ms (median, 247 at
+# most) after its registration, and the choice came 157 ms or more after the
+# last of them in all 70 markets, so this wait almost never runs.
+VENUE_STAMP_WAIT_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -47,6 +54,10 @@ class FleetPlacement:
     orders: tuple[PlacedOrder, ...]
     cancelled_order_ids: tuple[str, ...] = ()
     cancel_errors: tuple[str, ...] = ()
+    # "venue": chosen on the venue's registration times; "reply": on when
+    # each acceptance reply reached us, because a venue time was missing.
+    kept_by: str | None = None
+    venue_registered_ts_ms: dict[str, int] | None = None
 
     @property
     def attempts(self) -> int:
@@ -99,12 +110,16 @@ class FleetPlacement:
                 "registered": placement.registered,
                 "attempts": result.attempts if result else 0,
                 "registered_ts_ms": result.registered_ts_ms if result else None,
+                "venue_registered_ts_ms": (self.venue_registered_ts_ms or {}).get(
+                    placement.member
+                ),
                 "held_back": result.held_back if result else None,
                 "order_ids": [order.order_id for order in result.orders] if result else [],
                 "error": placement.error or (result.error if result else None),
             }
         return {
             "kept": self.kept,
+            "kept_by": self.kept_by,
             "cancelled_order_ids": list(self.cancelled_order_ids),
             "cancel_errors": list(self.cancel_errors),
             "members": members,
@@ -185,6 +200,9 @@ class Fleet:
         self.members = members
         self.keep_best = keep_best
         self.order_view = FleetOrderView(members)
+        # order id -> when the venue registered it, from the members' user
+        # streams; the service wires it once those streams exist.
+        self.registration_clock: Callable[[str], int | None] | None = None
         # Every member's requests come out of one process-wide pool, so each
         # one may only hold its share of it.
         for member in members:
@@ -246,21 +264,73 @@ class Fleet:
             thread.join()
 
         placements = tuple(outcomes[member.name] for member in self.members)
-        kept = self._choose(placements)
+        kept, kept_by, stamps = self._choose(placements)
         orders, cancelled, errors = self._settle(placements, kept)
-        return FleetPlacement(placements, kept, orders, tuple(cancelled), tuple(errors))
+        return FleetPlacement(
+            placements,
+            kept,
+            orders,
+            tuple(cancelled),
+            tuple(errors),
+            kept_by=kept_by,
+            venue_registered_ts_ms=stamps,
+        )
 
-    @staticmethod
-    def _choose(placements: tuple[MemberPlacement, ...]) -> str | None:
-        best: tuple[tuple, str] | None = None
-        for index, placement in enumerate(placements):
-            if not placement.registered:
-                continue
-            registered_ts_ms = placement.result.registered_ts_ms
-            key = (registered_ts_ms is None, registered_ts_ms or 0, index)
-            if best is None or key < best[0]:
-                best = (key, placement.member)
-        return best[1] if best else None
+    def _choose(
+        self, placements: tuple[MemberPlacement, ...]
+    ) -> tuple[str | None, str | None, dict[str, int] | None]:
+        """Keep the member whose order the venue registered first.
+
+        Which acceptance reply reaches us first is not the same thing: it
+        adds the venue's reply, the way back, the HTTP stack handing the
+        reply over and a member thread waking on a shared core, while the
+        members register a few ms apart. In run38 that picked a later
+        registration in 10 of 70 markets, 412 shares deeper at the median.
+        The venue's own time settles it; the reply time is used only when a
+        registered member's venue time never arrived, and then for every
+        member, so the two clocks are never compared.
+        """
+        registered = [
+            (index, placement)
+            for index, placement in enumerate(placements)
+            if placement.registered
+        ]
+        if not registered:
+            return None, None, None
+        stamps = self._venue_stamps(registered)
+        if stamps is not None:
+            chosen = min(
+                registered, key=lambda item: (stamps[item[1].member], item[0])
+            )
+            return chosen[1].member, "venue", stamps
+
+        def reply_key(item):
+            registered_ts_ms = item[1].result.registered_ts_ms
+            return (registered_ts_ms is None, registered_ts_ms or 0, item[0])
+
+        return min(registered, key=reply_key)[1].member, "reply", None
+
+    def _venue_stamps(
+        self, registered: list[tuple[int, MemberPlacement]]
+    ) -> dict[str, int] | None:
+        """Each registered member's venue registration time, or None."""
+        if self.registration_clock is None:
+            return None
+        deadline = time.monotonic() + VENUE_STAMP_WAIT_SECONDS
+        while True:
+            stamps: dict[str, int] = {}
+            for _, placement in registered:
+                found = [
+                    self.registration_clock(order.order_id)
+                    for order in placement.result.orders
+                ]
+                if found and all(stamp is not None for stamp in found):
+                    stamps[placement.member] = min(found)
+            if len(stamps) == len(registered):
+                return stamps
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.01)
 
     def _settle(
         self,

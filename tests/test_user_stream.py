@@ -547,3 +547,45 @@ def test_a_sick_member_stream_does_not_pause_trading(tmp_path) -> None:
         ]
         # A warning, not the ERROR that reads as "new placements paused".
         assert levels == ["WARNING"]
+
+
+def test_a_placement_push_is_readable_the_moment_it_arrives() -> None:
+    """The fleet chooses which order to keep before the service loop gets
+    round to the queue, so the venue's registration time has to be readable
+    as soon as the push lands - and later pushes must not move it."""
+    from polymarket.models import ApiKeyCreds
+
+    from polymarket_bot.config import BotConfig
+
+    worker = UserStreamWorker(
+        BotConfig(
+            project_root=__import__("pathlib").Path("."),
+            private_key="",
+            funder_address="",
+            signature_type=0,
+            api_key=None,
+            api_secret=None,
+            api_passphrase=None,
+        ),
+        logger=logging.getLogger("test"),
+        credentials=ApiKeyCreds(key="k", secret="s", passphrase="p"),
+        account="m1",
+    )
+    placed = UserStreamWorker._normalize_order(
+        _order_event(
+            event_type="PLACEMENT", status="LIVE", matched="0", timestamp="2000000000123"
+        )
+    )
+    worker._accept_order(placed)
+    assert worker.registered_ts_ms("up-order") == 2_000_000_000_123
+
+    matched = UserStreamWorker._normalize_order(
+        _order_event(
+            event_type="UPDATE", status="LIVE", matched="10", timestamp="2000000009999"
+        )
+    )
+    worker._accept_order(matched)
+    assert worker.registered_ts_ms("up-order") == 2_000_000_000_123
+    assert worker.registered_ts_ms("someone-else") is None
+    # The service still receives every update, in order.
+    assert [update.event_type for update in worker.drain()] == ["PLACEMENT", "UPDATE"]

@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from decimal import Decimal
 from queue import Empty, SimpleQueue
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 
 from polymarket import PRODUCTION
 from polymarket._internal.streams.clob.user import ClobUserStreamManager
@@ -79,6 +79,11 @@ class UserStreamWorker:
         self._updates: SimpleQueue[
             UserOrderUpdate | UserTradeUpdate | UserStreamState
         ] = SimpleQueue()
+        # When each of this account's orders registered, on the venue's own
+        # clock, readable the moment its push arrives: the fleet decides which
+        # order to keep before the service loop gets round to the queue.
+        self._registered_at: dict[str, int] = {}
+        self._registered_lock = Lock()
         self._attempted = False
         self._thread: Thread | None = None
 
@@ -152,7 +157,7 @@ class UserStreamWorker:
                 finally:
                     next_event = None
                 if isinstance(event, UserOrderEvent):
-                    self._updates.put(self._normalize_order(event))
+                    self._accept_order(self._normalize_order(event))
                 elif isinstance(event, UserTradeEvent):
                     self._updates.put(self._normalize_trade(event))
         finally:
@@ -166,6 +171,19 @@ class UserStreamWorker:
             if handle is not None:
                 await handle.close()
             await manager.close()
+
+    def registered_ts_ms(self, order_id: str) -> int | None:
+        """When the venue registered one of this account's orders, if seen."""
+        with self._registered_lock:
+            return self._registered_at.get(order_id)
+
+    def _accept_order(self, update: UserOrderUpdate) -> None:
+        if update.event_type == "PLACEMENT" and update.exchange_event_ts_ms is not None:
+            with self._registered_lock:
+                self._registered_at.setdefault(
+                    update.order_id, update.exchange_event_ts_ms
+                )
+        self._updates.put(update)
 
     def _set_health(self, healthy: bool, error: str | None = None) -> None:
         was_healthy = self._healthy.is_set()

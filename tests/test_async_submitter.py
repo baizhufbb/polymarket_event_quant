@@ -193,6 +193,59 @@ def test_a_failed_send_gives_its_stream_back(flat_headers):
         submitter.stop()
 
 
+def test_any_failure_of_the_send_itself_is_a_network_error(flat_headers):
+    """httpx does not wrap everything HTTP/2 can throw. These two came through
+    raw in run37 and run38, the send loop took them for unknown trouble, and
+    every member stopped knocking - three markets lost. A failed send is a
+    network error: the loop sends again, and the stream count comes back."""
+    import h2.exceptions
+
+    submitter = _submitter(lambda request: httpx.Response(200, json={}))
+
+    class Breaking:
+        def __init__(self, exc):
+            self.exc = exc
+
+        async def post(self, url, content, headers):
+            raise self.exc
+
+    raw = [
+        h2.exceptions.ProtocolError(
+            "Invalid input ConnectionInputs.SEND_SETTINGS in state ConnectionState.CLOSED"
+        ),
+        ValueError("semaphore released too many times"),
+    ]
+    try:
+        submitter.start()
+        for exc in raw:
+            submitter._clients = [Breaking(exc)]
+            submitter._in_flight = [0]
+            with pytest.raises(PolyApiException) as caught:
+                submitter.submit([_leg()]).result(timeout=10)
+            assert caught.value.status_code is None
+            assert "Request exception" in str(caught.value.error_msg)
+            assert submitter._in_flight == [0]
+    finally:
+        submitter.stop()
+
+
+def test_a_failure_signing_our_own_headers_is_not_a_network_error(monkeypatch):
+    """Building the signed headers is our own work; if it breaks, that is a
+    bug to stop on, not a send to retry."""
+
+    def broken(self):
+        raise RuntimeError("cannot sign")
+
+    monkeypatch.setattr(PreparedLeg, "headers", broken)
+    submitter = _submitter(lambda request: httpx.Response(200, json={}))
+    try:
+        with pytest.raises(RuntimeError):
+            submitter.submit([_leg()]).result(timeout=10)
+        assert sum(submitter._in_flight) == 0
+    finally:
+        submitter.stop()
+
+
 def test_a_second_caller_waits_for_the_loop_to_be_ready(flat_headers, monkeypatch):
     """Fleet members start the loop concurrently. One that found the thread
     alive used to return while the clients were still being built, and its
