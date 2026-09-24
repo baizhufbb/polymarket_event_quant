@@ -40,7 +40,7 @@ def _loop_backed_by_the_fake_client(monkeypatch):
     from polymarket_bot.exchange import _transient_submission_error
 
     class LoopStandIn:
-        def warm(self, count):
+        def warm(self):
             pass
 
         def prepare(self, client, args):
@@ -1313,3 +1313,103 @@ def test_knocking_gives_up_after_its_budget_and_is_not_retried() -> None:
     assert result.attempts >= 5
     assert KNOCK_BUDGET_ERROR in (result.error or "")
     assert exchange.client.canceled == []
+
+
+class _DoorClient(FakeClient):
+    """Not ready until the door opens, then accepted.
+
+    Replies to sends made before the door take `slow` seconds, so the sends
+    fired in the moments before the door are still in flight when the
+    acceptance comes back - the replies that show which send won.
+    """
+
+    def __init__(self, door_at, slow, fail_first=False):
+        super().__init__([])
+        self.door_at = door_at
+        self.slow = slow
+        self.fail_first = fail_first
+        self.lock = Lock()
+        self.calls = 0
+
+    def post_order(self, order, order_type, post_only=False):
+        with self.lock:
+            self.calls += 1
+            first = self.calls == 1
+        if first and self.fail_first:
+            raise PolyApiException(error_msg="Request exception!")
+        if time.monotonic() < self.door_at:
+            time.sleep(self.slow)
+            return {
+                "success": False,
+                "orderID": "",
+                "errorMsg": "the market is not yet ready to process new orders",
+            }
+        return {"success": True, "orderID": "0x" + "1" * 64, "status": "live"}
+
+
+def _door_exchange(client, rows) -> Exchange:
+    exchange = Exchange.__new__(Exchange)
+    exchange.entry_submission = "solo-up"
+    exchange.attempt_trace = rows.append
+    exchange.client = client
+    return exchange
+
+
+def test_an_early_transient_error_does_not_cut_the_drain_at_the_door(monkeypatch) -> None:
+    """The replies in flight at the door are the ones that show which send won.
+
+    The drain used to start at the last transient error, so an error seconds
+    before the door left a deadline already past when the order was
+    accepted: the loop left at once and those replies went unrecorded (run36
+    lost 313 trace lines within half a second of a registration, 20 anywhere
+    else). The drain runs from the moment sending stops.
+    """
+    import polymarket_bot.exchange as exchange_module
+
+    monkeypatch.setattr(exchange_module, "DRAIN_TIMEOUT_SECONDS", 0.5)
+    rows = []
+    exchange = _door_exchange(
+        _DoorClient(door_at=time.monotonic() + 1.2, slow=0.1, fail_first=True), rows
+    )
+
+    result = exchange.place_dual(
+        MARKET,
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        submission_interval_ms=Decimal("10"),
+    )
+
+    assert result.complete
+    # Every send was answered inside the drain, so every one is on record by
+    # the time the placement returns - including those in flight at the door.
+    assert len(rows) == result.attempts
+    assert any(row["results"] == ["not_ready"] for row in rows)
+
+
+def test_replies_landing_after_the_drain_are_still_recorded(monkeypatch) -> None:
+    """Requests are no longer cancelled, so some replies land after the
+    placement has stopped waiting; each is written when it lands."""
+    import polymarket_bot.exchange as exchange_module
+
+    monkeypatch.setattr(exchange_module, "DRAIN_TIMEOUT_SECONDS", 0.05)
+    rows = []
+    exchange = _door_exchange(
+        _DoorClient(door_at=time.monotonic() + 0.3, slow=0.5), rows
+    )
+
+    result = exchange.place_dual(
+        MARKET,
+        price=Decimal("0.01"),
+        size=Decimal("100"),
+        submission_interval_ms=Decimal("10"),
+    )
+
+    assert result.complete
+    # Pre-door replies take half a second and the drain 50 ms, so some were
+    # still in flight when the placement returned...
+    assert len(rows) < result.attempts
+    # ...and each is recorded once it lands.
+    deadline = time.monotonic() + 3
+    while len(rows) < result.attempts and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert len(rows) == result.attempts

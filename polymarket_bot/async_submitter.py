@@ -23,11 +23,21 @@ Response semantics mirror the sync stack exactly:
   - network errors  -> PolyApiException("Request exception!")
   - non-transient PolyApiException per leg -> {"errorMsg": ..., "success":
     False}                                           [Exchange._post_single]
-On top, the loop can do what the sync stack could not: a hard total
-lifetime per request. A reply that trickles bytes forever held a thread
-and a socket for up to 69 s in the field; here it is cancelled cleanly at
-TOTAL_LIFETIME_SECONDS and surfaces as the same transient error a timeout
-always did.
+
+Nothing is cancelled: a request waits for its reply however slow it is.
+Cancelling was never real over HTTP/2 here. httpcore does not send a
+RST_STREAM when a request is cancelled - it releases its own count of open
+streams and forgets the request - so the request still runs at the venue
+and still holds its stream in the protocol state underneath. The two counts
+drift apart, httpcore opens streams the connection does not have, those
+sends fail on the spot with "Max outbound streams is 100, 100 open", and
+the connection soon errors outright. That is how run38 lost a market on
+2026-09-24: a three-second lifetime cut every request once the venue slowed,
+and at the door none of our sends were getting through. Room for slow
+spells comes from spreading the sends over transport.ORDER_CONNECTIONS
+connections instead. Leaving them uncancelled costs nothing in orders: every
+send for a market is the same signed order, so a late one is rejected as not
+ready or answered "Duplicated".
 """
 
 from __future__ import annotations
@@ -50,36 +60,14 @@ from py_clob_client_v2.order_utils.model.order_data_v2 import order_to_json_v2
 
 from .transport import (
     CLOB_TIME_URL,
-    MAX_CONNECTIONS,
-    MAX_KEEPALIVE_CONNECTIONS,
-    WORST_REPLY_SECONDS,
+    ORDER_CLIENT_CONNECTIONS,
+    ORDER_CONNECT_SECONDS,
+    ORDER_CONNECTIONS,
+    ORDER_SILENCE_SECONDS,
 )
 
 logger = logging.getLogger(__name__)
 
-# A reply we are still waiting on after this long has already lost us the
-# moment it was sent for. Cancelling is not losing the order: the next send
-# returns "Duplicated" with the order's id, and the user streams report
-# placements.
-#
-# This sat at 30 s from 2026-08-28 to 2026-09-02, and not because 30 s was a
-# good number: over HTTP/1.1 a cancelled request killed its socket (the
-# reply left half-read cannot be reused), so every cancel was a redial, and
-# a cancel landing between the pool assigning a connection and the request
-# driving it stranded that connection for good (run23, 5.5 h). Cancelling
-# often was the disease, so the lifetime was stretched until almost nothing
-# was cancelled - at the cost of a request holding its in-flight slot for
-# 30 s while the venue thought about it, which is what pinned in-flight at
-# the cap and skipped a quarter of the send slots (run31-34).
-#
-# Over HTTP/2 a cancel is one RST_STREAM frame on a connection that keeps
-# serving, and the stranded-connection window closes (an undriven h2
-# connection is `is_available()`, so the pool reuses it). With cancels
-# cheap again the lifetime can be what the strategy actually wants: a
-# request the venue has not answered in a few seconds is not going to be
-# the one that wins the queue, and holding it only deepens the backlog
-# during a slow spell.
-TOTAL_LIFETIME_SECONDS = 3.0
 _VERSION_HEAL_INTERVAL_SECONDS = 30.0
 
 
@@ -134,12 +122,15 @@ class PreparedLeg:
 
 
 class AsyncSubmitter:
-    """The process-wide loop thread and its HTTP client."""
+    """The process-wide loop thread and its HTTP clients."""
 
     def __init__(self, transport: httpx.AsyncBaseTransport | None = None) -> None:
         self._transport = transport
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._client: httpx.AsyncClient | None = None
+        # One HTTP/2 connection each, used in turn; only the loop thread
+        # touches the list and the turn counter.
+        self._clients: list[httpx.AsyncClient] = []
+        self._next_client = 0
         self._ready = threading.Event()
         self._thread: threading.Thread | None = None
         self._prepared: dict[int, PreparedLeg] = {}
@@ -166,9 +157,8 @@ class AsyncSubmitter:
         asyncio.set_event_loop(loop)
         # HTTP/2 multiplexes every in-flight order onto a handful of
         # connections (the venue allows 100 concurrent streams per
-        # connection), so the pool no longer grows one socket per request
-        # and cancelling a request costs a RST_STREAM frame instead of a
-        # dead socket. The original HTTP/2 concern - one slow reply
+        # connection), so the pool no longer grows one socket per request.
+        # The original HTTP/2 concern - one slow reply
         # blocking every other reply behind a read lock - was diagnosed in
         # the *sync* httpcore transport; the async transport pumps one
         # network read per lock acquisition and dispatches to every
@@ -179,23 +169,37 @@ class AsyncSubmitter:
         # same box at the same moment, an authenticated request bypassing
         # this pool answered in 33ms while orders through it took 3554ms -
         # the bottleneck is this transport, not the venue.
-        client = httpx.AsyncClient(
-            http2=True,
-            transport=self._transport,
-            limits=httpx.Limits(
-                max_connections=MAX_CONNECTIONS,
-                max_keepalive_connections=MAX_KEEPALIVE_CONNECTIONS,
-                keepalive_expiry=300.0,
-            ),
-            timeout=httpx.Timeout(WORST_REPLY_SECONDS),
-        )
+        #
+        # Several clients rather than one bigger pool: a client keeps every
+        # request on its one live HTTP/2 connection until that connection's
+        # streams run out, then makes the rest wait (see
+        # transport.ORDER_CONNECTIONS). No timeout here may fire on a merely
+        # slow venue - over HTTP/2 a read or write timeout fails the whole
+        # connection.
+        clients = [
+            httpx.AsyncClient(
+                http2=True,
+                transport=self._transport,
+                limits=httpx.Limits(
+                    max_connections=ORDER_CLIENT_CONNECTIONS,
+                    max_keepalive_connections=ORDER_CLIENT_CONNECTIONS,
+                    keepalive_expiry=300.0,
+                ),
+                timeout=httpx.Timeout(
+                    ORDER_SILENCE_SECONDS, connect=ORDER_CONNECT_SECONDS
+                ),
+            )
+            for _ in range(ORDER_CONNECTIONS)
+        ]
         self._loop = loop
-        self._client = client
+        self._clients = clients
+        self._next_client = 0
         self._ready.set()
         try:
             loop.run_forever()
         finally:
-            loop.run_until_complete(client.aclose())
+            for client in clients:
+                loop.run_until_complete(client.aclose())
             loop.close()
 
     def stop(self) -> None:
@@ -209,7 +213,8 @@ class AsyncSubmitter:
             thread.join(timeout=5.0)
         with self._lock:
             self._loop = None
-            self._client = None
+            self._clients = []
+            self._next_client = 0
             self._prepared.clear()
         self._ready.clear()
 
@@ -257,14 +262,19 @@ class AsyncSubmitter:
             self._heal_order_version(leg.client)
         return response
 
+    def _next_order_client(self) -> httpx.AsyncClient:
+        """The next client in turn; called on the loop thread only."""
+        client = self._clients[self._next_client % len(self._clients)]
+        self._next_client += 1
+        return client
+
     async def _request(self, leg: PreparedLeg) -> object:
-        assert self._client is not None
+        assert self._clients
         try:
-            async with asyncio.timeout(TOTAL_LIFETIME_SECONDS):
-                response = await self._client.post(
-                    leg.url, content=leg.body_bytes, headers=leg.headers()
-                )
-        except (httpx.RequestError, TimeoutError) as exc:
+            response = await self._next_order_client().post(
+                leg.url, content=leg.body_bytes, headers=leg.headers()
+            )
+        except httpx.RequestError as exc:
             logger.error(
                 "[async-submitter] request error: %s",
                 str(exc) or type(exc).__name__,
@@ -285,14 +295,16 @@ class AsyncSubmitter:
 
     # -- side channels -----------------------------------------------------
 
-    def warm(self, count: int) -> None:
-        """Dial pool connections ahead of the burst; fire and forget.
+    def warm(self) -> None:
+        """Dial every order connection ahead of the burst; fire and forget.
 
-        Rate-limited like the sync warm-up, and for the same reason: a
-        market handed back by signing re-enters place_dual every loop
-        tick, and every entry asks to warm - unguarded, three members
-        would bunch hundreds of dials into the seconds before the open,
-        on the loop thread whose next job is the first sends.
+        One request per client opens that client's connection, so the first
+        sends at the open do not pay a TLS handshake. Rate-limited like the
+        sync warm-up, and for the same reason: a market handed back by
+        signing re-enters place_dual every loop tick, and every entry asks
+        to warm - unguarded, the members would bunch hundreds of dials into
+        the seconds before the open, on the loop thread whose next job is
+        the first sends.
         """
         from . import transport
 
@@ -311,15 +323,14 @@ class AsyncSubmitter:
         self.start()
         assert self._loop is not None
 
-        async def dial() -> None:
+        async def dial(client: httpx.AsyncClient) -> None:
             try:
-                assert self._client is not None
-                await self._client.get(CLOB_TIME_URL)
+                await client.get(CLOB_TIME_URL)
             except Exception:  # noqa: BLE001 - warming is best effort
                 pass
 
-        for _ in range(count):
-            asyncio.run_coroutine_threadsafe(dial(), self._loop)
+        for client in self._clients:
+            asyncio.run_coroutine_threadsafe(dial(client), self._loop)
 
     def _heal_order_version(self, client) -> None:
         """The sync client re-resolves the order version on mismatch; keep

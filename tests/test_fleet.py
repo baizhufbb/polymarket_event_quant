@@ -190,7 +190,7 @@ def _loop_backed_by_the_fake_client(monkeypatch):
     from py_clob_client_v2.exceptions import PolyApiException
 
     class LoopStandIn:
-        def warm(self, count):
+        def warm(self):
             pass
 
         def prepare(self, client, args):

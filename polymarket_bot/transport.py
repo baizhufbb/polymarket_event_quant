@@ -39,39 +39,56 @@ CLOB_TIME_URL = "https://clob.polymarket.com/time"
 # of that scales with streams.
 #
 # What still matters: the venue retires a connection after 10,000 streams
-# with GOAWAY, so a replacement must be dialable while the old one drains -
-# hence a pool a few times larger than the streams alone require.
+# with GOAWAY, so a replacement must be dialable while the old one drains.
 #
-# WORST_REPLY_SECONDS is the httpx per-phase timeout (connect, write,
-# read-gap), not a lifetime bound; the hard lifetime is
-# async_submitter.TOTAL_LIFETIME_SECONDS.
+# WORST_REPLY_SECONDS is the per-phase timeout (connect, write, read-gap) of
+# the sync pool below - cancels, reconciliation and signing reads. Orders do
+# not use it; see ORDER_SILENCE_SECONDS.
 FLEET_ACCOUNTS = 5
 WORST_REPLY_SECONDS = 1.0
 FASTEST_INTERVAL_SECONDS = 0.025
 STREAMS_PER_CONNECTION = 100
-# One warm connection per planned account is plenty over HTTP/2; the warm-up
-# exists so the first sends at the open do not pay a TLS handshake, and a
-# single h2 connection already carries an account's whole burst.
-WARM_CONNECTIONS = 3
-MAX_CONNECTIONS = 16
-# Over HTTP/1.1 this had to sit strictly below MAX_CONNECTIONS: the pool
-# prunes an idle connection promptly only when the idle count exceeds it,
-# and with the two equal that rule was unreachable, so sockets the venue had
-# closed sat in CLOSE-WAIT for the whole keepalive expiry (run31: 365 of 512
-# slots). Over HTTP/2 there are a few connections, each kept busy by the
-# streams on it, and an idle one costs nothing to keep - the rule is inert
-# rather than needed, so this simply matches the pool.
-MAX_KEEPALIVE_CONNECTIONS = MAX_CONNECTIONS
+# Orders are spread over this many HTTP/2 connections, one client each, used
+# in turn. More room has to come from more clients, not a bigger pool:
+# httpcore keeps handing requests to a live HTTP/2 connection whether or not
+# its streams are all taken (its is_available() never looks at them), so a
+# client never dials a second connection for room - a request past the
+# hundredth waits inside the client for a stream to free. In run38 five
+# accounts sending 200 a second shared one connection, which filled whenever
+# the venue took more than half a second to reply.
+#
+# Nothing is cancelled (see async_submitter), so a request holds its stream
+# until its reply lands. At the full fleet's 200 sends a second these
+# connections carry replies up to 15 x 100 / 200 = 7.5 s slow before a send
+# would have to wait for a stream; run38's worst spell answered in 3-5 s.
+ORDER_CONNECTIONS = 15
+# Per client: the connection in use plus the one that replaces it after a
+# GOAWAY while the old one drains its streams.
+ORDER_CLIENT_CONNECTIONS = 2
+# How long an order connection may go without a single byte while replies
+# are owed before it is treated as dead. httpcore's HTTP/2 takes a read
+# timeout as the whole connection failing: every stream on it errors at once
+# and the connection is dropped (a write timeout does the same). At
+# WORST_REPLY_SECONDS a venue pause of one second killed every request on the
+# one connection orders used (run38, 08:18). Only a connection that has
+# really died goes this long without a byte.
+ORDER_SILENCE_SECONDS = 30.0
+# A TLS handshake to the venue's edge takes about 35 ms; a second was too
+# short while the venue was slow (run38 logged ConnectTimeout four times in
+# the seven seconds before a door).
+ORDER_CONNECT_SECONDS = 10.0
 # The sync pool no longer carries placements - those go through the event
-# loop's own pool, sized by MAX_CONNECTIONS above. What is left here is
-# cancels, reconciliation reads and the warm-up: small, bursty at market
-# end, never hundreds deep.
+# loop's own clients above. What is left here is cancels, reconciliation
+# reads and the warm-up: small, bursty at market end, never hundreds deep.
 SYNC_POOL_CONNECTIONS = 64
-# The most requests one account may hold outstanding. A safety net on the
-# send loop, not a share of anything: at TOTAL_LIFETIME_SECONDS a request
-# lives at most lifetime / interval sends (3 s / 25 ms = 120), so at this
-# ceiling the loop never has to skip a slot for want of a request slot.
-ACCOUNT_BUDGET_CEILING = 160
+# Dials the sync warm-up makes; the order clients warm one dial each
+# (async_submitter.AsyncSubmitter.warm).
+WARM_CONNECTIONS = 3
+# The most requests one account may hold outstanding: its even share of the
+# order connections' streams. At this ceiling the connections have no stream
+# left for the account, so the send loop gives up the slot instead of
+# queueing a request inside a client that would send it late.
+ACCOUNT_BUDGET_CEILING = ORDER_CONNECTIONS * STREAMS_PER_CONNECTION // FLEET_ACCOUNTS
 
 
 def in_flight_budget(accounts: int) -> int:
@@ -79,11 +96,11 @@ def in_flight_budget(accounts: int) -> int:
 
     Over HTTP/1.1 this was the account's share of a socket pool - the pool
     minus the warm-up, divided by the accounts running, clipped at the
-    ceiling - because a request in flight owned a socket. Over HTTP/2 it
-    does not, so there is nothing to share: every account gets the ceiling,
-    which the hard request lifetime keeps unreachable in normal operation.
-    The argument is kept so callers and tests that pass a fleet size still
-    read naturally; only nonsense input is guarded.
+    ceiling - because a request in flight owned a socket. Over HTTP/2 every
+    account gets the ceiling: an even share of the order connections' streams
+    for the largest fleet planned. The argument is kept so callers and tests
+    that pass a fleet size still read naturally; only nonsense input is
+    guarded.
     """
     if accounts < 1:
         return max(4, ACCOUNT_BUDGET_CEILING)

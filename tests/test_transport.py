@@ -138,104 +138,44 @@ def test_the_process_lifts_its_own_fd_limit_as_far_as_the_pool_needs():
         return  # no rlimits on this platform, nothing to verify
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     wanted = 8192 if hard == resource.RLIM_INFINITY else min(8192, hard)
-    assert soft >= min(wanted, transport.MAX_CONNECTIONS + 256)
-
-
-def test_the_pool_covers_the_warm_up_and_every_account_at_the_open():
-    """One pool serves the whole process: the warm-up and every account.
-
-    Over HTTP/2 a request in flight is a stream, and the venue allows
-    STREAMS_PER_CONNECTION of them per connection. The pool must hold the
-    warm-up plus enough connections for the whole planned fleet's worst
-    in-flight count, and then some, because the venue retires a connection
-    after 10,000 streams with GOAWAY and a replacement has to be dialable
-    while the old one drains.
-    """
-    import math
-
-    worst_in_flight = transport.FLEET_ACCOUNTS * transport.ACCOUNT_BUDGET_CEILING
-    needed = transport.WARM_CONNECTIONS + math.ceil(
-        worst_in_flight / transport.STREAMS_PER_CONNECTION
+    sockets = (
+        transport.ORDER_CONNECTIONS * transport.ORDER_CLIENT_CONNECTIONS
+        + transport.SYNC_POOL_CONNECTIONS
     )
-    assert transport.MAX_CONNECTIONS >= needed
-    # ...and the pool is still a handful, not the hundreds HTTP/1.1 needed.
-    assert transport.MAX_CONNECTIONS <= 64
+    assert soft >= min(wanted, sockets + 256)
 
 
-def test_idle_connections_can_actually_be_pruned():
-    """The keepalive ceiling is valid for httpx and keeps the warm-up.
+def test_the_order_connections_hold_every_account_at_its_ceiling():
+    """A send must never wait inside a client for a stream.
 
-    Over HTTP/1.1 this had to sit strictly below the pool so the surplus-idle
-    prune could fire on sockets the venue closed (run31: 365 of 512 slots
-    stuck in CLOSE-WAIT). Over HTTP/2 there are a few connections and an idle
-    one is harmless, so the ceiling may equal the pool; httpx only requires
-    it not exceed the pool, and the warm-up must never be pruned between
-    markets.
+    httpcore keeps a client's requests on its one live HTTP/2 connection and
+    makes the rest wait once the streams run out, so the room is
+    ORDER_CONNECTIONS x STREAMS_PER_CONNECTION. The whole planned fleet at
+    its in-flight ceiling has to fit in it, or the send loop believes it has
+    sent while the request sits in a queue on our side.
     """
-    assert transport.MAX_KEEPALIVE_CONNECTIONS <= transport.MAX_CONNECTIONS
-    assert transport.MAX_KEEPALIVE_CONNECTIONS >= transport.WARM_CONNECTIONS
+    room = transport.ORDER_CONNECTIONS * transport.STREAMS_PER_CONNECTION
+    assert transport.FLEET_ACCOUNTS * transport.ACCOUNT_BUDGET_CEILING <= room
+    # ...and still a handful of sockets, not the hundreds HTTP/1.1 needed.
+    assert transport.ORDER_CONNECTIONS * transport.ORDER_CLIENT_CONNECTIONS <= 64
 
 
-def test_the_placement_pool_uses_the_keepalive_ceiling():
-    """The submitter's own client is the one that carries placements."""
-    import inspect
+def test_every_account_gets_the_ceiling_and_it_rides_out_a_slow_spell():
+    """Nothing is cancelled, so a request keeps its place until its reply.
 
-    from polymarket_bot import async_submitter
-
-    source = inspect.getsource(async_submitter.AsyncSubmitter._run)
-    assert "max_keepalive_connections=MAX_KEEPALIVE_CONNECTIONS" in source
-
-
-def test_the_in_flight_ceiling_is_a_safety_net_no_fleet_size_reaches():
-    """Every account gets the ceiling; the lifetime keeps it out of reach.
-
-    Over HTTP/1.1 the cap was each account's share of a socket pool, so a
-    larger fleet meant a smaller cap and, at three accounts, one the send
-    loop actually hit. Over HTTP/2 a request costs a stream, nothing is
-    shared, and the cap only exists so a venue answering slower than the
-    hard lifetime makes the loop skip slots instead of deepening a queue.
+    run38's worst spell answered in 3-5 s. At the fastest cadence an account
+    then holds 5 s / 25 ms = 200 requests, and the ceiling must not turn
+    that into skipped slots - skipping is for a venue slower than the
+    connections can carry, not for one that is merely slow.
     """
-    from polymarket_bot import async_submitter
-
-    # Fleet size no longer changes the cap.
+    # Fleet size does not change the cap.
     caps = {transport.in_flight_budget(n) for n in range(1, transport.FLEET_ACCOUNTS + 1)}
     assert caps == {transport.ACCOUNT_BUDGET_CEILING}
-    # The most a request can accumulate before the hard lifetime cancels it
-    # is lifetime / interval; the ceiling sits above that, so in normal
-    # operation the cap is never the binding limit.
-    most_alive = async_submitter.TOTAL_LIFETIME_SECONDS / transport.FASTEST_INTERVAL_SECONDS
-    assert transport.ACCOUNT_BUDGET_CEILING > most_alive
+    slowest_reply_seen = 5.0
+    held = slowest_reply_seen / transport.FASTEST_INTERVAL_SECONDS
+    assert transport.ACCOUNT_BUDGET_CEILING >= held
     # Nonsense input cannot produce a nonsense cap.
     assert transport.in_flight_budget(0) >= 4
-
-
-def test_a_reply_cannot_outlive_what_the_in_flight_budget_assumed() -> None:
-    """The pool arithmetic assumes a reply lands within WORST_REPLY_SECONDS.
-
-    Nothing enforced that: the client's timeout was ten seconds, so a reply
-    could hold its slot forty times longer than the sizing above allows. The
-    send loop then hit its in-flight cap and skipped slots - 18% of them over
-    a six-hour run, and the markets where it happened sat 2834 shares deeper
-    in the queue than the ones where it did not.
-
-    With the timeout tied to the same constant, an account sending every
-    FASTEST_INTERVAL_SECONDS can never accumulate more than the ratio between
-    them, so the cap becomes unreachable rather than merely generous - and it
-    must stay unreachable for every fleet size this pool was sized for, which
-    is what the old halved cap broke at three accounts and above.
-    """
-    from polymarket_bot.transport import in_flight_budget
-
-    alive = transport.WORST_REPLY_SECONDS / transport.FASTEST_INTERVAL_SECONDS
-
-    for accounts in range(1, transport.FLEET_ACCOUNTS + 1):
-        # Exchange.max_requests_in_flight: the account's share of the pool.
-        cap = in_flight_budget(accounts)
-        assert alive < cap, (
-            f"a request lives up to {alive:.0f} sends, but {accounts} "
-            f"account(s) get a cap of {cap} - the send loop will skip slots "
-            f"at the open, which cost 2834 shares a market when it last fired"
-        )
 
 
 def test_the_full_fleet_cannot_exhaust_the_thread_supply() -> None:

@@ -5,6 +5,7 @@ import re
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, wait
 from decimal import Decimal
+from functools import partial
 
 import requests
 from py_clob_client_v2 import (
@@ -24,7 +25,6 @@ from .async_submitter import get_submitter
 from .config import BotConfig
 from .models import Market, PlacedOrder, PlacementResult
 from .transport import (
-    WARM_CONNECTIONS,
     in_flight_budget,
     install_parallel_transport,
     warm_connections,
@@ -53,6 +53,9 @@ DEFAULT_PLACEMENT_INTERVAL_MS = Decimal("20")
 # next 0.2 s tick.
 SIGNING_NOT_READY_RETRY_SECONDS = 0.5
 SIGNING_NOT_READY_POLL_SECONDS = 0.1
+# How long a placement keeps collecting replies after it stops sending,
+# before handing the market back to the service loop. A reply that lands
+# later is still written to the attempt trace when it arrives.
 DRAIN_TIMEOUT_SECONDS = 3.0
 # How long a market is knocked before it is given up as skipped. Doors open
 # 53..125 s after the listing on the venue's normal days (hourly p90 about
@@ -200,13 +203,13 @@ class Exchange:
     def max_requests_in_flight(self) -> int:
         """Outstanding requests this account may hold at once.
 
-        A safety net on the send loop, not a share of a pool: orders travel
-        over HTTP/2, where a request in flight costs a stream rather than a
-        socket, so there is nothing scarce to divide between accounts. The
-        ceiling sits above what the hard request lifetime lets accumulate,
-        so in normal operation the loop never gives up a slot for want of
-        one; if it ever does, that is the venue answering slower than the
-        lifetime, and skipping the slot is the right call (see place_dual).
+        Orders travel over HTTP/2, where a request in flight costs a stream
+        rather than a socket, and nothing is cancelled, so a request holds
+        its stream until its reply lands. The ceiling is the account's even
+        share of the order connections' streams; reaching it means the venue
+        is answering slower than the connections can carry (7.5 s at the
+        full fleet's rate), and skipping the slot beats queueing a send
+        that would leave late (see place_dual).
         """
         return in_flight_budget(self.accounts_sharing_the_pool)
 
@@ -280,9 +283,9 @@ class Exchange:
         if knock_until_ts is None:
             knock_until_ts = time.time() + KNOCK_SECONDS
         warm_connections()
-        # The hot path sends through the event loop's own pool, which
-        # dials its own connections; warm it alongside the sync pool.
-        get_submitter().warm(WARM_CONNECTIONS)
+        # The hot path sends through the event loop's own clients, which
+        # dial their own connections; warm them alongside the sync pool.
+        get_submitter().warm()
         options = PartialCreateOrderOptions(
             tick_size=str(market.tick_size),
             neg_risk=False,
@@ -427,9 +430,18 @@ class Exchange:
 
             if not stop_submitting:
                 timeout = max(0.0, next_submission - now)
-            elif drain_deadline is None:
-                timeout = None
             else:
+                if drain_deadline is None:
+                    # The drain runs from the moment sending stops. It used
+                    # to start at the last transient error instead, so an
+                    # error seconds before the door left a deadline already
+                    # past when the order was accepted: the loop left at
+                    # once and the replies still in flight at the door -
+                    # the ones that show which send won - went unrecorded
+                    # (run36 lost 313 trace lines within half a second of a
+                    # registration, 20 anywhere else). Nor may the drain be
+                    # open-ended now that requests are never cancelled.
+                    drain_deadline = now + DRAIN_TIMEOUT_SECONDS
                 timeout = max(0.0, drain_deadline - now)
                 if timeout <= 0:
                     break
@@ -468,7 +480,6 @@ class Exchange:
                     else:
                         errors.append(f"{type(exc).__name__}: {exc}")
                         stop_submitting = True
-                    drain_deadline = time.monotonic() + DRAIN_TIMEOUT_SECONDS
                     continue
                 except Exception as exc:
                     self._trace(
@@ -526,6 +537,15 @@ class Exchange:
                 )
                 if not recoverable:
                     stop_submitting = True
+
+        # Replies still in flight when the drain ends are not dropped: each
+        # is written to the attempt trace when it lands.
+        for future, (late_specs, late_sent_ts_ms, late_attempt_no) in pending.items():
+            future.add_done_callback(
+                partial(
+                    self._trace_when_done, late_specs, late_attempt_no, late_sent_ts_ms
+                )
+            )
 
         if ambiguous_errors and not accepted:
             unique = "; ".join(dict.fromkeys(ambiguous_errors))
@@ -662,6 +682,26 @@ class Exchange:
         submitter = get_submitter()
         legs = [submitter.prepare(self.client, args) for args in signed]
         return submitter.submit(legs)
+
+    def _trace_when_done(
+        self,
+        specs: tuple[tuple[str, str], ...],
+        attempt_no: int,
+        sent_ts_ms: int,
+        future: Future,
+    ) -> None:
+        """Record a reply that landed after its placement stopped waiting."""
+        if future.cancelled():
+            return
+        returned_ts_ms = int(time.time() * 1000)
+        error = future.exception()
+        self._trace(
+            specs,
+            attempt_no,
+            sent_ts_ms,
+            returned_ts_ms,
+            error if error is not None else future.result(),
+        )
 
     def _trace(
         self,

@@ -169,11 +169,9 @@ class _ExpectedOrderEngineFilter(logging.Filter):
     """Keep the human log readable during the pre-open hammering.
 
     These replies are expected thousands of times per market. They stay in
-    logs/attempts.jsonl, which records every attempt regardless. The same
-    goes for the event loop's lifetime kills: a request cancelled at
-    TOTAL_LIFETIME_SECONDS is routine traffic during a venue slow spell -
-    run25 wrote three hundred thousand of them in one night - and the
-    trace already records each one as a transport_error.
+    logs/attempts.jsonl, which records every attempt regardless. Requests
+    are no longer cancelled on a timer, so a timeout is not routine traffic
+    any more; it is news and is left in the log.
     """
 
     NAMES = (
@@ -184,8 +182,6 @@ class _ExpectedOrderEngineFilter(logging.Filter):
         "invalid token id",
         "market not found",
         "trading is disabled",
-        "request error: timeouterror",
-        "request error: cancellederror",
     )
 
     def filter(self, record: logging.LogRecord) -> bool:

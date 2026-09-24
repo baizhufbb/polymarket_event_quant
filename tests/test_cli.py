@@ -51,10 +51,11 @@ def test_a_cadence_finer_than_the_loop_can_hold_is_rejected() -> None:
 
 
 def test_the_noise_filter_covers_both_chatty_loggers() -> None:
-    """Expected knocking replies and lifetime kills are routine traffic,
-    fully recorded in attempts.jsonl; the human log must not drown in
-    them - run25 wrote three hundred thousand blank-reason lines in one
-    night. Real errors must still pass."""
+    """Expected knocking replies are routine traffic, fully recorded in
+    attempts.jsonl; the human log must not drown in them - run25 wrote three
+    hundred thousand blank-reason lines in one night. Real errors must still
+    pass, and a timeout is one now that requests are no longer cancelled on
+    a timer."""
     import logging
 
     from polymarket_bot.cli import _ExpectedOrderEngineFilter
@@ -69,9 +70,6 @@ def test_the_noise_filter_covers_both_chatty_loggers() -> None:
 
     # routine traffic: silenced
     assert not noise_filter.filter(
-        record(submitter, "[async-submitter] request error: TimeoutError")
-    )
-    assert not noise_filter.filter(
         record(submitter, 'request error status=400 body={"error":"invalid token id"}')
     )
     assert not noise_filter.filter(record(helpers, "... market not found ..."))
@@ -79,6 +77,9 @@ def test_the_noise_filter_covers_both_chatty_loggers() -> None:
     # real trouble: passes
     assert noise_filter.filter(
         record(submitter, "[async-submitter] request error: ConnectError")
+    )
+    assert noise_filter.filter(
+        record(submitter, "[async-submitter] request error: ReadTimeout")
     )
     assert noise_filter.filter(record(helpers, "request error status=500 boom"))
 

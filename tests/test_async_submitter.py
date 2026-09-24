@@ -17,7 +17,6 @@ import httpx
 import pytest
 from py_clob_client_v2.exceptions import PolyApiException
 
-from polymarket_bot import async_submitter
 from polymarket_bot.async_submitter import AsyncSubmitter, PreparedLeg
 
 
@@ -110,23 +109,69 @@ def test_network_trouble_raises_the_same_request_exception(flat_headers):
         submitter.stop()
 
 
-def test_a_trickling_reply_dies_at_the_total_lifetime(flat_headers, monkeypatch):
-    """The sync stack could never bound a request's total life - trickling
-    replies lived 69 s in the field. The loop cancels at the deadline and
-    surfaces the same transient error a timeout always did."""
-    monkeypatch.setattr(async_submitter, "TOTAL_LIFETIME_SECONDS", 0.2)
+def test_a_slow_reply_is_waited_for_not_cancelled(flat_headers):
+    """A cancel was never real over HTTP/2: httpcore sends no RST_STREAM, so
+    the request kept running at the venue and kept its stream while httpcore
+    counted the stream free - the next sends failed with "Max outbound
+    streams is 100, 100 open" and the connection broke (run38). A reply
+    slower than the old three-second lifetime must simply arrive."""
 
     async def handler(request):
-        await asyncio.sleep(30)
-        return httpx.Response(200, json={})
+        await asyncio.sleep(3.3)
+        return httpx.Response(200, json={"success": True, "orderId": "0xslow"})
 
     submitter = _submitter(handler)
     try:
-        began = time.monotonic()
-        with pytest.raises(PolyApiException) as caught:
+        result = submitter.submit([_leg()]).result(timeout=10)
+        assert result == [{"success": True, "orderId": "0xslow"}]
+    finally:
+        submitter.stop()
+
+
+def test_sends_take_the_order_connections_in_turn(flat_headers):
+    """One client keeps every request on its single HTTP/2 connection until
+    the streams run out; the room comes from using several in turn."""
+    submitter = _submitter(lambda request: httpx.Response(200, json={}))
+    used = []
+
+    class Recording:
+        def __init__(self, index):
+            self.index = index
+
+        async def post(self, url, content, headers):
+            used.append(self.index)
+            return httpx.Response(200, json={})
+
+    try:
+        submitter.start()
+        submitter._clients = [Recording(index) for index in range(4)]
+        for _ in range(9):
             submitter.submit([_leg()]).result(timeout=10)
-        assert time.monotonic() - began < 5
-        assert caught.value.status_code is None
+        assert used == [0, 1, 2, 3, 0, 1, 2, 3, 0]
+    finally:
+        submitter.stop()
+
+
+def test_order_connections_are_http2_and_outlast_a_slow_venue():
+    """Over HTTP/2 a read or write timeout fails every stream on the
+    connection at once. At one second, a venue pause of one second killed
+    every request on the one connection orders used (run38, 08:18); its
+    slow spell answered in 3-5 s, so no timeout may sit anywhere near that."""
+    from polymarket_bot import transport
+
+    submitter = AsyncSubmitter()
+    try:
+        submitter.start()
+        clients = submitter._clients
+        assert len({id(client) for client in clients}) == transport.ORDER_CONNECTIONS
+        for client in clients:
+            pool = client._transport._pool
+            assert pool._http2 is True
+            assert pool._max_connections == transport.ORDER_CLIENT_CONNECTIONS
+            assert pool._max_keepalive_connections == transport.ORDER_CLIENT_CONNECTIONS
+            assert client.timeout.read >= 10
+            assert client.timeout.write >= 10
+            assert client.timeout.connect >= 5
     finally:
         submitter.stop()
 
@@ -256,7 +301,7 @@ def test_warm_is_rate_limited_like_the_sync_warm_up(monkeypatch):
 
     monkeypatch.setattr(time_module, "monotonic", lambda: 1000.0)
     try:
-        submitter.warm(1)
+        submitter.warm()
     except AssertionError:
         pass
     first_stamp = submitter._last_warm
@@ -265,9 +310,32 @@ def test_warm_is_rate_limited_like_the_sync_warm_up(monkeypatch):
     # A second call inside the window must not even reach start().
     started.clear()
     monkeypatch.setattr(time_module, "monotonic", lambda: 1000.0 + 5.0)
-    submitter.warm(1)
+    submitter.warm()
     assert submitter._last_warm == first_stamp
     assert started == []
+
+
+def test_warm_opens_every_order_connection(monkeypatch):
+    """Each client opens its connection on its first request; one dial each
+    keeps the first sends at the open from paying a TLS handshake."""
+    from polymarket_bot import transport
+
+    monkeypatch.setattr(transport, "_installed", True)
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        return httpx.Response(200, json=0)
+
+    submitter = _submitter(handler)
+    try:
+        submitter.warm()
+        deadline = time.monotonic() + 5
+        while len(seen) < transport.ORDER_CONNECTIONS and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert seen == ["/time"] * transport.ORDER_CONNECTIONS
+    finally:
+        submitter.stop()
 
 
 def test_exchange_routes_every_send_through_the_loop(monkeypatch):
