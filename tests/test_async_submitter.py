@@ -174,6 +174,25 @@ def test_sends_fill_one_connection_before_spilling_onto_the_next(flat_headers):
         submitter.stop()
 
 
+def test_a_failed_send_gives_its_stream_back(flat_headers):
+    """A count left high would mark a healthy connection full for good."""
+    submitter = _submitter(lambda request: httpx.Response(200, json={}))
+
+    class Failing:
+        async def post(self, url, content, headers):
+            raise httpx.ConnectError("no route")
+
+    try:
+        submitter.start()
+        submitter._clients = [Failing(), Failing()]
+        submitter._in_flight = [0, 0]
+        with pytest.raises(PolyApiException):
+            submitter.submit([_leg()]).result(timeout=10)
+        assert submitter._in_flight == [0, 0]
+    finally:
+        submitter.stop()
+
+
 def test_a_second_caller_waits_for_the_loop_to_be_ready(flat_headers, monkeypatch):
     """Fleet members start the loop concurrently. One that found the thread
     alive used to return while the clients were still being built, and its
@@ -210,6 +229,10 @@ def test_order_connections_are_http2_and_outlast_a_slow_venue():
         submitter.start()
         clients = submitter._clients
         assert len({id(client) for client in clients}) == transport.ORDER_CONNECTIONS
+        # One TLS context for all: loading the CA bundle per client cost
+        # about half a second apiece, and fleet members wait on the build.
+        contexts = {id(client._transport._pool._ssl_context) for client in clients}
+        assert len(contexts) == 1
         for client in clients:
             pool = client._transport._pool
             assert pool._http2 is True
