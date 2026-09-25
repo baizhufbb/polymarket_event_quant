@@ -44,17 +44,34 @@ stable positive expectation. Use a dedicated wallet and small limits.
 
 ## HTTP stack
 
-Authenticated CLOB traffic uses `py-clob-client-v2 -> httpx -> httpcore`.
+Entry orders are knocked by a Go library loaded into the bot's process
+(`knocker/`, called through `polymarket_bot/knocker.py`). Python signs each
+account's orders; the library sends them on the fleet's timetable over its
+own HTTP/2 connections (15, filled one at a time, 100 requests each), judges
+every reply, stops each account once the venue has registered its orders,
+collects the replies still in flight for three seconds, and hands every reply
+to the attempt trace - also the ones that land later. The request bytes are
+the official client's own (`order_to_json_v2`), and the L2 headers are checked
+byte for byte against its `create_level_2_headers`. `knocker/testdata/`
+holds the Python sender's verdict on each kind of reply, which the library
+must reproduce.
+
+The Linux build, `polymarket_bot/libknocker.so`, is committed together with
+its sources and stamped with their hash; a test fails when the two part.
+`knocker/build.ps1` (Go and zig) runs the Go tests and rebuilds it, along
+with a Windows build and a stand-in venue for local tests. The server needs
+neither Go nor zig.
+
+Everything else authenticated uses `py-clob-client-v2 -> httpx -> httpcore`.
 `httpcore` is pinned to commit
 `35ddb373e13be5940e5137798d5a63d67e10f3e2` from
 `baizhufbb/httpcore`, which contains the proxy TLS zombie-connection fix.
 At startup `polymarket_bot/transport.py` replaces the library's shared
 `httpx.Client(http2=True)` with an HTTP/1.1 pool (64 connections): on the
 single multiplexed connection, httpcore serializes socket reads behind a
-lock, so the one slow reply at the open (300-1000ms exchange-side) held
-back every other in-flight reply and could stall outgoing writes. Each
-placement loop warms the pool before hammering so the open-moment burst
-does not pay per-connection TLS handshakes.
+lock, so one slow reply held back every other one. Each placement warms the
+pool before knocking so the cancels right after the door do not pay
+per-connection TLS handshakes.
 Public discovery continues to use `requests`. Gamma fills the existing window
 once, then the predictable next five-minute slug is queried every second. These
 requests include a unique cache buster because Gamma otherwise advertises a

@@ -1,0 +1,2 @@
+# The knock library ships built; never touch its bytes.
+*.so binary

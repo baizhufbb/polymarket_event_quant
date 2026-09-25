@@ -12,3 +12,6 @@ logs/
 
 # Session data pulled off the server for analysis; regenerated on demand.
 run*.json
+
+# Local builds of the knock library for tests; the Linux one ships as polymarket_bot/libknocker.so.
+knocker/build/

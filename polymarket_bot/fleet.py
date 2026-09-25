@@ -16,9 +16,9 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from decimal import Decimal
-from threading import Thread
 
-from .exchange import KNOCK_SECONDS, Exchange
+from . import knocker
+from .exchange import KNOCK_SECONDS, Exchange, knock_plan
 from .models import Market, PlacedOrder, PlacementResult
 
 # How long the choice of which order to keep may wait for the venue's own
@@ -203,10 +203,6 @@ class Fleet:
         # order id -> when the venue registered it, from the members' user
         # streams; the service wires it once those streams exist.
         self.registration_clock: Callable[[str], int | None] | None = None
-        # Every member's requests come out of one process-wide pool, so each
-        # one may only hold its share of it.
-        for member in members:
-            member.exchange.accounts_sharing_the_pool = len(members)
 
     @property
     def primary(self) -> FleetMember:
@@ -227,41 +223,75 @@ class Fleet:
         knock_until_ts: float | None = None,
     ) -> FleetPlacement:
         outcomes: dict[str, MemberPlacement] = {}
-        # One timetable for the whole fleet: every member sends only at
-        # origin + its own offset + k * interval. Sleeping each member's
-        # offset before it started instead put the offset ahead of the
-        # warm-up and signing, whose cost is far larger and varies per call.
-        grid_origin = time.monotonic()
-        # And one knocking budget, so the members give up together.
+        # One knocking budget, so the members give up together.
         if knock_until_ts is None:
             knock_until_ts = time.time() + KNOCK_SECONDS
 
-        def run(member: FleetMember) -> None:
+        # Every member signs first; then one knock carries them all on one
+        # timetable, each at its own offset. A member whose signing is not
+        # ready (or fails) sits this knock out with that result.
+        entries = {}
+        for member in self.members:
             try:
-                result = member.exchange.place_dual(
-                    market,
-                    price=price,
-                    size=member.size,
-                    submission_interval_ms=submission_interval_ms,
-                    grid_origin=grid_origin,
-                    phase_offset_ms=member.phase_offset_ms,
-                    knock_until_ts=knock_until_ts,
+                prepared = member.exchange.prepare_entry(
+                    market, price=price, size=member.size
+                )
+            except Exception as exc:  # noqa: BLE001 - reported per member
+                outcomes[member.name] = MemberPlacement(
+                    member.name, None, f"{type(exc).__name__}: {exc}"
+                )
+                continue
+            if isinstance(prepared, PlacementResult):
+                outcomes[member.name] = MemberPlacement(member.name, prepared)
+            else:
+                entries[member.name] = prepared
+
+        knocking = []
+        parts = []
+        for member in self.members:
+            if member.name not in entries:
+                continue
+            try:
+                parts.append(
+                    member.exchange.knock_member(
+                        entries[member.name],
+                        name=member.name,
+                        phase_offset_ms=member.phase_offset_ms,
+                    )
                 )
             except Exception as exc:  # noqa: BLE001 - reported per member
                 outcomes[member.name] = MemberPlacement(
                     member.name, None, f"{type(exc).__name__}: {exc}"
                 )
             else:
-                outcomes[member.name] = MemberPlacement(member.name, result)
-
-        threads = [
-            Thread(target=run, args=(member,), name=f"fleet-{member.name}", daemon=True)
-            for member in self.members
-        ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
+                knocking.append(member)
+        if knocking:
+            plan = knock_plan(
+                market,
+                parts,
+                interval_ms=submission_interval_ms,
+                knock_until_ts=knock_until_ts,
+            )
+            hooks = {member.name: member.exchange.knock_hooks() for member in knocking}
+            try:
+                knocked = knocker.knock(plan, hooks)
+            except Exception as exc:  # noqa: BLE001 - reported per member
+                for member in knocking:
+                    outcomes[member.name] = MemberPlacement(
+                        member.name, None, f"{type(exc).__name__}: {exc}"
+                    )
+            else:
+                for member, outcome in zip(knocking, knocked["members"], strict=True):
+                    try:
+                        result = member.exchange.settle_entry(
+                            entries[member.name], outcome
+                        )
+                    except Exception as exc:  # noqa: BLE001 - reported per member
+                        outcomes[member.name] = MemberPlacement(
+                            member.name, None, f"{type(exc).__name__}: {exc}"
+                        )
+                    else:
+                        outcomes[member.name] = MemberPlacement(member.name, result)
 
         placements = tuple(outcomes[member.name] for member in self.members)
         kept, kept_by, stamps = self._choose(placements)

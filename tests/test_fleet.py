@@ -3,9 +3,9 @@ from decimal import Decimal
 
 import pytest
 
+from polymarket_bot import knocker
 from polymarket_bot.config import BotConfig
 from polymarket_bot.database import BotDatabase
-from polymarket_bot.exchange import Exchange
 from polymarket_bot.fleet import Fleet, FleetMember, FleetOrderView, evenly_phased
 from polymarket_bot.models import Market, PlacedOrder, PlacementResult
 
@@ -35,7 +35,10 @@ class FakeExchange:
         open_rows=(),
         orders_by_id=None,
         gave_up=False,
+        not_ready=False,
+        member_exc=None,
     ):
+        self.member_exc = member_exc
         self.gave_up = gave_up
         self.name = name
         self.registered_ts_ms = registered_ts_ms
@@ -48,26 +51,31 @@ class FakeExchange:
         self.started_at = None
         self.sizes = []
         self.canceled = []
-        self.grid_origin = None
         self.phase_offset_ms = None
+        self.not_ready = not_ready
 
-    def place_dual(
-        self,
-        market,
-        *,
-        price,
-        size,
-        submission_interval_ms,
-        grid_origin=None,
-        phase_offset_ms=Decimal(0),
-        knock_until_ts=None,
-    ):
+    def prepare_entry(self, market, *, price, size):
         self.started_at = time.monotonic()
-        self.grid_origin = grid_origin
-        self.knock_until_ts = knock_until_ts
-        self.phase_offset_ms = phase_offset_ms
         self.sizes.append(size)
-        time.sleep(0.02)
+        if self.not_ready:
+            return PlacementResult((), "signing not ready", retryable=True, attempts=1)
+        return (market, price, size)
+
+    def knock_member(self, entry, *, name, phase_offset_ms):
+        if self.member_exc:
+            raise self.member_exc
+        self.phase_offset_ms = phase_offset_ms
+        return {"account": name, "phase_ms": float(phase_offset_ms), "legs": [{"outcome": "up", "body": "{}"}]}
+
+    def knock_hooks(self):
+        return knocker.Hooks(trace=self.trace)
+
+    def trace(self, row):
+        pass
+
+    def settle_entry(self, entry, outcome):
+        market, price, size = entry
+        self.outcome = outcome
         if self.raise_exc:
             raise self.raise_exc
         if self.gave_up:
@@ -115,173 +123,76 @@ def place(fleet):
     return fleet.place(MARKET, price=Decimal("0.01"), submission_interval_ms=Decimal("25"))
 
 
-def test_every_member_shares_one_timetable_with_its_own_offset():
-    """The offsets ride on a common origin instead of a per-member sleep.
+class Knocks:
+    """Stands in for the knock library: records each plan, answers every
+    member with an empty result (the fake exchanges settle on their own)."""
 
-    Sleeping the offset before a member started put it ahead of that
-    member's warm-up and signing, which cost hundreds of milliseconds and
-    varied per call, so the intended offsets never reached the wire.
-    """
-    fleet = Fleet([member("primary", 0), member("m1", 60), member("m2", 120)])
-    place(fleet)
+    def __init__(self):
+        self.plans = []
+        self.hooks = []
+        self.error = None
 
-    origins = {m.exchange.grid_origin for m in fleet.members}
-    assert len(origins) == 1
-    assert origins != {None}
-    assert [m.exchange.phase_offset_ms for m in fleet.members] == [
-        Decimal(0),
-        Decimal(60),
-        Decimal(120),
-    ]
-    # No member is held back before it starts preparing.
-    starts = [m.exchange.started_at for m in fleet.members]
-    assert max(starts) - min(starts) < 0.05
-
-
-class SlowSigningClient:
-    """A venue that keeps answering not-ready, so the loop keeps its cadence.
-
-    Signing costs differ per member on purpose: that difference is what used
-    to decide where each member's sends landed.
-    """
-
-    def __init__(self, sign_cost):
-        self.sign_cost = sign_cost
-        self.calls = 0
-
-    def create_order(self, order_args, options):
-        time.sleep(self.sign_cost)
-        return {"token_id": order_args.token_id, "side": order_args.side}
-
-    def post_orders(self, signed, post_only=False):
-        self.calls += 1
-        if self.calls >= 40:
-            return [
-                {"success": True, "orderID": f"{id(self)}-{index}", "status": "live"}
-                for index in range(len(signed))
-            ]
-        return [
-            {
-                "success": False,
-                "orderID": "",
-                "errorMsg": "the market is not yet ready to process new orders",
-            }
-            for _ in signed
-        ]
-
-    def post_order(self, order, order_type, post_only=False):
-        return self.post_orders([order], post_only=post_only)[0]
-
-    def cancel_orders(self, order_ids):
-        return {"canceled": list(order_ids)}
+    def __call__(self, plan, hooks):
+        if self.error:
+            raise self.error
+        self.plans.append(plan)
+        self.hooks.append(hooks)
+        return {"members": [{"account": m["account"]} for m in plan["members"]]}
 
 
 @pytest.fixture(autouse=True)
-def _loop_backed_by_the_fake_client(monkeypatch):
-    """Production sends go through the event loop; these tests exercise
-    fleets of fake clients, so the submitter is a stand-in that fulfils
-    each leg from the fake client's post_order with the wrapping the real
-    loop applies (transient errors re-raised, other rejections folded to
-    the errorMsg dict)."""
-    from concurrent.futures import Future
-
-    from polymarket_bot import exchange as exchange_module
-    from polymarket_bot.exchange import _transient_submission_error
-    from py_clob_client_v2.exceptions import PolyApiException
-
-    class LoopStandIn:
-        def warm(self):
-            pass
-
-        def prepare(self, client, args):
-            return (client, args)
-
-        def submit(self, legs):
-            from threading import Thread as _Thread
-
-            future: Future = Future()
-
-            def work() -> None:
-                try:
-                    results = []
-                    for client, args in legs:
-                        try:
-                            results.append(
-                                client.post_order(
-                                    args.order, args.orderType, post_only=True
-                                )
-                            )
-                        except PolyApiException as exc:
-                            if _transient_submission_error(exc):
-                                raise
-                            payload = (
-                                exc.error_msg
-                                if isinstance(exc.error_msg, dict)
-                                else {}
-                            )
-                            message = str(
-                                payload.get("error") or exc.error_msg or exc
-                            )
-                            results.append(
-                                {"errorMsg": message, "success": False}
-                            )
-                except BaseException as exc:  # noqa: BLE001 - mirrors the loop
-                    future.set_exception(exc)
-                else:
-                    future.set_result(results)
-
-            _Thread(target=work, daemon=True).start()
-            return future
-
-    monkeypatch.setattr(exchange_module, "get_submitter", lambda: LoopStandIn())
+def knocks(monkeypatch):
+    stub = Knocks()
+    monkeypatch.setattr(knocker, "knock", stub)
+    return stub
 
 
-def _recording_exchange(sign_cost):
-    exchange = Exchange.__new__(Exchange)
-    exchange.client = SlowSigningClient(sign_cost)
-    exchange.sends = []
-    dispatch = Exchange._submit_placement_request
+def test_one_knock_carries_every_member_at_its_own_offset(knocks):
+    """The offsets ride on one timetable in one knock; nobody sleeps its
+    offset before it starts."""
+    fleet = Fleet([member("primary", 0), member("m1", 60), member("m2", 120)])
+    place(fleet)
 
-    def record(self, payload):
-        self.sends.append(time.monotonic())
-        return dispatch(self, payload)
+    [plan] = knocks.plans
+    assert plan["interval_ms"] == 25.0
+    assert [m["account"] for m in plan["members"]] == ["primary", "m1", "m2"]
+    assert [m["phase_ms"] for m in plan["members"]] == [0.0, 60.0, 120.0]
+    assert set(knocks.hooks[0]) == {"primary", "m1", "m2"}
+    # Every member signs before the knock, none is held back to start.
+    starts = [m.exchange.started_at for m in fleet.members]
+    assert max(starts) - min(starts) < 0.05
+    # Each member settles its own part of the result.
+    assert [m.exchange.outcome["account"] for m in fleet.members] == ["primary", "m1", "m2"]
 
-    exchange._submit_placement_request = record.__get__(exchange, Exchange)
-    return exchange
+
+def test_a_member_whose_signing_is_not_ready_sits_the_knock_out(knocks):
+    fleet = Fleet([member("primary", not_ready=True), member("m1", 12.5, registered_ts_ms=900)])
+    placement = place(fleet)
+
+    assert [m["account"] for m in knocks.plans[0]["members"]] == ["m1"]
+    assert placement.kept == "m1"
+    assert placement.placements[0].result.retryable
 
 
-def test_two_members_reach_the_wire_half_a_cadence_apart():
-    """The acceptance criterion for the whole timetable change.
+def test_a_member_that_cannot_join_the_knock_is_reported_alone(knocks):
+    fleet = Fleet([member("primary", member_exc=RuntimeError("no creds")), member("m1", 12.5, registered_ts_ms=900)])
+    placement = place(fleet)
 
-    Run 15 and run 16 failed exactly here: both accounts fired within a few
-    milliseconds of each other instead of half a cadence apart, so the second
-    account bought nothing. The signing costs below differ by 127 ms, which
-    is 2 ms in cadence terms - close to what the field actually showed - so a
-    member that started its own timetable would land there instead of at
-    12.5 ms.
-    """
-    interval = 25.0
-    members = [
-        ("primary", _recording_exchange(0.010), Decimal("103.7")),
-        ("m1", _recording_exchange(0.137), Decimal("106.1")),
+    assert [m["account"] for m in knocks.plans[0]["members"]] == ["m1"]
+    assert placement.placements[0].error == "RuntimeError: no creds"
+    assert placement.kept == "m1"
+
+
+def test_a_knock_that_fails_is_reported_for_every_member(knocks):
+    knocks.error = knocker.KnockerError("library missing")
+    fleet = Fleet([member("primary"), member("m1", 12.5)])
+    placement = place(fleet)
+
+    assert placement.kept is None
+    assert [p.error for p in placement.placements] == [
+        "KnockerError: library missing",
+        "KnockerError: library missing",
     ]
-    fleet = Fleet(evenly_phased(members, Decimal("25")))
-
-    fleet.place(MARKET, price=Decimal("0.01"), submission_interval_ms=Decimal("25"))
-
-    first, second = (member.exchange.sends for member in fleet.members)
-    assert len(first) >= 20 and len(second) >= 20
-
-    base = first[0]
-    differences = []
-    for moment in second:
-        offset = ((moment - base) * 1000.0) % interval
-        differences.append(offset)
-    differences.sort()
-    middle = differences[len(differences) // 2]
-    assert 12.5 - 5.0 <= middle <= 12.5 + 5.0, (
-        f"members reached the wire {middle:.2f} ms apart, wanted 12.5"
-    )
 
 
 def test_keeps_earliest_registration_and_cancels_laggards():
@@ -449,95 +360,7 @@ def test_config_from_env_file_requires_key_and_funder(tmp_path):
         BotConfig.from_env_file(path, project_root=tmp_path)
 
 
-class AcceptingClient:
-    def create_order(self, order_args, options):
-        return {
-            "token_id": order_args.token_id,
-            "side": order_args.side,
-            "price": order_args.price,
-            "size": order_args.size,
-        }
-
-    def post_orders(self, signed, post_only=False):
-        return [
-            {"success": True, "orderID": f"{item.order['token_id']}-id", "status": "live"}
-            for item in signed
-        ]
-
-    def post_order(self, order, order_type, post_only=False):
-        return {
-            "success": True,
-            "orderID": f"{order['token_id']}-id",
-            "status": "live",
-        }
-
-    def cancel_orders(self, order_ids):
-        return {"canceled": list(order_ids)}
-
-
-def test_place_dual_reports_registration_time():
-    exchange = Exchange.__new__(Exchange)
-    exchange.client = AcceptingClient()
-    before = int(time.time() * 1000)
-    result = exchange.place_dual(
-        MARKET,
-        price=Decimal("0.01"),
-        size=Decimal("100"),
-        submission_interval_ms=Decimal("20"),
-    )
-    assert result.complete
-    assert result.registered_ts_ms is not None
-    assert before <= result.registered_ts_ms <= int(time.time() * 1000)
-
-def test_every_member_is_told_how_many_share_the_pool():
-    """The cap has to come from the fleet running, not from a constant.
-
-    One pool serves the whole process. Divided by a fixed number instead, a
-    solo account was held to half the pool it owned, and a fleet larger than
-    that number was promised more connections than the pool has.
-    """
-    from polymarket_bot.transport import in_flight_budget
-
-    for size in (1, 2, 3, 5):
-        members = [
-            (f"m{index}", _recording_exchange(0.0), Decimal("103.7"))
-            for index in range(size)
-        ]
-        fleet = Fleet(evenly_phased(members, Decimal("25")))
-        for member in fleet.members:
-            assert member.exchange.accounts_sharing_the_pool == size
-            assert member.exchange.max_requests_in_flight == in_flight_budget(size)
-            # The halving that once cut this outside batch mode hurt exactly
-            # the non-batch multi-account quadrant; pin that quadrant too.
-            member.exchange.entry_submission = "solo-up"
-            assert member.exchange.max_requests_in_flight == in_flight_budget(size)
-
-    # A single Exchange with no fleet around it still owns the whole pool.
-    alone = _recording_exchange(0.0)
-    assert alone.accounts_sharing_the_pool == 1
-    assert alone.max_requests_in_flight == in_flight_budget(1)
-
-
-def test_the_cap_is_the_pool_share_in_every_submission_mode():
-    """The cap counts connections; threads are budgeted where they are spent.
-
-    Halving the cap outside batch mode was thread protection priced in the
-    wrong unit: at three or more accounts it fell below the ~40 requests a
-    one-second reply lets accumulate, and the send loop skipped slots again.
-    A transport test now holds the fleet's worst-case thread count instead.
-    """
-    from polymarket_bot.transport import in_flight_budget
-
-    batch = _recording_exchange(0.0)
-    batch.entry_submission = "batch"
-    solo = _recording_exchange(0.0)
-    solo.entry_submission = "solo-up"
-
-    assert batch.max_requests_in_flight == in_flight_budget(1)
-    assert solo.max_requests_in_flight == in_flight_budget(1)
-
-
-def test_every_member_shares_one_knocking_budget():
+def test_every_member_shares_one_knocking_budget(knocks):
     """The members give up together, on the deadline the fleet was handed."""
     fleet = Fleet([member("primary", 0), member("m1", 60), member("m2", 120)])
     until = time.time() + 240
@@ -546,7 +369,8 @@ def test_every_member_shares_one_knocking_budget():
         MARKET, price=Decimal("0.01"), submission_interval_ms=Decimal("25"), knock_until_ts=until
     )
 
-    assert [m.exchange.knock_until_ts for m in fleet.members] == [until, until, until]
+    [plan] = knocks.plans
+    assert plan["knock_until_ms"] == int(until * 1000)
 
 
 def test_the_fleet_gives_up_only_when_every_member_did():

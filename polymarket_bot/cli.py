@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import sys
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 from logging.handlers import TimedRotatingFileHandler
@@ -43,11 +42,8 @@ def _take_profit_arg(value: str) -> ExitTarget:
     )
 
 
-# A cadence finer than this leaves the submission loop permanently behind its
-# own timetable: it never reaches the wait that collects replies, and since
-# every send carries a thread it spins without bound. It is also three orders
-# of magnitude past what the venue will accept from one account, so nothing
-# real lives below it.
+# A cadence finer than this is three orders of magnitude past what the venue
+# will accept from one account, so nothing real lives below it.
 MINIMUM_PLACEMENT_INTERVAL_MS = Decimal("1")
 
 
@@ -176,7 +172,7 @@ class _ExpectedOrderEngineFilter(logging.Filter):
 
     NAMES = (
         "py_clob_client_v2.http_helpers.helpers",
-        "polymarket_bot.async_submitter",
+        "polymarket_bot.knocker",
     )
     EXPECTED = (
         "invalid token id",
@@ -216,27 +212,7 @@ def _rotating_logger(name: str, path: Path) -> logging.Logger:
     return logger
 
 
-# A submission cadence of 25 ms is finer than the interpreter's default
-# 5 ms hand-off between threads, so a loop whose slot has come can be left
-# waiting behind whatever else is running - on a single core, all the
-# members wait together and their offsets vanish. Measured on the server
-# against a fake venue, two members 12.5 ms apart under load: 14.3 ms apart
-# with the default and 121 of 200 slots missed, 12.49 ms apart and no slot
-# missed at 0.2 ms.
-#
-# The cost was measured where it could bite: signing, the one processor-bound
-# thing here (the native backend is not installed, so signatures are computed
-# in Python and hold the interpreter), with every member signing at once. On
-# the single-core server the whole per-market signing cost is unchanged - five
-# members took 0.0707 s at the default and 0.0702 s at 0.2 ms. On a multi-core
-# machine the same measurement costs several times the processor time, because
-# the interpreter is then handed back and forth between cores; if this ever
-# runs on more than one core, measure again before keeping this value.
-THREAD_SWITCH_SECONDS = 0.0002
-
-
 def main() -> None:
-    sys.setswitchinterval(THREAD_SWITCH_SECONDS)
     args = _parser().parse_args()
     if args.command == "setup":
         result = setup_wallet(SetupConfig.load(apply=args.apply), apply=args.apply)

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import math
-import re
+import json
+import logging
+import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, Future, wait
+from dataclasses import dataclass
 from decimal import Decimal
-from functools import partial
 
+import certifi
 import requests
 from py_clob_client_v2 import (
     ApiCreds,
@@ -19,77 +20,40 @@ from py_clob_client_v2 import (
     PostOrdersV2Args,
     Side,
 )
+from py_clob_client_v2.client import _is_v2_order
 from py_clob_client_v2.exceptions import PolyApiException
+from py_clob_client_v2.order_utils.model.order_data_v1 import order_to_json_v1
+from py_clob_client_v2.order_utils.model.order_data_v2 import order_to_json_v2
 
-from .async_submitter import get_submitter
+from . import knocker
 from .config import BotConfig
 from .models import Market, PlacedOrder, PlacementResult
-from .transport import (
-    in_flight_budget,
-    install_parallel_transport,
-    warm_connections,
-)
+from .transport import install_parallel_transport, warm_connections
 
+logger = logging.getLogger(__name__)
 
 CLOB_HOST = "https://clob.polymarket.com"
 GEOBLOCK_URL = "https://polymarket.com/api/geoblock"
 TOKEN_SCALE = Decimal("1000000")
-MARKET_NOT_READY = "the market is not yet ready to process new orders"
-ORDERBOOK_MISSING_PREFIX = "the orderbook "
-ORDERBOOK_MISSING_SUFFIX = " does not exist"
-ORDER_ENGINE_NOT_READY_ERRORS = {
-    (400, "invalid token id"),
-    (404, "market not found"),
-}
 DEFAULT_PLACEMENT_INTERVAL_MS = Decimal("20")
 # The client asks the venue for the market's tick size before signing, and a
 # freshly announced market answers 404 "market not found" for its first tens
 # of milliseconds. Run 14 lost 17 of 72 markets to that reply being fatal.
-# Signing runs on the service loop (or a fleet member thread the loop joins),
-# and that loop is also what cancels resting orders before a market ends
-# (default margin 2 s), so the in-place wait must stay well below that
-# margin; past it the market is handed back to the loop as a retryable
-# placement, the same path the submission loop uses, and re-enters on the
-# next 0.2 s tick.
+# Signing runs on the service loop, and that loop is also what cancels
+# resting orders before a market ends (default margin 2 s), so the in-place
+# wait must stay well below that margin; past it the market is handed back
+# to the loop as a retryable placement and re-enters on the next 0.2 s tick.
 SIGNING_NOT_READY_RETRY_SECONDS = 0.5
 SIGNING_NOT_READY_POLL_SECONDS = 0.1
-# How long a placement keeps collecting replies after it stops sending,
-# before handing the market back to the service loop. A reply that lands
-# later is still written to the attempt trace when it arrives.
-DRAIN_TIMEOUT_SECONDS = 3.0
 # How long a market is knocked before it is given up as skipped. Doors open
 # 53..125 s after the listing on the venue's normal days (hourly p90 about
 # 110 s over 2026-09-22/23) and minutes to hours on its bad ones; 240 s takes
 # the whole normal distribution and bounds the damage of a bad one to four
 # minutes of not-ready replies instead of a session pinned on one market.
 KNOCK_SECONDS = 240.0
-KNOCK_BUDGET_ERROR = "no acceptance within the knocking budget"
-# A moment this close after a slot still counts as that slot. The monotonic
-# clock reads in the millions of seconds, where a double carries about a
-# nanosecond of noise, so without slack the arithmetic below rounds up at
-# random and silently skips every other slot. One microsecond swamps that
-# noise and is far below anything the scheduler can resolve.
-_GRID_TOLERANCE_SECONDS = 1e-6
-
-
-def submission_slot(
-    moment: float, *, origin: float, phase: float, interval: float
-) -> float:
-    """First slot at or after `moment` on the timetable origin+phase+k*interval.
-
-    Fleet members share `origin` and differ only in `phase`, so their sends
-    stay that far apart however long each member's warm-up and signing took,
-    and a member that misses slots resumes on its own next one rather than
-    starting a fresh timetable at "now".
-    """
-    offset = moment - origin - phase - _GRID_TOLERANCE_SECONDS
-    return origin + phase + math.ceil(offset / interval) * interval
-
-
-DUPLICATE_ORDER_PATTERN = re.compile(
-    r"\border\s+(0x[0-9a-f]{64})\s+is invalid\.\s*duplicated\.",
-    re.IGNORECASE,
-)
+# The client re-resolves the order version when a reply says it is stale;
+# at most this often.
+VERSION_HEAL_INTERVAL_SECONDS = 30.0
 
 
 class _SigningNotReady(RuntimeError):
@@ -111,59 +75,23 @@ class AmbiguousPlacementError(RuntimeError):
         self.attempts = attempts
 
 
-def _duplicate_order_id(response: object) -> str | None:
-    if not isinstance(response, dict):
-        return None
-    match = DUPLICATE_ORDER_PATTERN.search(str(response.get("errorMsg") or ""))
-    return match.group(1) if match else None
+# Replies are judged once, by the knock library; these read its verdict for
+# the replies Python still handles itself (exits, reconciliation).
 
 
 def _order_id(response: object) -> str | None:
     if not isinstance(response, dict):
         return None
-    return (
-        response.get("orderID") or response.get("orderId") or response.get("order_id")
-        or _duplicate_order_id(response)
-    )
+    return knocker.classify(response).order_id
 
 
 def _accepted(response: object) -> bool:
-    if not isinstance(response, dict):
-        return False
-    if _duplicate_order_id(response):
-        return True
-    if response.get("success") is False:
-        return False
-    return bool(_order_id(response))
-
-
-def _order_engine_not_ready(response: object) -> bool:
-    if not isinstance(response, dict) or _order_id(response):
-        return False
-    error = str(response.get("errorMsg") or "").lower()
-    return (
-        error == MARKET_NOT_READY
-        or error in {"invalid token id", "market not found"}
-        or (
-            error.startswith(ORDERBOOK_MISSING_PREFIX)
-            and error.endswith(ORDERBOOK_MISSING_SUFFIX)
-        )
-    )
+    return isinstance(response, dict) and knocker.classify(response).accepted
 
 
 def _transient_submission_error(error: PolyApiException) -> bool:
     status = error.status_code
     return status is None or status == 429 or 500 <= status < 600
-
-
-def _order_engine_not_ready_error(error: PolyApiException) -> str | None:
-    payload = error.error_msg
-    if not isinstance(payload, dict):
-        return None
-    message = str(payload.get("error") or "").lower()
-    if (error.status_code, message) not in ORDER_ENGINE_NOT_READY_ERRORS:
-        return None
-    return message
 
 
 def _signing_retryable(error: PolyApiException) -> bool:
@@ -175,43 +103,45 @@ def _signing_retryable(error: PolyApiException) -> bool:
     return _transient_submission_error(error)
 
 
-def classify_response(response: object) -> str:
-    """Bucket one submission response for the attempt trace."""
-    if isinstance(response, BaseException):
-        status = getattr(response, "status_code", None)
-        if status == 429:
-            return "rate_limited"
-        return f"error_{status}" if status else "transport_error"
-    if _duplicate_order_id(response):
-        return "duplicate"
-    if _accepted(response):
-        return "accepted"
-    if _order_engine_not_ready(response):
-        return "not_ready"
-    return "rejected"
+@dataclass(frozen=True)
+class Entry:
+    """One account's signed entry for a market, ready to knock."""
+
+    market: Market
+    price: Decimal
+    size: Decimal
+    specifications: tuple[tuple[str, str], ...]
+    # (outcome, the exact request body), in the order of specifications
+    legs: tuple[tuple[str, str], ...]
+    submission_key: tuple
+
+
+def knock_plan(
+    market: Market,
+    members: list[dict],
+    *,
+    interval_ms: Decimal,
+    knock_until_ts: float,
+) -> dict:
+    """What the knock library needs for one market.
+
+    The certificate authorities are the ones the Python HTTP stack trusted
+    (certifi), so the orders reach the same venue they always did.
+    """
+    return {
+        "market": market.slug,
+        "interval_ms": float(interval_ms),
+        "knock_until_ms": int(knock_until_ts * 1000),
+        "market_end_ms": int(market.end_ts * 1000),
+        "ca_file": certifi.where(),
+        "members": members,
+    }
 
 
 class Exchange:
-    _next_placement_submission = 0.0
     entry_submission = "single"
     attempt_trace = None
-    # An account alone in the process owns the whole pool; Fleet narrows this
-    # to a share when it builds its members.
-    accounts_sharing_the_pool = 1
-
-    @property
-    def max_requests_in_flight(self) -> int:
-        """Outstanding requests this account may hold at once.
-
-        Orders travel over HTTP/2, where a request in flight costs a stream
-        rather than a socket, and nothing is cancelled, so a request holds
-        its stream until its reply lands. The ceiling is the account's even
-        share of the order connections' streams; reaching it means the venue
-        is answering slower than the connections can carry (7.5 s at the
-        full fleet's rate), and skipping the slot beats queueing a send
-        that would leave late (see place_dual).
-        """
-        return in_flight_budget(self.accounts_sharing_the_pool)
+    _last_version_heal = 0.0
 
     def __init__(self, config: BotConfig):
         install_parallel_transport()
@@ -248,7 +178,6 @@ class Exchange:
         self.config = config
         self.credentials = creds
         self._dual_submissions: dict[tuple, list[PostOrdersV2Args]] = {}
-        self._next_placement_submission = 0.0
 
     @staticmethod
     def geoblock() -> dict:
@@ -276,16 +205,40 @@ class Exchange:
         price: Decimal,
         size: Decimal,
         submission_interval_ms: Decimal | None = None,
-        grid_origin: float | None = None,
-        phase_offset_ms: Decimal = Decimal(0),
         knock_until_ts: float | None = None,
     ) -> PlacementResult:
+        """Knock this account's entry on its own (no fleet)."""
         if knock_until_ts is None:
             knock_until_ts = time.time() + KNOCK_SECONDS
+        entry = self.prepare_entry(market, price=price, size=size)
+        if isinstance(entry, PlacementResult):
+            return entry
+        if submission_interval_ms is None or submission_interval_ms <= 0:
+            raise ValueError("submission_interval_ms must be above 0")
+        outcome = knocker.knock(
+            knock_plan(
+                market,
+                [self.knock_member(entry, name="primary", phase_offset_ms=Decimal(0))],
+                interval_ms=submission_interval_ms,
+                knock_until_ts=knock_until_ts,
+            ),
+            {"primary": self.knock_hooks()},
+        )
+        return self.settle_entry(entry, outcome["members"][0])
+
+    def prepare_entry(
+        self, market: Market, *, price: Decimal, size: Decimal
+    ) -> Entry | PlacementResult:
+        """Sign this account's entry orders for a knock.
+
+        A market handed back earlier reuses the orders signed then: every
+        send for a market is the same signed order, so a late one earns "not
+        ready" or "duplicated", never a second order. Signing that the venue
+        is not ready for comes back as a retryable PlacementResult.
+        """
+        # Cancels right after the door ride the sync pool; open its
+        # connections before the burst.
         warm_connections()
-        # The hot path sends through the event loop's own clients, which
-        # dial their own connections; warm them alongside the sync pool.
-        get_submitter().warm()
         options = PartialCreateOrderOptions(
             tick_size=str(market.tick_size),
             neg_risk=False,
@@ -304,356 +257,135 @@ class Exchange:
             except _SigningNotReady as exc:
                 return PlacementResult((), str(exc), retryable=True, attempts=1)
             submissions[submission_key] = signed
-
-        if submission_interval_ms is None or submission_interval_ms <= 0:
-            raise ValueError("submission_interval_ms must be above 0")
-        return self._place_dual_staggered(
-            specifications,
-            signed,
-            price=price,
-            size=size,
-            submission_interval_ms=submission_interval_ms,
-            grid_origin=grid_origin,
-            phase_offset_ms=phase_offset_ms,
-            market_end_ts=market.end_ts,
-            knock_until_ts=knock_until_ts,
-            submission_key=submission_key,
-            submissions=submissions,
+        legs = tuple(
+            (outcome, self._order_body(args))
+            for (outcome, _), args in zip(specifications, signed, strict=True)
         )
+        return Entry(market, price, size, specifications, legs, submission_key)
 
-    def _place_dual_staggered(
-        self,
-        specifications: tuple[tuple[str, str], tuple[str, str]],
-        signed: list[PostOrdersV2Args],
-        *,
-        price: Decimal,
-        size: Decimal,
-        submission_interval_ms: Decimal,
-        market_end_ts: int,
-        knock_until_ts: float,
-        submission_key: tuple,
-        submissions: dict[tuple, list[PostOrdersV2Args]],
-        grid_origin: float | None = None,
-        phase_offset_ms: Decimal = Decimal(0),
-    ) -> PlacementResult:
-        """Submit one immutable signed pair on this member's timetable.
+    def _order_body(self, args: PostOrdersV2Args) -> str:
+        """The exact body the official client posts for this order, post-only.
 
-        Every send falls on `grid_origin + phase_offset + k * interval`. The
-        fleet hands all members one origin, so their offsets hold whatever
-        each member's warm-up and signing cost, and a member that misses a
-        slot resumes on its own next slot instead of re-basing on "now" -
-        which is what collapsed the offsets when both members stalled on the
-        same core.
+        It is built by the library's own functions and never changes for a
+        signed order; only the auth headers, stamped per send, move.
         """
-        interval = float(submission_interval_ms / Decimal("1000"))
-        phase = float(phase_offset_ms / Decimal("1000"))
-        # Without a fleet the timetable starts here, so this same reading is
-        # what the first slot must be snapped from. Reading the clock a second
-        # time below would push the first send a whole interval out whenever
-        # the two readings differ, which they usually do.
-        started = time.monotonic()
-        origin = started if grid_origin is None else grid_origin
-
-        def slot_at_or_after(moment: float) -> float:
-            return submission_slot(
-                moment, origin=origin, phase=phase, interval=interval
-            )
-
-        def slot_after(scheduled: float) -> float:
-            """The slot that follows `scheduled`, never one already gone.
-
-            Both the send and the give-up path move the timetable on, and
-            they have to move it the same way: a member that re-based on
-            "now" would drift off the offsets the fleet depends on. One
-            function so they cannot come apart.
-            """
-            return slot_at_or_after(max(scheduled + interval, time.monotonic()))
-
-        pending: dict[Future, tuple[tuple[tuple[str, str], ...], int, int]] = {}
-        accepted: dict[str, PlacedOrder] = {}
-        errors: list[str] = []
-        ambiguous_errors: list[str] = []
-        attempts = 0
-        held_back = 0
-        in_flight_cap = self.max_requests_in_flight
-        registered_ts_ms: int | None = None
-        next_submission = slot_at_or_after(
-            max(started, self._next_placement_submission)
+        owner = self.client.creds.api_key or ""
+        to_json = order_to_json_v2 if _is_v2_order(args.order) else order_to_json_v1
+        body = to_json(
+            args.order, owner, args.orderType, True, getattr(args, "deferExec", False)
         )
-        stop_submitting = False
-        gave_up = False
-        drain_deadline: float | None = None
+        return json.dumps(body, separators=(",", ":"), ensure_ascii=False)
 
-        while pending or not stop_submitting:
-            now = time.monotonic()
-            if not stop_submitting and time.time() >= market_end_ts:
-                errors.append("market ended before both orders were accepted")
-                stop_submitting = True
-            elif not stop_submitting and time.time() >= knock_until_ts:
-                # The door did not open inside the knocking budget. Stop here
-                # and let the caller mark the market skipped: since 2026-09-05
-                # the venue sometimes opens a book minutes to hours after the
-                # listing, and the loop's only other exit is the market's end
-                # a day later - one such market pinned a whole session.
-                errors.append(KNOCK_BUDGET_ERROR)
-                gave_up = True
-                stop_submitting = True
-            if (
-                not stop_submitting
-                and now >= next_submission
-                and len(pending) >= in_flight_cap
-            ):
-                # The venue is answering slower than this cadence sends. Give
-                # up this slot rather than deepen the queue, and stay on the
-                # timetable so the offset from the other members survives.
-                held_back += 1
-                next_submission = slot_after(next_submission)
-                self._next_placement_submission = next_submission
-                continue
+    def knock_member(
+        self, entry: Entry, *, name: str, phase_offset_ms: Decimal
+    ) -> dict:
+        """This account's part of a knock plan."""
+        creds = self.credentials
+        return {
+            "account": name,
+            "phase_ms": float(phase_offset_ms),
+            "address": self.client.signer.address(),
+            "api_key": creds.api_key,
+            "api_secret": creds.api_secret,
+            "api_passphrase": creds.api_passphrase,
+            "legs": [{"outcome": outcome, "body": body} for outcome, body in entry.legs],
+        }
 
-            if not stop_submitting and now >= next_submission:
-                submit_specs, payload = self._next_submission(
-                    specifications, signed, accepted, attempts
-                )
-                pending[self._submit_placement_request(payload)] = (
-                    submit_specs,
-                    int(time.time() * 1000),
-                    attempts + 1,
-                )
-                attempts += 1
-                # Next slot on this member's own timetable. A stall skips the
-                # slots it ate rather than re-basing the timetable, so the
-                # offset from the other members survives it.
-                next_submission = slot_after(next_submission)
-                self._next_placement_submission = next_submission
-                continue
+    def knock_hooks(self) -> knocker.Hooks:
+        return knocker.Hooks(
+            trace=self.attempt_trace, version_mismatch=self._heal_order_version
+        )
 
-            if not stop_submitting:
-                timeout = max(0.0, next_submission - now)
-            else:
-                if drain_deadline is None:
-                    # The drain runs from the moment sending stops. It used
-                    # to start at the last transient error instead, so an
-                    # error seconds before the door left a deadline already
-                    # past when the order was accepted: the loop left at
-                    # once and the replies still in flight at the door -
-                    # the ones that show which send won - went unrecorded
-                    # (run36 lost 313 trace lines within half a second of a
-                    # registration, 20 anywhere else). Nor may the drain be
-                    # open-ended now that requests are never cancelled.
-                    drain_deadline = now + DRAIN_TIMEOUT_SECONDS
-                timeout = max(0.0, drain_deadline - now)
-                if timeout <= 0:
-                    break
-            if not pending:
-                if stop_submitting:
-                    break
-                if timeout is not None:
-                    time.sleep(timeout)
-                continue
+    def settle_entry(self, entry: Entry, outcome: dict) -> PlacementResult:
+        """What this account's knock came to.
 
-            completed, _ = wait(
-                set(pending),
-                timeout=timeout,
-                return_when=FIRST_COMPLETED,
-            )
-            if not completed:
-                continue
-
-            for future in completed:
-                submit_specs, sent_ts_ms, attempt_no = pending.pop(future)
-                returned_ts_ms = int(time.time() * 1000)
-                try:
-                    responses = future.result()
-                    self._trace(
-                        submit_specs, attempt_no, sent_ts_ms, returned_ts_ms, responses
-                    )
-                except PolyApiException as exc:
-                    self._trace(
-                        submit_specs, attempt_no, sent_ts_ms, returned_ts_ms, exc
-                    )
-                    not_ready_error = _order_engine_not_ready_error(exc)
-                    if not_ready_error:
-                        errors.append(not_ready_error)
-                    elif _transient_submission_error(exc):
-                        ambiguous_errors.append(f"{type(exc).__name__}: {exc}")
-                    else:
-                        errors.append(f"{type(exc).__name__}: {exc}")
-                        stop_submitting = True
-                    continue
-                except Exception as exc:
-                    self._trace(
-                        submit_specs, attempt_no, sent_ts_ms, returned_ts_ms, exc
-                    )
-                    ambiguous_errors.append(f"{type(exc).__name__}: {exc}")
-                    stop_submitting = True
-                    continue
-
-                try:
-                    result = self._parse_dual_responses(
-                        submit_specs,
-                        responses,
-                        price=price,
-                        size=size,
-                        attempts=attempts,
-                    )
-                except AmbiguousPlacementError as exc:
-                    ambiguous_errors.append(str(exc))
-                    continue
-
-                errors.append(result.error or "")
-                for order in result.orders:
-                    existing = accepted.get(order.outcome)
-                    if existing is not None and existing.order_id != order.order_id:
-                        ambiguous_errors.append(
-                            f"conflicting {order.outcome} order ids: "
-                            f"{existing.order_id}, {order.order_id}"
-                        )
-                        stop_submitting = True
-                        continue
-                    accepted[order.outcome] = order
-                    if registered_ts_ms is None or returned_ts_ms < registered_ts_ms:
-                        registered_ts_ms = returned_ts_ms
-                    # sent_ts_ms/returned_ts_ms belong to the request whose
-                    # response is being handled right now, not to whichever
-                    # tick the loop has reached: responses come back out of
-                    # order and dozens of ticks later.
-
-                if len(accepted) == len(specifications):
-                    # Stop sending, but drain the replies still in flight: the
-                    # request that actually registered the order is usually an
-                    # earlier one whose reply has not arrived yet, and dropping
-                    # it here hides which attempt won the queue slot.
-                    stop_submitting = True
-                    continue
-
-                recoverable = (
-                    isinstance(responses, (list, tuple))
-                    and len(responses) == len(submit_specs)
-                    and all(
-                        _accepted(response) or _order_engine_not_ready(response)
-                        for response in responses
-                    )
-                )
-                if not recoverable:
-                    stop_submitting = True
-
-        # Replies still in flight when the drain ends are not dropped: each
-        # is written to the attempt trace when it lands.
-        for future, (late_specs, late_sent_ts_ms, late_attempt_no) in pending.items():
-            future.add_done_callback(
-                partial(
-                    self._trace_when_done, late_specs, late_attempt_no, late_sent_ts_ms
+        Raises AmbiguousPlacementError when nothing registered and some sends
+        never got a verdict: an order may rest at the venue that no reply
+        told us about, and the caller reconciles against the open orders.
+        """
+        attempts = outcome["attempts"]
+        held_back = outcome["held_back"]
+        registered_ts_ms = outcome.get("registered_ms")
+        tokens = dict(entry.specifications)
+        accepted = []
+        for order in outcome["accepted"]:
+            reply = knocker.reply_value(order["status"], order["body"])
+            status = reply.get("status") if isinstance(reply, dict) else None
+            accepted.append(
+                PlacedOrder(
+                    order_id=str(order["order_id"]),
+                    outcome=order["outcome"],
+                    token_id=tokens[order["outcome"]],
+                    price=entry.price,
+                    size=entry.size,
+                    status=str(status or "open").lower(),
+                    raw=reply,
+                    side="buy",
+                    role="entry",
                 )
             )
-
-        if ambiguous_errors and not accepted:
-            unique = "; ".join(dict.fromkeys(ambiguous_errors))
+        ambiguous = [knocker.ambiguous_text(item) for item in outcome["ambiguous"]]
+        if ambiguous and not accepted:
+            unique = "; ".join(dict.fromkeys(ambiguous))
             raise AmbiguousPlacementError(
                 f"staggered submission remained ambiguous: {unique}",
                 attempts=attempts,
             )
-
-        if len(accepted) == len(specifications):
+        expected = len(entry.specifications)
+        if len(accepted) == expected:
             # Every leg registered; replies gathered while draining (repeat
             # duplicates, late not-ready) are expected and not failures.
-            ordered = tuple(accepted[outcome] for outcome, _ in specifications)
-            return self._finalize_dual_result(
-                PlacementResult(
-                    ordered,
-                    attempts=attempts,
-                    held_back=held_back,
-                    expected=len(specifications),
-                    registered_ts_ms=registered_ts_ms,
-                ),
-                submission_key=submission_key,
-                submissions=submissions,
-            )
-
-        meaningful_errors = [error for error in dict.fromkeys(errors) if error]
-        error = "; ".join(meaningful_errors) or "partial placement"
-        if accepted:
-            accepted_orders = tuple(
-                accepted[outcome]
-                for outcome, _ in specifications
-                if outcome in accepted
-            )
             result = PlacementResult(
-                accepted_orders,
-                error,
+                tuple(accepted),
                 attempts=attempts,
                 held_back=held_back,
-                expected=len(specifications),
+                expected=expected,
                 registered_ts_ms=registered_ts_ms,
             )
         else:
-            result = PlacementResult(
-                (),
-                error,
-                retryable=not stop_submitting,
-                attempts=attempts,
-                held_back=held_back,
-                expected=len(specifications),
-                gave_up=gave_up,
-            )
-        return self._finalize_dual_result(
-            result,
-            submission_key=submission_key,
-            submissions=submissions,
-        )
-
-    @staticmethod
-    def _parse_dual_responses(
-        specifications: tuple[tuple[str, str], tuple[str, str]],
-        responses: object,
-        *,
-        price: Decimal,
-        size: Decimal,
-        attempts: int,
-    ) -> PlacementResult:
-        if not isinstance(responses, (list, tuple)) or len(responses) != len(
-            specifications
-        ):
-            raise AmbiguousPlacementError(
-                "submission returned an incomplete dual-order response",
-                attempts=attempts,
-            )
-        accepted = []
-        errors = []
-        for (outcome, token_id), response in zip(
-            specifications, responses, strict=True
-        ):
-            if _accepted(response):
-                accepted.append(
-                    PlacedOrder(
-                        order_id=str(_order_id(response)),
-                        outcome=outcome,
-                        token_id=token_id,
-                        price=price,
-                        size=size,
-                        status=str(response.get("status") or "open").lower(),
-                        raw=response,
-                        side="buy",
-                        role="entry",
-                    )
+            errors = [knocker.error_text(item) for item in outcome["errors"]]
+            error = "; ".join(e for e in dict.fromkeys(errors) if e) or "partial placement"
+            if accepted:
+                result = PlacementResult(
+                    tuple(accepted),
+                    error,
+                    attempts=attempts,
+                    held_back=held_back,
+                    expected=expected,
+                    registered_ts_ms=registered_ts_ms,
                 )
             else:
-                errors.append(str(response))
+                result = PlacementResult(
+                    (),
+                    error,
+                    retryable=False,
+                    attempts=attempts,
+                    held_back=held_back,
+                    expected=expected,
+                    gave_up=outcome["gave_up"],
+                )
+        return self._finalize_dual_result(
+            result,
+            submission_key=entry.submission_key,
+            submissions=self._dual_submission_cache(),
+        )
 
-        if len(accepted) == len(specifications):
-            return PlacementResult(
-                tuple(accepted), attempts=attempts, expected=len(specifications)
-            )
-        retryable = not accepted and all(
-            _order_engine_not_ready(response) for response in responses
-        )
-        return PlacementResult(
-            tuple(accepted),
-            "; ".join(errors) or "partial placement",
-            retryable=retryable,
-            attempts=attempts,
-            expected=len(specifications),
-        )
+    def _heal_order_version(self) -> None:
+        """A reply said the order version is stale: have the client look the
+        version up again, off the knock's thread, at most every 30 s."""
+        now = time.monotonic()
+        if now - self._last_version_heal < VERSION_HEAL_INTERVAL_SECONDS:
+            return
+        self._last_version_heal = now
+        client = self.client
+
+        def heal() -> None:
+            try:
+                client._ClobClient__resolve_version(force_update=True)
+            except Exception as exc:  # noqa: BLE001 - healing is best effort
+                logger.warning("order version heal failed: %s", exc)
+
+        threading.Thread(target=heal, name="order-version-heal", daemon=True).start()
 
     def _finalize_dual_result(
         self,
@@ -672,69 +404,6 @@ class Exchange:
             submissions.pop(submission_key, None)
         return result
 
-    def _submit_placement_request(
-        self,
-        signed: list[PostOrdersV2Args],
-    ) -> Future:
-        # A request in flight costs an event-loop entry, not two OS
-        # threads: run22 held ~460 requests in a venue slow spell and
-        # the ~930 carrier threads starved the one-core box to death.
-        submitter = get_submitter()
-        legs = [submitter.prepare(self.client, args) for args in signed]
-        return submitter.submit(legs)
-
-    def _trace_when_done(
-        self,
-        specs: tuple[tuple[str, str], ...],
-        attempt_no: int,
-        sent_ts_ms: int,
-        future: Future,
-    ) -> None:
-        """Record a reply that landed after its placement stopped waiting."""
-        if future.cancelled():
-            return
-        returned_ts_ms = int(time.time() * 1000)
-        error = future.exception()
-        self._trace(
-            specs,
-            attempt_no,
-            sent_ts_ms,
-            returned_ts_ms,
-            error if error is not None else future.result(),
-        )
-
-    def _trace(
-        self,
-        specs: tuple[tuple[str, str], ...],
-        attempt_no: int,
-        sent_ts_ms: int,
-        returned_ts_ms: int,
-        responses: object,
-    ) -> None:
-        """Record one attempt: which legs, when it left, when it came back.
-
-        The engine-not-ready replies are filtered out of the console log, so
-        without this trace a session cannot show when the book actually
-        started accepting our orders.
-        """
-        if self.attempt_trace is None:
-            return
-        if isinstance(responses, BaseException):
-            outcomes = [classify_response(responses)] * len(specs)
-        elif isinstance(responses, (list, tuple)):
-            outcomes = [classify_response(item) for item in responses]
-        else:
-            outcomes = [classify_response(responses)]
-        self.attempt_trace(
-            {
-                "attempt": attempt_no,
-                "legs": [outcome for outcome, _ in specs],
-                "sent_ts_ms": sent_ts_ms,
-                "returned_ts_ms": returned_ts_ms,
-                "results": outcomes,
-            }
-        )
-
     def _entry_specifications(
         self, market: Market
     ) -> tuple[tuple[str, str], ...]:
@@ -747,32 +416,6 @@ class Exchange:
             ("up", market.up_token_id),
             ("down", market.down_token_id),
         )
-
-    def _next_submission(
-        self,
-        specifications: tuple[tuple[str, str], ...],
-        signed: list[PostOrdersV2Args],
-        accepted: dict[str, PlacedOrder],
-        attempts: int,
-    ) -> tuple[tuple[tuple[str, str], ...], list[PostOrdersV2Args]]:
-        """Pick the payload for one cadence tick.
-
-        Batch mode always submits the full pair. Single mode submits one
-        leg per tick, rotating over the legs that are not registered yet:
-        one rate-limit token per tick, and a registered leg stops
-        consuming budget while the remaining leg inherits every tick.
-        """
-        if self.entry_submission != "single":
-            return specifications, signed
-        remaining = [
-            (spec, args)
-            for spec, args in zip(specifications, signed, strict=True)
-            if spec[0] not in accepted
-        ]
-        if not remaining:
-            return specifications, signed
-        spec, args = remaining[attempts % len(remaining)]
-        return (spec,), [args]
 
     def _prime_tick_size(self, market: Market) -> None:
         """Hand the client the tick size it would otherwise ask the venue for.

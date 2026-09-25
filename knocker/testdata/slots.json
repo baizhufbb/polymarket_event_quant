@@ -1,0 +1,58 @@
+[
+ {
+  "moment_ns": 100000000000,
+  "origin_ns": 100000000000,
+  "phase_ns": 0,
+  "interval_ns": 25000000,
+  "slot_ns": 100000000000
+ },
+ {
+  "moment_ns": 100000000500,
+  "origin_ns": 100000000000,
+  "phase_ns": 0,
+  "interval_ns": 25000000,
+  "slot_ns": 100000000000
+ },
+ {
+  "moment_ns": 100001000000,
+  "origin_ns": 100000000000,
+  "phase_ns": 0,
+  "interval_ns": 25000000,
+  "slot_ns": 100025000000
+ },
+ {
+  "moment_ns": 100024999900,
+  "origin_ns": 100000000000,
+  "phase_ns": 5000000,
+  "interval_ns": 25000000,
+  "slot_ns": 100030000000
+ },
+ {
+  "moment_ns": 100030000000,
+  "origin_ns": 100000000000,
+  "phase_ns": 5000000,
+  "interval_ns": 25000000,
+  "slot_ns": 100030000000
+ },
+ {
+  "moment_ns": 99900000000,
+  "origin_ns": 100000000000,
+  "phase_ns": 20000000,
+  "interval_ns": 25000000,
+  "slot_ns": 99920000000
+ },
+ {
+  "moment_ns": 1234567891234000,
+  "origin_ns": 1234567000000000,
+  "phase_ns": 15000000,
+  "interval_ns": 25000000,
+  "slot_ns": 1234567915000000
+ },
+ {
+  "moment_ns": 1234567015000900,
+  "origin_ns": 1234567000000000,
+  "phase_ns": 15000000,
+  "interval_ns": 25000000,
+  "slot_ns": 1234567015000000
+ }
+]

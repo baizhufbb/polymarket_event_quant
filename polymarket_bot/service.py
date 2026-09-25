@@ -8,6 +8,7 @@ from threading import Event
 
 from polymarket.models import ApiKeyCreds
 
+from . import knocker
 from .config import BotConfig
 from .database import BotDatabase
 from .discovery import MarketDiscovery, is_eligible
@@ -104,6 +105,16 @@ class BotService:
         self.cancel_before_end_seconds = cancel_before_end_seconds
         self.live = live
         self.logger = logger
+        if live:
+            # Loaded now rather than at the first market: a machine that
+            # cannot load the knock library must not start trading, since
+            # exits and reconciliation read replies through it too.
+            library = knocker.version()
+            logger.info(
+                "knock library built from sources %s (%s)",
+                library["source_hash"][:12],
+                library["go"],
+            )
         self.entry_submission = entry_submission
         self.wake_event = Event()
         self.discovery = MarketDiscovery()
@@ -239,6 +250,11 @@ class BotService:
             while True:
                 self.wake_event.clear()
                 self._tick()
+                # A stop that came in during a knock was held until the
+                # knock's orders were written down, so the shutdown cancel
+                # below reaches them; it is acted on here.
+                if knocker.take_interrupt():
+                    raise KeyboardInterrupt
                 self.wake_event.wait(0.2)
         except KeyboardInterrupt:
             cancel_on_shutdown = True

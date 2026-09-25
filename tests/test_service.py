@@ -641,6 +641,32 @@ def test_run_cancels_tracked_orders_on_ctrl_c(tmp_path) -> None:
         assert status == "stopped"
 
 
+def test_a_stop_held_during_a_knock_ends_the_run_after_the_tick(tmp_path) -> None:
+    """The knock hands back what it registered before the stop is acted on,
+    so the tick records those orders and the shutdown cancel reaches them."""
+    from polymarket_bot import knocker
+
+    ticks = []
+
+    def knocked_and_interrupted() -> None:
+        ticks.append("recorded")
+        knocker._interrupted.set()
+
+    with BotDatabase(tmp_path / "bot.sqlite") as database:
+        service = _service_for_run(database, knocked_and_interrupted)
+        cancel_calls = []
+        service._cancel_tracked_orders = lambda: cancel_calls.append(list(ticks))
+
+        service.run()
+
+        assert cancel_calls == [["recorded"]]
+        assert not knocker.take_interrupt()
+        status = database.connection.execute(
+            "SELECT status FROM runs WHERE id=?", (service.run_id,)
+        ).fetchone()["status"]
+        assert status == "stopped"
+
+
 def test_run_leaves_orders_open_on_failure(tmp_path) -> None:
     def failed_tick() -> None:
         raise RuntimeError("network failed")
