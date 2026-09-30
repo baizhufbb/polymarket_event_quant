@@ -11,7 +11,7 @@ from pathlib import Path
 from .config import BotConfig, SetupConfig
 from .database import BotDatabase
 from .exchange import DEFAULT_PLACEMENT_INTERVAL_MS, Exchange
-from .fleet import Fleet, evenly_phased
+from .fleet import LANE_MODES, Fleet, evenly_phased
 from .lock import SingleInstance
 from .models import ExitTarget, TradePlan
 from .paper import PaperDatabase, PaperSimulator, paper_database_path
@@ -146,6 +146,16 @@ def _parser() -> argparse.ArgumentParser:
             "same cadence with its phase offset by interval/N and a distinct "
             "order size, and only the earliest registered order per market "
             "is kept"
+        ),
+    )
+    run.add_argument(
+        "--lane-mode",
+        choices=LANE_MODES,
+        default="shared",
+        help=(
+            "how the fleet's sends reach the venue: shared fills one "
+            "connection, per-member gives each account its own, alternate "
+            "takes turns by market; default shared"
         ),
     )
     run.add_argument(
@@ -308,7 +318,10 @@ def main() -> None:
                 members.append(
                     (f"m{index}", Exchange(member_config), member_plan.order_size)
                 )
-            fleet = Fleet(evenly_phased(members, args.placement_interval_ms))
+            fleet = Fleet(
+                evenly_phased(members, args.placement_interval_ms),
+                lane_mode=args.lane_mode,
+            )
         trace_path = config.project_root / "logs" / "attempts.jsonl"
         with SingleInstance():
             service = BotService(

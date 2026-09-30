@@ -10,9 +10,15 @@ type Plan struct {
 	MarketEndMs  int64 `json:"market_end_ms"`
 	// Where the orders go; empty means the exchange itself. CAFile, when
 	// set, is the only certificate authority trusted.
-	BaseURL string   `json:"base_url,omitempty"`
-	CAFile  string   `json:"ca_file,omitempty"`
-	Members []Member `json:"members"`
+	BaseURL string `json:"base_url,omitempty"`
+	CAFile  string `json:"ca_file,omitempty"`
+	// LanePerMember sends each member's orders on a connection of its own
+	// (the member at index i on lane i) instead of filling one connection
+	// for the whole fleet: each member then reaches the venue by its own
+	// route. An experiment from 2026-10-01 on whether a route registers
+	// orders sooner.
+	LanePerMember bool     `json:"lane_per_member,omitempty"`
+	Members       []Member `json:"members"`
 }
 
 // Member is one account's part: its phase on the shared timetable, its
@@ -83,6 +89,8 @@ type Attempt struct {
 	SentMs     int64    `json:"sent_ts_ms"`
 	ReturnedMs int64    `json:"returned_ts_ms"`
 	Results    []string `json:"results"`
+	// Which of the venue's connections carried the send.
+	Lane int `json:"lane"`
 	// The raw reply, for the log: status 0 means the send failed and
 	// Error says why.
 	Status          int    `json:"status"`

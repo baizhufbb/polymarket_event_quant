@@ -20,8 +20,10 @@ import (
 type Request struct {
 	Arrived time.Time
 	Proto   int
-	Header  http.Header
-	Body    string
+	// The client's end of the connection it came on: one per connection.
+	Remote string
+	Header http.Header
+	Body   string
 }
 
 // Response is what the venue answers; ok false means "use the default".
@@ -97,7 +99,7 @@ func OrderID(body string) string {
 
 func (v *Venue) order(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
-	request := Request{Arrived: time.Now(), Proto: r.ProtoMajor, Header: r.Header.Clone(), Body: string(body)}
+	request := Request{Arrived: time.Now(), Proto: r.ProtoMajor, Remote: r.RemoteAddr, Header: r.Header.Clone(), Body: string(body)}
 	v.mu.Lock()
 	n := len(v.seen)
 	v.seen = append(v.seen, request)

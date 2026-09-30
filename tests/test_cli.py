@@ -49,3 +49,12 @@ def test_the_noise_filter_covers_both_chatty_loggers() -> None:
 
     # unrelated loggers: untouched
     assert noise_filter.filter(record("polymarket_bot", "market not found"))
+
+
+def test_the_lane_mode_defaults_to_one_shared_connection() -> None:
+    parser = cli._parser()
+    base = ["run", "--buy-price", "0.01", "--usd-per-side", "1"]
+    assert parser.parse_args(base).lane_mode == "shared"
+    assert parser.parse_args([*base, "--lane-mode", "alternate"]).lane_mode == "alternate"
+    with pytest.raises(SystemExit):
+        parser.parse_args([*base, "--lane-mode", "round-robin"])

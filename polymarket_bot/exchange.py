@@ -122,11 +122,14 @@ def knock_plan(
     *,
     interval_ms: Decimal,
     knock_until_ts: float,
+    lane_per_member: bool = False,
 ) -> dict:
     """What the knock library needs for one market.
 
     The certificate authorities are the ones the Python HTTP stack trusted
     (certifi), so the orders reach the same venue they always did.
+    lane_per_member gives every member a connection of its own instead of
+    one shared by the fleet.
     """
     return {
         "market": market.slug,
@@ -134,6 +137,7 @@ def knock_plan(
         "knock_until_ms": int(knock_until_ts * 1000),
         "market_end_ms": int(market.end_ts * 1000),
         "ca_file": certifi.where(),
+        "lane_per_member": lane_per_member,
         "members": members,
     }
 

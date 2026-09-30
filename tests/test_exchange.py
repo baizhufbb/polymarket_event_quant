@@ -169,6 +169,8 @@ def test_place_dual_hands_the_signed_pair_to_one_knock(knocks) -> None:
     # The venue is reached with the certificate authorities the Python HTTP
     # stack trusted.
     assert plan["ca_file"] == certifi.where()
+    # A lone account fills the one shared connection.
+    assert plan["lane_per_member"] is False
     [member] = plan["members"]
     assert member["account"] == "primary"
     assert member["phase_ms"] == 0.0

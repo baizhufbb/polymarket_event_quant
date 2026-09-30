@@ -130,13 +130,17 @@ def test_a_reply_reaches_its_accounts_trace_and_the_log(monkeypatch, caplog):
         knocker._record({**attempt, "attempt": 4, "status": 200, "body": "", "version_mismatch": True, "results": ["rejected"]})
         knocker._record({**attempt, "attempt": 5, "status": 0, "error": "EOF", "results": ["transport_error"]})
         knocker._record({**attempt, "account": "nobody", "status": 429, "results": ["rate_limited"]})
+        knocker._record({**attempt, "attempt": 6, "lane": 7})
 
     # The trace keeps its old shape: the tracer adds the account.
     assert rows[0] == {
         "attempt": 3, "legs": ["up"], "sent_ts_ms": 10, "returned_ts_ms": 42,
         "results": ["not_ready"],
     }
-    assert [row["attempt"] for row in rows] == [3, 4, 5]
+    # The connection that carried a send goes last, after the old fields.
+    assert list(rows[-1]) == ["attempt", "legs", "sent_ts_ms", "returned_ts_ms", "results", "lane"]
+    assert rows[-1]["lane"] == 7
+    assert [row["attempt"] for row in rows] == [3, 4, 5, 6]
     assert healed == [1]
     messages = [record.getMessage() for record in caplog.records]
     assert any("status=400" in m and "invalid token id" in m for m in messages)
@@ -241,7 +245,34 @@ def test_a_whole_knock_runs_through_the_real_library(venue):
         }
         assert _wait_for(lambda name=name, outcome=outcome: len(rows[name]) >= outcome["attempts"])
         assert len(rows[name]) == outcome["attempts"]
-        assert set(rows[name][0]) == {"attempt", "legs", "sent_ts_ms", "returned_ts_ms", "results"}
+        assert set(rows[name][0]) == {"attempt", "legs", "sent_ts_ms", "returned_ts_ms", "results", "lane"}
+        # Unless told otherwise the fleet fills one connection.
+        assert {row["lane"] for row in rows[name]} == {0}
+
+
+@with_venue
+def test_each_member_can_knock_on_a_connection_of_its_own_through_the_library(venue):
+    run = uuid.uuid4().hex[:8]
+    names = [f"a-{run}", f"b-{run}", f"c-{run}"]
+    rows = {name: [] for name in names}
+    now_ms = int(time.time() * 1000)
+    plan = {
+        "market": "integration",
+        "interval_ms": 24.0,
+        "knock_until_ms": now_ms + 10_000,
+        "market_end_ms": now_ms + 60_000,
+        "base_url": venue["url"],
+        "ca_file": venue["ca_file"],
+        "lane_per_member": True,
+        "members": [_member(name, 8.0 * index, ["up"]) for index, name in enumerate(names)],
+    }
+
+    result = knocker.knock(plan, {name: knocker.Hooks(trace=rows[name].append) for name in names})
+
+    for index, (name, outcome) in enumerate(zip(names, result["members"], strict=True)):
+        assert [order["outcome"] for order in outcome["accepted"]] == ["up"]
+        assert _wait_for(lambda name=name, outcome=outcome: len(rows[name]) >= outcome["attempts"])
+        assert {row["lane"] for row in rows[name]} == {index}
 
 
 @with_venue
