@@ -144,10 +144,16 @@ func (v *Venue) Pick() *Lane {
 
 // Own takes a stream on the connection set aside for the fleet member at
 // index, the same one on every send: each member reaches the venue by a
-// route of its own. Past Lanes members the connections are shared again.
-// Release is as for Pick.
+// route of its own. Once that connection carries StreamsPerLane requests
+// the send spills over as Pick's do, onto a connection already open,
+// rather than have the transport dial a fresh one for every send of a slow
+// spell. Past Lanes members the connections are shared again. Release is
+// as for Pick.
 func (v *Venue) Own(member int) *Lane {
 	lane := v.lanes[member%len(v.lanes)]
+	if lane.inFlight.Load() >= StreamsPerLane {
+		return v.Pick()
+	}
 	lane.inFlight.Add(1)
 	return lane
 }

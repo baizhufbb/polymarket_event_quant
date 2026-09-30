@@ -13,10 +13,9 @@ type Plan struct {
 	BaseURL string `json:"base_url,omitempty"`
 	CAFile  string `json:"ca_file,omitempty"`
 	// LanePerMember sends each member's orders on a connection of its own
-	// (the member at index i on lane i) instead of filling one connection
-	// for the whole fleet: each member then reaches the venue by its own
-	// route. An experiment from 2026-10-01 on whether a route registers
-	// orders sooner.
+	// (Member.Lane) instead of filling one connection for the whole fleet:
+	// each member then reaches the venue by its own route. An experiment
+	// from 2026-10-01 on whether a route registers orders sooner.
 	LanePerMember bool     `json:"lane_per_member,omitempty"`
 	Members       []Member `json:"members"`
 }
@@ -24,13 +23,17 @@ type Plan struct {
 // Member is one account's part: its phase on the shared timetable, its
 // credentials, and its signed orders.
 type Member struct {
-	Account    string  `json:"account"`
-	PhaseMs    float64 `json:"phase_ms"`
-	Address    string  `json:"address"`
-	APIKey     string  `json:"api_key"`
-	APISecret  string  `json:"api_secret"`
-	Passphrase string  `json:"api_passphrase"`
-	Legs       []Leg   `json:"legs"`
+	Account string  `json:"account"`
+	PhaseMs float64 `json:"phase_ms"`
+	// Lane is the member's own connection when the plan gives each member
+	// one: its place in the whole fleet, so it keeps that connection when
+	// another member sits a market out.
+	Lane       int    `json:"lane"`
+	Address    string `json:"address"`
+	APIKey     string `json:"api_key"`
+	APISecret  string `json:"api_secret"`
+	Passphrase string `json:"api_passphrase"`
+	Legs       []Leg  `json:"legs"`
 }
 
 // Leg is one signed order: the exact request body, sent unchanged on

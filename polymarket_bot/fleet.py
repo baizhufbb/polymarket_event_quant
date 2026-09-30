@@ -277,17 +277,19 @@ class Fleet:
         lane_per_member = self.lanes_per_member(market)
         knocking = []
         parts = []
-        for member in self.members:
+        for position, member in enumerate(self.members):
             if member.name not in entries:
                 continue
             try:
-                parts.append(
-                    member.exchange.knock_member(
-                        entries[member.name],
-                        name=member.name,
-                        phase_offset_ms=member.phase_offset_ms,
-                    )
+                part = member.exchange.knock_member(
+                    entries[member.name],
+                    name=member.name,
+                    phase_offset_ms=member.phase_offset_ms,
                 )
+                # Its place in the whole fleet: a member keeps its own
+                # connection when another one sits this market out.
+                part["lane"] = position
+                parts.append(part)
             except Exception as exc:  # noqa: BLE001 - reported per member
                 outcomes[member.name] = MemberPlacement(
                     member.name, None, f"{type(exc).__name__}: {exc}"

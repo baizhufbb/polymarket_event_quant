@@ -200,6 +200,10 @@ func TestEachMemberCanKnockOnAConnectionOfItsOwn(t *testing.T) {
 	fake := start(t)
 	fake.OpenAt(time.Now().Add(150 * time.Millisecond))
 	members := []knock.Member{member(t, "a", 0, "up"), member(t, "b", 8, "up"), member(t, "c", 16, "up")}
+	// The lanes come from the plan, not from the members' order in it.
+	for i, lane := range []int{0, 5, 9} {
+		members[i].Lane = lane
+	}
 	p := plan(fake, 25*time.Millisecond, 5*time.Second, members...)
 	p.LanePerMember = true
 	sink := &trace{}
@@ -219,9 +223,9 @@ func TestEachMemberCanKnockOnAConnectionOfItsOwn(t *testing.T) {
 	}
 	for _, attempt := range list {
 		want := -1
-		for i, m := range members {
+		for _, m := range members {
 			if attempt.Account == m.Account {
-				want = i
+				want = m.Lane
 			}
 		}
 		if attempt.Lane != want {

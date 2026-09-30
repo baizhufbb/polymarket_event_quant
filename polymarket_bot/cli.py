@@ -303,6 +303,8 @@ def main() -> None:
             )
         if args.fleet_env and args.take_profit:
             raise SystemExit("--fleet-env supports buy-only plans for now")
+        if args.lane_mode != "shared" and not args.fleet_env:
+            raise SystemExit("--lane-mode splits a fleet's connections; add --fleet-env")
         fleet = None
         if live and args.fleet_env:
             members = [("primary", Exchange(config), plan.order_size)]

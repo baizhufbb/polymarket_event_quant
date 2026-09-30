@@ -124,6 +124,46 @@ func TestEachMemberCanOwnAConnection(t *testing.T) {
 	}
 }
 
+func TestAFullOwnConnectionSpillsOntoOneAlreadyOpen(t *testing.T) {
+	fake := start(t)
+	release := make(chan struct{})
+	fake.Respond = func(int, fakevenue.Request) (fakevenue.Response, bool) {
+		<-release
+		return fakevenue.Response{Status: 400, Body: `{"error":"invalid token id"}`}, true
+	}
+	v, err := venue.For(fake.URL, fake.CAFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	send := func(lane *venue.Lane) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, _ = v.SendOrder(lane, creds, []byte(`{}`))
+		}()
+	}
+	for range venue.StreamsPerLane {
+		send(v.Own(3))
+	}
+	spilled := v.Own(3)
+	if spilled.Index() == 3 {
+		t.Fatal("a full connection took one more send")
+	}
+	send(spilled)
+	counts := v.InFlight()
+	if counts[3] != venue.StreamsPerLane || counts[spilled.Index()] != 1 {
+		t.Fatalf("in flight per connection: %v", counts)
+	}
+	close(release)
+	wg.Wait()
+	for i, n := range v.InFlight() {
+		if n != 0 {
+			t.Errorf("connection %d still carries %d", i, n)
+		}
+	}
+}
+
 func TestAFailedSendGivesItsStreamBack(t *testing.T) {
 	fake := start(t)
 	url, ca := fake.URL, fake.CAFile

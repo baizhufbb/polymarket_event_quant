@@ -389,7 +389,7 @@ func (r *run) onSlot(index int) {
 	m.inFlight++
 	var lane *venue.Lane
 	if r.plan.LanePerMember {
-		lane = r.venue.Own(index)
+		lane = r.venue.Own(m.plan.Lane)
 	} else {
 		lane = r.venue.Pick()
 	}

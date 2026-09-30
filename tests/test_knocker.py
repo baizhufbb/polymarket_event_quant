@@ -264,7 +264,7 @@ def test_each_member_can_knock_on_a_connection_of_its_own_through_the_library(ve
         "base_url": venue["url"],
         "ca_file": venue["ca_file"],
         "lane_per_member": True,
-        "members": [_member(name, 8.0 * index, ["up"]) for index, name in enumerate(names)],
+        "members": [{**_member(name, 8.0 * index, ["up"]), "lane": index} for index, name in enumerate(names)],
     }
 
     result = knocker.knock(plan, {name: knocker.Hooks(trace=rows[name].append) for name in names})

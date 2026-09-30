@@ -158,6 +158,8 @@ def test_one_knock_carries_every_member_at_its_own_offset(knocks):
     assert plan["interval_ms"] == 25.0
     assert [m["account"] for m in plan["members"]] == ["primary", "m1", "m2"]
     assert [m["phase_ms"] for m in plan["members"]] == [0.0, 60.0, 120.0]
+    # Each member's own connection, used when the market splits them.
+    assert [m["lane"] for m in plan["members"]] == [0, 1, 2]
     assert set(knocks.hooks[0]) == {"primary", "m1", "m2"}
     # Every member signs before the knock, none is held back to start.
     starts = [m.exchange.started_at for m in fleet.members]
@@ -171,6 +173,8 @@ def test_a_member_whose_signing_is_not_ready_sits_the_knock_out(knocks):
     placement = place(fleet)
 
     assert [m["account"] for m in knocks.plans[0]["members"]] == ["m1"]
+    # m1 keeps its own connection with primary out.
+    assert knocks.plans[0]["members"][0]["lane"] == 1
     assert placement.kept == "m1"
     assert placement.placements[0].result.retryable
 
