@@ -387,13 +387,7 @@ func (r *run) onSlot(index int) {
 	leg := remaining[m.attempts%len(remaining)]
 	m.attempts++
 	m.inFlight++
-	var lane *venue.Lane
-	if r.plan.LanePerMember {
-		lane = r.venue.Own(m.plan.Lane)
-	} else {
-		lane = r.venue.Pick()
-	}
-	go r.send(index, m.creds, m.plan.Account, leg, m.attempts, lane)
+	go r.send(index, m.creds, m.plan.Account, leg, m.attempts, r.venue.Pick())
 }
 
 // send posts one order and hands the reply to the coordinator if the knock
@@ -425,7 +419,6 @@ func (r *run) send(index int, creds venue.Creds, account string, leg Leg, attemp
 			SentMs:          sent,
 			ReturnedMs:      rep.returned,
 			Results:         []string{rep.class.Trace},
-			Lane:            lane.Index(),
 			Status:          rep.status,
 			VersionMismatch: rep.class.VersionMismatch,
 		}

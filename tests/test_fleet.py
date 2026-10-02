@@ -1,5 +1,4 @@
 import time
-from dataclasses import replace
 from decimal import Decimal
 
 import pytest
@@ -158,8 +157,6 @@ def test_one_knock_carries_every_member_at_its_own_offset(knocks):
     assert plan["interval_ms"] == 25.0
     assert [m["account"] for m in plan["members"]] == ["primary", "m1", "m2"]
     assert [m["phase_ms"] for m in plan["members"]] == [0.0, 60.0, 120.0]
-    # Each member's own connection, used when the market splits them.
-    assert [m["lane"] for m in plan["members"]] == [0, 1, 2]
     assert set(knocks.hooks[0]) == {"primary", "m1", "m2"}
     # Every member signs before the knock, none is held back to start.
     starts = [m.exchange.started_at for m in fleet.members]
@@ -173,8 +170,6 @@ def test_a_member_whose_signing_is_not_ready_sits_the_knock_out(knocks):
     placement = place(fleet)
 
     assert [m["account"] for m in knocks.plans[0]["members"]] == ["m1"]
-    # m1 keeps its own connection with primary out.
-    assert knocks.plans[0]["members"][0]["lane"] == 1
     assert placement.kept == "m1"
     assert placement.placements[0].result.retryable
 
@@ -307,36 +302,6 @@ def test_evenly_phased_spreads_offsets():
 def test_duplicate_member_names_are_rejected():
     with pytest.raises(ValueError):
         Fleet([member("a"), member("a")])
-
-
-def test_the_fleet_shares_one_connection_unless_told_otherwise(knocks):
-    placement = place(Fleet([member("primary"), member("m1", 12.5)]))
-    assert knocks.plans[0]["lane_per_member"] is False
-    assert placement.details()["lanes"] == "shared"
-
-
-def test_per_member_lanes_give_every_account_its_own_connection(knocks):
-    placement = place(Fleet([member("primary"), member("m1", 12.5)], lane_mode="per-member"))
-    assert knocks.plans[0]["lane_per_member"] is True
-    assert placement.details()["lanes"] == "per-member"
-
-
-def test_alternating_lanes_take_turns_by_market(knocks):
-    """Odd five-minute numbers get a connection per member, even ones the
-    shared connection, so both ways meet the same hours."""
-    fleet = Fleet([member("primary"), member("m1", 12.5)], lane_mode="alternate")
-    lanes = []
-    for start in (1_999_999_800, 2_000_000_100, 2_000_000_400, 2_000_000_700):
-        market = replace(MARKET, slug=f"btc-updown-5m-{start}", start_ts=start, end_ts=start + 300)
-        placement = fleet.place(market, price=Decimal("0.01"), submission_interval_ms=Decimal("25"))
-        lanes.append(placement.details()["lanes"])
-    assert [plan["lane_per_member"] for plan in knocks.plans] == [False, True, False, True]
-    assert lanes == ["shared", "per-member", "shared", "per-member"]
-
-
-def test_an_unknown_lane_mode_is_refused():
-    with pytest.raises(ValueError):
-        Fleet([member("a")], lane_mode="round-robin")
 
 
 def test_order_view_aggregates_and_routes():

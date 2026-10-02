@@ -196,68 +196,6 @@ func TestTheFleetKnocksUntilTheDoorOpensAndKeepsWhatRegistered(t *testing.T) {
 	}
 }
 
-func TestEachMemberCanKnockOnAConnectionOfItsOwn(t *testing.T) {
-	fake := start(t)
-	fake.OpenAt(time.Now().Add(150 * time.Millisecond))
-	members := []knock.Member{member(t, "a", 0, "up"), member(t, "b", 8, "up"), member(t, "c", 16, "up")}
-	// The lanes come from the plan, not from the members' order in it.
-	for i, lane := range []int{0, 5, 9} {
-		members[i].Lane = lane
-	}
-	p := plan(fake, 25*time.Millisecond, 5*time.Second, members...)
-	p.LanePerMember = true
-	sink := &trace{}
-	result := run(t, p, sink)
-
-	total := 0
-	for i, m := range members {
-		if got := result.Members[i]; len(got.Accepted) != 1 {
-			t.Fatalf("%s: %+v", m.Account, got)
-		}
-		total += result.Members[i].Attempts
-	}
-	// Every send went out on its member's own connection...
-	list := sink.waitFor(func(l []knock.Attempt) bool { return len(l) >= total })
-	if len(list) != total {
-		t.Fatalf("%d attempts traced, %d sent", len(list), total)
-	}
-	for _, attempt := range list {
-		want := -1
-		for _, m := range members {
-			if attempt.Account == m.Account {
-				want = m.Lane
-			}
-		}
-		if attempt.Lane != want {
-			t.Errorf("%s #%d went out on lane %d, want %d", attempt.Account, attempt.Attempt, attempt.Lane, want)
-		}
-	}
-	// ...and no two members ever shared one.
-	owner := map[string]string{}
-	for _, m := range members {
-		for _, r := range requestsOf(fake, m.Account) {
-			if other, ok := owner[r.Remote]; ok && other != m.Account {
-				t.Fatalf("%s and %s shared the connection %s", other, m.Account, r.Remote)
-			}
-			owner[r.Remote] = m.Account
-		}
-	}
-}
-
-func TestTheFleetFillsOneConnectionUnlessToldOtherwise(t *testing.T) {
-	fake := start(t)
-	fake.OpenAt(time.Now().Add(150 * time.Millisecond))
-	a, b := member(t, "a", 0, "up"), member(t, "b", 12.5, "up")
-	sink := &trace{}
-	result := run(t, plan(fake, 25*time.Millisecond, 5*time.Second, a, b), sink)
-	total := result.Members[0].Attempts + result.Members[1].Attempts
-	for _, attempt := range sink.waitFor(func(l []knock.Attempt) bool { return len(l) >= total }) {
-		if attempt.Lane != 0 {
-			t.Errorf("%s #%d went out on lane %d", attempt.Account, attempt.Attempt, attempt.Lane)
-		}
-	}
-}
-
 func TestLegsTakeTurnsUntilOneRegisters(t *testing.T) {
 	fake := start(t)
 	fake.OpenAt(time.Now().Add(150 * time.Millisecond))

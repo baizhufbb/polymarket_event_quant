@@ -251,17 +251,15 @@ def _record(attempt: dict) -> None:
     if hooks is None:
         return
     if hooks.trace is not None:
-        row = {
-            "attempt": attempt["attempt"],
-            "legs": attempt["legs"],
-            "sent_ts_ms": attempt["sent_ts_ms"],
-            "returned_ts_ms": attempt["returned_ts_ms"],
-            "results": attempt["results"],
-        }
-        # Last, so every reader that parses the older rows reads these too.
-        if "lane" in attempt:
-            row["lane"] = attempt["lane"]
-        hooks.trace(row)
+        hooks.trace(
+            {
+                "attempt": attempt["attempt"],
+                "legs": attempt["legs"],
+                "sent_ts_ms": attempt["sent_ts_ms"],
+                "returned_ts_ms": attempt["returned_ts_ms"],
+                "results": attempt["results"],
+            }
+        )
     if attempt.get("version_mismatch") and hooks.version_mismatch is not None:
         hooks.version_mismatch()
 

@@ -19,10 +19,9 @@ const (
 	// DefaultBase is the exchange's order API.
 	DefaultBase = "https://clob.polymarket.com"
 	// Orders are spread over this many HTTP/2 connections, each its own
-	// client. Pick fills them one at a time: a normal market stays on one
-	// busy connection, the rest take the overflow of a slow spell. Own gives
-	// each fleet member a connection of its own instead. The venue allows
-	// StreamsPerLane requests at once on a connection
+	// client, filled one at a time: a normal market stays on one busy
+	// connection, the rest take the overflow of a slow spell. The venue
+	// allows StreamsPerLane requests at once on a connection
 	// (SETTINGS_MAX_CONCURRENT_STREAMS, measured 2026-09-01).
 	Lanes          = 15
 	StreamsPerLane = 100
@@ -56,13 +55,9 @@ type Venue struct {
 
 // Lane is one HTTP/2 client and the requests it is carrying right now.
 type Lane struct {
-	index    int
 	client   *http.Client
 	inFlight atomic.Int32
 }
-
-// Index is the lane's place among the venue's connections, for the trace.
-func (l *Lane) Index() int { return l.index }
 
 var (
 	venuesMu sync.Mutex
@@ -95,7 +90,7 @@ func For(base, caFile string) (*Venue, error) {
 		config.RootCAs = pool
 	}
 	v := &Venue{base: base}
-	for index := range Lanes {
+	for range Lanes {
 		transport := &http.Transport{
 			Proxy: http.ProxyFromEnvironment,
 			DialContext: (&net.Dialer{
@@ -111,7 +106,7 @@ func For(base, caFile string) (*Venue, error) {
 				PingTimeout:     pingTimeout,
 			},
 		}
-		v.lanes = append(v.lanes, &Lane{index: index, client: &http.Client{
+		v.lanes = append(v.lanes, &Lane{client: &http.Client{
 			Transport: transport,
 			// A redirect is an answer, not somewhere to send the order and
 			// its credentials again; the Python client never followed one.
@@ -140,22 +135,6 @@ func (v *Venue) Pick() *Lane {
 	}
 	chosen.inFlight.Add(1)
 	return chosen
-}
-
-// Own takes a stream on the connection set aside for the fleet member at
-// index, the same one on every send: each member reaches the venue by a
-// route of its own. Once that connection carries StreamsPerLane requests
-// the send spills over as Pick's do, onto a connection already open,
-// rather than have the transport dial a fresh one for every send of a slow
-// spell. Past Lanes members the connections are shared again. Release is
-// as for Pick.
-func (v *Venue) Own(member int) *Lane {
-	lane := v.lanes[member%len(v.lanes)]
-	if lane.inFlight.Load() >= StreamsPerLane {
-		return v.Pick()
-	}
-	lane.inFlight.Add(1)
-	return lane
 }
 
 // InFlight is how many requests each connection is carrying.

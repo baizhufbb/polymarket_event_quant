@@ -21,12 +21,6 @@ from . import knocker
 from .exchange import KNOCK_SECONDS, Exchange, knock_plan
 from .models import Market, PlacedOrder, PlacementResult
 
-# How the members' sends reach the venue: "shared" fills one connection for
-# the whole fleet; "per-member" gives each member a connection of its own;
-# "alternate" takes turns by market, so the two ways meet the same doors
-# through the same hours (the experiment of 2026-10-01).
-LANE_MODES = ("shared", "per-member", "alternate")
-
 # How long the choice of which order to keep may wait for the venue's own
 # registration times. In run38 each push reached us 10 ms (median, 247 at
 # most) after its registration, and the choice came 157 ms or more after the
@@ -64,8 +58,6 @@ class FleetPlacement:
     # each acceptance reply reached us, because a venue time was missing.
     kept_by: str | None = None
     venue_registered_ts_ms: dict[str, int] | None = None
-    # "per-member" or "shared": how this market's sends reached the venue.
-    lanes: str | None = None
 
     @property
     def attempts(self) -> int:
@@ -128,7 +120,6 @@ class FleetPlacement:
         return {
             "kept": self.kept,
             "kept_by": self.kept_by,
-            "lanes": self.lanes,
             "cancelled_order_ids": list(self.cancelled_order_ids),
             "cancel_errors": list(self.cancel_errors),
             "members": members,
@@ -199,24 +190,15 @@ def evenly_phased(
 
 
 class Fleet:
-    def __init__(
-        self,
-        members: list[FleetMember],
-        *,
-        keep_best: bool = True,
-        lane_mode: str = "shared",
-    ):
+    def __init__(self, members: list[FleetMember], *, keep_best: bool = True):
         members = tuple(members)
         if not members:
             raise ValueError("a fleet needs at least one member")
         names = [member.name for member in members]
         if len(set(names)) != len(names):
             raise ValueError("fleet member names must be unique")
-        if lane_mode not in LANE_MODES:
-            raise ValueError(f"lane mode must be one of {', '.join(LANE_MODES)}")
         self.members = members
         self.keep_best = keep_best
-        self.lane_mode = lane_mode
         self.order_view = FleetOrderView(members)
         # order id -> when the venue registered it, from the members' user
         # streams; the service wires it once those streams exist.
@@ -231,16 +213,6 @@ class Fleet:
             if member.name == name:
                 return member
         raise KeyError(name)
-
-    def lanes_per_member(self, market: Market) -> bool:
-        """Whether this market's knock gives each member its own connection.
-
-        "alternate" goes by the market's five-minute number: odd ones on a
-        connection per member, even ones on the shared one.
-        """
-        if self.lane_mode == "alternate":
-            return (market.start_ts // 300) % 2 == 1
-        return self.lane_mode == "per-member"
 
     def place(
         self,
@@ -274,22 +246,19 @@ class Fleet:
             else:
                 entries[member.name] = prepared
 
-        lane_per_member = self.lanes_per_member(market)
         knocking = []
         parts = []
-        for position, member in enumerate(self.members):
+        for member in self.members:
             if member.name not in entries:
                 continue
             try:
-                part = member.exchange.knock_member(
-                    entries[member.name],
-                    name=member.name,
-                    phase_offset_ms=member.phase_offset_ms,
+                parts.append(
+                    member.exchange.knock_member(
+                        entries[member.name],
+                        name=member.name,
+                        phase_offset_ms=member.phase_offset_ms,
+                    )
                 )
-                # Its place in the whole fleet: a member keeps its own
-                # connection when another one sits this market out.
-                part["lane"] = position
-                parts.append(part)
             except Exception as exc:  # noqa: BLE001 - reported per member
                 outcomes[member.name] = MemberPlacement(
                     member.name, None, f"{type(exc).__name__}: {exc}"
@@ -302,7 +271,6 @@ class Fleet:
                 parts,
                 interval_ms=submission_interval_ms,
                 knock_until_ts=knock_until_ts,
-                lane_per_member=lane_per_member,
             )
             hooks = {member.name: member.exchange.knock_hooks() for member in knocking}
             try:
@@ -336,7 +304,6 @@ class Fleet:
             tuple(errors),
             kept_by=kept_by,
             venue_registered_ts_ms=stamps,
-            lanes="per-member" if lane_per_member else "shared",
         )
 
     def _choose(
