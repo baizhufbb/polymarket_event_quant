@@ -55,16 +55,27 @@ func KnockerStop() *C.char {
 }
 
 // KnockerNextAttempts returns the replies that landed since the last call,
-// waiting up to timeoutMs for the first one.
+// waiting up to timeoutMs for the first one. While a burst is on it hands
+// over nothing (knock.Quiet): writing replies down would take the processor
+// from the burst's sends.
 //
 //export KnockerNextAttempts
 func KnockerNextAttempts(timeoutMs C.int) *C.char {
 	return answer(func() (any, error) {
 		batch := []knock.Attempt{}
+		timeout := time.After(time.Duration(timeoutMs) * time.Millisecond)
+		select {
+		case <-knock.Quiet():
+		case <-timeout:
+			return batch, nil
+		}
 		select {
 		case a := <-attempts:
+			// A wait that began before a burst can see its first replies
+			// land: those are held as well until it is over.
+			<-knock.Quiet()
 			batch = append(batch, a)
-		case <-time.After(time.Duration(timeoutMs) * time.Millisecond):
+		case <-timeout:
 			return batch, nil
 		}
 		for len(batch) < 4096 {

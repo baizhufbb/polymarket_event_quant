@@ -4,6 +4,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -224,5 +225,85 @@ func TestAPreviewItCannotFollowIsRefused(t *testing.T) {
 	}
 	if len(fake.Requests())+len(fake.Asks()) != 0 {
 		t.Error("a refused plan reached the venue")
+	}
+}
+
+func isClosed(c <-chan struct{}) bool {
+	select {
+	case <-c:
+		return true
+	default:
+		return false
+	}
+}
+
+func TestRepliesAreHeldFromPythonWhileABurstIsOn(t *testing.T) {
+	fake := start(t)
+	startDate := time.Now().Add(100 * time.Millisecond)
+	fake.ActivateAt(startDate, startDate)
+	// The door stays shut: every send is "not ready" and the knock gives up.
+	fake.OpenAt(startDate.Add(time.Hour))
+	m := member(t, "a", 0, "up")
+	bursts := []knock.Burst{{FromMs: 100, UntilMs: 200, IntervalMs: 5}}
+	type sample struct {
+		ms    float64
+		quiet bool
+	}
+	var mu sync.Mutex
+	var samples []sample
+	stop := make(chan struct{})
+	sampled := make(chan struct{})
+	go func() {
+		defer close(sampled)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			s := sample{float64(time.Since(startDate)) / float64(time.Millisecond), isClosed(knock.Quiet())}
+			mu.Lock()
+			samples = append(samples, s)
+			mu.Unlock()
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+	run(t, previewPlan(fake, 25*time.Millisecond, 1500*time.Millisecond, bursts, m), &trace{})
+	close(stop)
+	<-sampled
+	if !isClosed(knock.Quiet()) {
+		t.Fatal("the trace is still held after the knock returned")
+	}
+	for _, s := range samples {
+		switch {
+		case s.ms < -10 && !s.quiet:
+			t.Fatalf("held %.0f ms before the record turned", -s.ms)
+		case s.ms > 120 && s.ms < 290 && s.quiet:
+			t.Fatalf("not held %.0f ms after startDate, inside the burst and its replies", s.ms)
+		case s.ms > 340 && !s.quiet:
+			t.Fatalf("still held %.0f ms after startDate; the replies were in by 300", s.ms)
+		}
+	}
+}
+
+func TestTheTraceIsReleasedWhenTheDoorOpensInABurst(t *testing.T) {
+	fake := start(t)
+	startDate := time.Now()
+	fake.ActivateAt(startDate, startDate)
+	fake.OpenAt(startDate.Add(120 * time.Millisecond))
+	m := member(t, "a", 0, "up")
+	bursts := []knock.Burst{{FromMs: 100, UntilMs: 5000, IntervalMs: 5}}
+	got := run(t, previewPlan(fake, 25*time.Millisecond, 10*time.Second, bursts, m), &trace{}).Members[0]
+	if len(got.Accepted) != 1 {
+		t.Fatalf("%+v", got)
+	}
+	// The timing thread lets go once it sees the knock end, a moment after
+	// it returns.
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for !isClosed(knock.Quiet()) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !isClosed(knock.Quiet()) {
+		t.Error("the trace is still held 200 ms after the member registered and the knock returned")
 	}
 }

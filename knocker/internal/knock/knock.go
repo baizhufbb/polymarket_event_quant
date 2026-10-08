@@ -34,6 +34,9 @@ const (
 	// the server has one: everything else in the knock waits meanwhile. On
 	// Go's timer it holds nothing.
 	preciseStretch = 1500 * time.Microsecond
+	// The replies to a burst's last sends are back within this long (30..80
+	// ms in run57); the trace is held until then.
+	replyMargin = 100 * time.Millisecond
 
 	KnockBudgetError = "no acceptance within the knocking budget"
 	MarketEndedError = "market ended before both orders were accepted"
@@ -238,11 +241,26 @@ func (r *run) tick() {
 		tables[i] = timetable{origin: origin, phase: m.phase, interval: r.interval}
 	}
 	start := origin
+	// The trace is held from the preview until the replies to the last
+	// burst are in (quiet.go).
+	quietAt, held := int64(0), false
+	defer func() {
+		if held {
+			burstOff()
+		}
+	}()
 	if r.plan.Preview != nil {
 		select {
 		case anchor := <-r.anchor:
 			r.timeBursts(tables, anchor)
 			start = now()
+			if n := len(r.plan.Preview.Bursts); n > 0 {
+				quietAt = anchor + int64(math.Round(r.plan.Preview.Bursts[n-1].UntilMs*1e6)) + int64(replyMargin)
+				if start < quietAt {
+					burstOn()
+					held = true
+				}
+			}
 		case <-r.done:
 			return
 		}
@@ -260,6 +278,10 @@ func (r *run) tick() {
 	coarse := time.NewTimer(time.Hour)
 	coarse.Stop()
 	for {
+		if held && now() >= quietAt {
+			burstOff()
+			held = false
+		}
 		due := -1
 		for i, m := range r.members {
 			if m.sending.Load() && (due < 0 || next[i] < next[due]) {
