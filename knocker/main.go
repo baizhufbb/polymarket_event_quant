@@ -26,6 +26,11 @@ import (
 // was built from, so a test can tell a library that is behind its sources.
 var sourceHash = "unset"
 
+// loadedAt is about when the Go runtime started in this process, so the
+// times GODEBUG=gctrace prints (seconds since then) can be put on the wall
+// clock.
+var loadedAt = time.Now()
+
 // attempts carries every reply to Python's trace writer, which collects
 // them with KnockerNextAttempts.
 var attempts = make(chan knock.Attempt, 1<<16)
@@ -106,7 +111,11 @@ func KnockerClassify(reply *C.char) *C.char {
 //export KnockerVersion
 func KnockerVersion() *C.char {
 	return answer(func() (any, error) {
-		return map[string]string{"source_hash": sourceHash, "go": runtime.Version()}, nil
+		return map[string]any{
+			"source_hash": sourceHash,
+			"go":          runtime.Version(),
+			"loaded_us":   loadedAt.UnixMicro(),
+		}, nil
 	})
 }
 

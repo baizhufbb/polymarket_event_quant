@@ -140,4 +140,13 @@ type Attempt struct {
 	Body            string `json:"body,omitempty"`
 	Error           string `json:"error,omitempty"`
 	VersionMismatch bool   `json:"version_mismatch,omitempty"`
+	// Where the time went, wall-clock microseconds: the timing thread woke
+	// for the slot SlotLateUs after it was due, at WokeUs; the coordinator
+	// handed it to a send at HandedUs; the send began at SentUs and had its
+	// reply read at ReturnedUs.
+	SlotLateUs int64 `json:"slot_late_us"`
+	WokeUs     int64 `json:"woke_us"`
+	HandedUs   int64 `json:"handed_us"`
+	SentUs     int64 `json:"sent_us"`
+	ReturnedUs int64 `json:"returned_us"`
 }

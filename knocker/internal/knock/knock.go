@@ -88,7 +88,19 @@ type member struct {
 	sending atomic.Bool
 }
 
-type slot struct{ member int }
+// slot is one member's turn, with when the timing thread woke for it, for
+// the trace: how late against the timetable (ns) and the wall clock (us).
+type slot struct {
+	member int
+	late   int64
+	wokeUs int64
+}
+
+// stamps are the moments one send passed through the knock, wall-clock
+// microseconds, for the trace.
+type stamps struct {
+	lateUs, wokeUs, handedUs int64
+}
 
 type reply struct {
 	member   int
@@ -303,6 +315,7 @@ func (r *run) tick() {
 			}
 		}
 		sleepUntil(next[due])
+		woke := slot{member: due, late: now() - next[due], wokeUs: time.Now().UnixMicro()}
 		// A knock that finished while this thread slept must not move the
 		// account's next slot any more: the next market may already use it.
 		select {
@@ -311,7 +324,7 @@ func (r *run) tick() {
 		default:
 		}
 		select {
-		case r.slots <- slot{due}:
+		case r.slots <- woke:
 		case <-r.done:
 			return
 		}
@@ -360,7 +373,7 @@ func (r *run) coordinate() {
 		timer.Reset(time.Until(wake))
 		select {
 		case s := <-r.slots:
-			r.onSlot(s.member)
+			r.onSlot(s)
 		case rep := <-r.replies:
 			r.onReply(rep)
 		case err := <-r.failed:
@@ -435,7 +448,9 @@ func (r *run) pastDeadline(m *member) bool {
 	return false
 }
 
-func (r *run) onSlot(index int) {
+func (r *run) onSlot(s slot) {
+	handed := time.Now().UnixMicro()
+	index := s.member
 	m := r.members[index]
 	if m.stopped || r.pastDeadline(m) {
 		return
@@ -461,14 +476,17 @@ func (r *run) onSlot(index int) {
 	leg := remaining[m.attempts%len(remaining)]
 	m.attempts++
 	m.inFlight++
-	go r.send(index, m.creds, m.plan.Account, leg, m.attempts, r.venue.Pick())
+	go r.send(index, m.creds, m.plan.Account, leg, m.attempts, r.venue.Pick(),
+		stamps{lateUs: s.late / 1000, wokeUs: s.wokeUs, handedUs: handed})
 }
 
 // send posts one order and hands the reply to the coordinator if the knock
 // is still running, then to the trace.
-func (r *run) send(index int, creds venue.Creds, account string, leg Leg, attempt int, lane *venue.Lane) {
+func (r *run) send(index int, creds venue.Creds, account string, leg Leg, attempt int, lane *venue.Lane, at stamps) {
 	rep := reply{member: index, outcome: leg.Outcome}
-	sent := time.Now().UnixMilli()
+	sentAt := time.Now()
+	sent := sentAt.UnixMilli()
+	var returnedUs int64
 	defer func() {
 		if p := recover(); p != nil {
 			rep.local = fmt.Errorf("send failed: %v", p)
@@ -479,6 +497,9 @@ func (r *run) send(index int, creds venue.Creds, account string, leg Leg, attemp
 		}
 		if rep.returned == 0 {
 			rep.returned = time.Now().UnixMilli()
+		}
+		if returnedUs == 0 {
+			returnedUs = time.Now().UnixMicro()
 		}
 		// The verdict first: a trace reader that falls behind must not hold
 		// up the knock.
@@ -495,6 +516,11 @@ func (r *run) send(index int, creds venue.Creds, account string, leg Leg, attemp
 			Results:         []string{rep.class.Trace},
 			Status:          rep.status,
 			VersionMismatch: rep.class.VersionMismatch,
+			SlotLateUs:      at.lateUs,
+			WokeUs:          at.wokeUs,
+			HandedUs:        at.handedUs,
+			SentUs:          sentAt.UnixMicro(),
+			ReturnedUs:      returnedUs,
 		}
 		if rep.status != 200 && rep.status != 0 {
 			record.Body = string(rep.body)
@@ -508,7 +534,8 @@ func (r *run) send(index int, creds venue.Creds, account string, leg Leg, attemp
 		r.emit(record)
 	}()
 	status, body, err := r.venue.SendOrder(lane, creds, []byte(leg.Body))
-	rep.returned = time.Now().UnixMilli()
+	returnedAt := time.Now()
+	rep.returned, returnedUs = returnedAt.UnixMilli(), returnedAt.UnixMicro()
 	switch {
 	case err != nil && venue.IsSecretError(err):
 		rep.local = err
