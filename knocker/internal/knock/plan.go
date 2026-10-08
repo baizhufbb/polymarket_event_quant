@@ -149,4 +149,9 @@ type Attempt struct {
 	HandedUs   int64 `json:"handed_us"`
 	SentUs     int64 `json:"sent_us"`
 	ReturnedUs int64 `json:"returned_us"`
+	// Since the timing thread's previous wake: how long it waited in the
+	// kernel's run queue for a processor (Linux), and how long it waited to
+	// get the processor back after giving it up to the coordinator.
+	OsWaitUs int64 `json:"os_wait_us"`
+	YieldUs  int64 `json:"yield_us"`
 }

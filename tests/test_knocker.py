@@ -244,6 +244,7 @@ def test_a_whole_knock_runs_through_the_real_library(venue):
         assert set(rows[name][0]) == {
             "attempt", "legs", "sent_ts_ms", "returned_ts_ms", "results",
             "slot_late_us", "woke_us", "handed_us", "sent_us", "returned_us",
+            "os_wait_us", "yield_us",
         }
         for row in rows[name]:
             assert row["woke_us"] <= row["handed_us"] <= row["sent_us"] <= row["returned_us"]

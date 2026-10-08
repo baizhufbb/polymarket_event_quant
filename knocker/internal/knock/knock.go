@@ -94,12 +94,16 @@ type slot struct {
 	member int
 	late   int64
 	wokeUs int64
+	// Since the thread's previous wake: how long it waited in the kernel's
+	// run queue, and how long it waited for the processor after giving it
+	// up (ns).
+	osWait, yield int64
 }
 
 // stamps are the moments one send passed through the knock, wall-clock
 // microseconds, for the trace.
 type stamps struct {
-	lateUs, wokeUs, handedUs int64
+	lateUs, wokeUs, handedUs, osWaitUs, yieldUs int64
 }
 
 type reply struct {
@@ -247,6 +251,11 @@ func (r *run) tick() {
 		}
 	}()
 	pinTimingThread()
+	waits := openThreadWait()
+	defer waits.close()
+	// For the trace: the thread's run-queue wait at its last wake, and how
+	// long it last waited to get the processor back after giving it up.
+	lastWaited, yielded := waits.ns(), int64(0)
 	origin := now()
 	tables := make([]timetable, len(r.members))
 	for i, m := range r.members {
@@ -259,6 +268,7 @@ func (r *run) tick() {
 	defer func() {
 		if held {
 			burstOff()
+			releaseGC()
 		}
 	}()
 	if r.plan.Preview != nil {
@@ -270,6 +280,7 @@ func (r *run) tick() {
 				quietAt = anchor + int64(math.Round(r.plan.Preview.Bursts[n-1].UntilMs*1e6)) + int64(replyMargin)
 				if start < quietAt {
 					burstOn()
+					holdGC()
 					held = true
 				}
 			}
@@ -292,6 +303,7 @@ func (r *run) tick() {
 	for {
 		if held && now() >= quietAt {
 			burstOff()
+			releaseGC()
 			held = false
 		}
 		due := -1
@@ -315,7 +327,10 @@ func (r *run) tick() {
 			}
 		}
 		sleepUntil(next[due])
-		woke := slot{member: due, late: now() - next[due], wokeUs: time.Now().UnixMicro()}
+		waited := waits.ns()
+		woke := slot{member: due, late: now() - next[due], wokeUs: time.Now().UnixMicro(),
+			osWait: waited - lastWaited, yield: yielded}
+		lastWaited, yielded = waited, 0
 		// A knock that finished while this thread slept must not move the
 		// account's next slot any more: the next market may already use it.
 		select {
@@ -344,7 +359,9 @@ func (r *run) tick() {
 		// 10 ms. The processor is given up first. On the cadence the next
 		// slot is further off and the wait below hands it over anyway.
 		if r.dueWithin(next, preciseStretch) {
+			gave := now()
 			runtime.Gosched()
+			yielded = now() - gave
 		}
 	}
 }
@@ -477,7 +494,7 @@ func (r *run) onSlot(s slot) {
 	m.attempts++
 	m.inFlight++
 	go r.send(index, m.creds, m.plan.Account, leg, m.attempts, r.venue.Pick(),
-		stamps{lateUs: s.late / 1000, wokeUs: s.wokeUs, handedUs: handed})
+		stamps{lateUs: s.late / 1000, wokeUs: s.wokeUs, handedUs: handed, osWaitUs: s.osWait / 1000, yieldUs: s.yield / 1000})
 }
 
 // send posts one order and hands the reply to the coordinator if the knock
@@ -521,6 +538,8 @@ func (r *run) send(index int, creds venue.Creds, account string, leg Leg, attemp
 			HandedUs:        at.handedUs,
 			SentUs:          sentAt.UnixMicro(),
 			ReturnedUs:      returnedUs,
+			OsWaitUs:        at.osWaitUs,
+			YieldUs:         at.yieldUs,
 		}
 		if rep.status != 200 && rep.status != 0 {
 			record.Body = string(rep.body)

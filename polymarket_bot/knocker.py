@@ -36,7 +36,9 @@ WINDOWS_LIBRARY = KNOCKER_DIR / "build" / "knocker.dll"
 ORDER_URL = "https://clob.polymarket.com/order"
 # How long one collection of replies for the trace waits for the first.
 _TRACE_WAIT_MS = 200
-_TIMING_KEYS = ("slot_late_us", "woke_us", "handed_us", "sent_us", "returned_us")
+_TIMING_KEYS = (
+    "slot_late_us", "woke_us", "handed_us", "sent_us", "returned_us", "os_wait_us", "yield_us",
+)
 
 
 class KnockerError(RuntimeError):

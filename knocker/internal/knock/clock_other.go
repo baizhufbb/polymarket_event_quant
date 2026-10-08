@@ -20,3 +20,10 @@ func sleepUntil(t int64) {
 }
 
 func pinTimingThread() { runtime.LockOSThread() }
+
+// threadWait is Linux only; elsewhere the trace says 0.
+type threadWait struct{}
+
+func openThreadWait() threadWait { return threadWait{} }
+func (threadWait) ns() int64     { return 0 }
+func (threadWait) close()        {}

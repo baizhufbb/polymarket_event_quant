@@ -322,7 +322,7 @@ func TestEverySendCarriesWhereItsTimeWent(t *testing.T) {
 		if a.WokeUs == 0 || !(a.WokeUs <= a.HandedUs && a.HandedUs <= a.SentUs && a.SentUs <= a.ReturnedUs) {
 			t.Errorf("stamps out of order: %+v", a)
 		}
-		if a.SentUs/1000 != a.SentMs || a.SlotLateUs < 0 || a.SlotLateUs > 50_000 {
+		if a.SentUs/1000 != a.SentMs || a.SlotLateUs < 0 || a.SlotLateUs > 50_000 || a.OsWaitUs < 0 || a.YieldUs < 0 {
 			t.Errorf("stamps disagree: %+v", a)
 		}
 	}

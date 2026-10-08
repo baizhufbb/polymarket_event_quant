@@ -3,7 +3,10 @@
 package knock
 
 import (
+	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"syscall"
 	"unsafe"
 )
@@ -47,4 +50,39 @@ func sleepUntil(t int64) {
 func pinTimingThread() {
 	runtime.LockOSThread()
 	syscall.Syscall(syscall.SYS_PRCTL, prSetTimerslack, 1, 0)
+}
+
+// threadWait reads how long the calling thread has waited in the kernel's
+// run queue for a processor (/proc/thread-self/schedstat, second field),
+// so the trace can tell a slot the processor was busy for from one the Go
+// scheduler kept waiting. Opened on the timing thread itself.
+type threadWait struct{ f *os.File }
+
+func openThreadWait() threadWait {
+	f, err := os.Open("/proc/thread-self/schedstat")
+	if err != nil {
+		return threadWait{}
+	}
+	return threadWait{f}
+}
+
+// ns is the thread's total run-queue wait so far, or 0 when unknown.
+func (w threadWait) ns() int64 {
+	if w.f == nil {
+		return 0
+	}
+	var buf [96]byte
+	n, _ := w.f.ReadAt(buf[:], 0)
+	fields := strings.Fields(string(buf[:n]))
+	if len(fields) < 2 {
+		return 0
+	}
+	v, _ := strconv.ParseInt(fields[1], 10, 64)
+	return v
+}
+
+func (w threadWait) close() {
+	if w.f != nil {
+		w.f.Close()
+	}
 }
