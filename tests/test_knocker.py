@@ -299,3 +299,54 @@ def test_a_fleet_places_through_the_real_library(venue, monkeypatch):
     assert len(placement.cancelled_order_ids) == 2
     assert kept.exchange.client.canceled == []
     assert len(placement.kept_order_ids()) == 2
+
+
+@pytest.fixture
+def previewed_venue(tmp_path):
+    """A venue whose market record turns active 300 ms after the start and
+    whose door opens 600 ms after that."""
+    process = subprocess.Popen(
+        [str(FAKEVENUE), "-dir", str(tmp_path), "-activate-after", "300ms", "-open-after", "900ms"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        encoding="utf-8",
+    )
+    try:
+        yield json.loads(process.stdout.readline())
+    finally:
+        process.stdin.close()
+        process.wait(timeout=10)
+
+
+@with_venue
+def test_a_knock_on_the_preview_runs_through_the_real_library(previewed_venue):
+    venue = previewed_venue
+    run = uuid.uuid4().hex[:8]
+    names = [f"a-{run}", f"b-{run}"]
+    rows = {name: [] for name in names}
+    now_ms = int(time.time() * 1000)
+    plan = {
+        "market": "integration",
+        "interval_ms": 25.0,
+        "knock_until_ms": now_ms + 10_000,
+        "market_end_ms": now_ms + 60_000,
+        "base_url": venue["url"],
+        "ca_file": venue["ca_file"],
+        "members": [_member(names[0], 0.0, ["up"]), _member(names[1], 12.5, ["up"])],
+        "preview": {
+            "url": venue["record_url"],
+            "poll_ms": 10.0,
+            "bursts": [{"from_ms": 500.0, "until_ms": 700.0, "interval_ms": 5.0}],
+        },
+    }
+
+    result = knocker.knock(plan, {name: knocker.Hooks(trace=rows[name].append) for name in names})
+
+    seen = result["preview"]
+    assert seen["start_date_ms"] > 0 and seen["anchor_ms"] == seen["start_date_ms"]
+    assert seen["seen_ms"] >= seen["asked_ms"] and seen["asks"] >= 1
+    for name, outcome in zip(names, result["members"], strict=True):
+        assert [order["outcome"] for order in outcome["accepted"]] == ["up"]
+        assert _wait_for(lambda name=name, outcome=outcome: len(rows[name]) >= outcome["attempts"])
+        # nothing went out before the first burst
+        assert min(row["sent_ts_ms"] for row in rows[name]) >= seen["start_date_ms"] + 499

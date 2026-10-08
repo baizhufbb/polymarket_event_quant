@@ -27,6 +27,7 @@ from py_clob_client_v2.order_utils.model.order_data_v2 import order_to_json_v2
 
 from . import knocker
 from .config import BotConfig
+from .discovery import GAMMA_MARKETS_BY_SLUG
 from .models import Market, PlacedOrder, PlacementResult
 from .transport import install_parallel_transport, warm_connections
 
@@ -54,6 +55,30 @@ KNOCK_SECONDS = 240.0
 # The client re-resolves the order version when a reply says it is stale;
 # at most this often.
 VERSION_HEAL_INTERVAL_SECONDS = 30.0
+# Knocking on the preview (--knock-on-preview). Gamma's record of a market
+# turns active, with its startDate to the microsecond, a third of a second
+# before the venue opens the book: over 4,796 doors (2026-09-18..10-06) the
+# first book frame came 296 ms after startDate at p1, 302 p10, 332 median,
+# 417 p75, 555 p90, 636 p95; never below 290 bar two. Our first accepted
+# send leaves about 26 ms before that frame (run55, 120 doors: last not
+# ready at -27 ms, first accepted at -25), so the send that wins leaves
+# 270..610 ms after startDate for p1..p95, and 274..299 ms for the 40% of
+# doors in the mode.
+#
+# Asked every 40 ms the record shows the turn 120..220 ms after startDate
+# (3 doors watched from the server), ahead of the first burst. Gamma's edge
+# allows an IP 300 asks of its markets per 10 s and delays the ones over;
+# 25 a second leaves room for the two discovery loops (one each in the bot
+# and the probe).
+PREVIEW_POLL_MS = 40
+# (from, until, every) in ms after startDate, every one per account; the
+# accounts spread evenly across each interval. Densest where most doors
+# open, about the square root of how often a door opens there: 12 accounts
+# put a send every 0.25 ms on the wire at 262..330 ms (the mode), every
+# 0.67 ms to 450 (p82) and every 1.33 ms to 650 (p95); the cadence carries
+# on after. Each account sends 51 in the bursts, inside the 60 its token
+# bucket holds when the knock begins.
+PREVIEW_BURSTS = ((262, 330, 3), (330, 450, 8), (450, 650, 16))
 
 
 class _SigningNotReady(RuntimeError):
@@ -122,19 +147,36 @@ def knock_plan(
     *,
     interval_ms: Decimal,
     knock_until_ts: float,
+    preview: dict | None = None,
 ) -> dict:
     """What the knock library needs for one market.
 
     The certificate authorities are the ones the Python HTTP stack trusted
     (certifi), so the orders reach the same venue they always did.
     """
-    return {
+    plan = {
         "market": market.slug,
         "interval_ms": float(interval_ms),
         "knock_until_ms": int(knock_until_ts * 1000),
         "market_end_ms": int(market.end_ts * 1000),
         "ca_file": certifi.where(),
         "members": members,
+    }
+    if preview is not None:
+        plan["preview"] = preview
+    return plan
+
+
+def preview_plan(market: Market) -> dict:
+    """Hold the knock until the market's record on Gamma turns active, then
+    send in PREVIEW_BURSTS timed from its startDate."""
+    return {
+        "url": f"{GAMMA_MARKETS_BY_SLUG}/{market.slug}",
+        "poll_ms": float(PREVIEW_POLL_MS),
+        "bursts": [
+            {"from_ms": float(start), "until_ms": float(end), "interval_ms": float(every)}
+            for start, end, every in PREVIEW_BURSTS
+        ],
     }
 
 

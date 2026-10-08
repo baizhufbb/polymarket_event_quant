@@ -1683,3 +1683,44 @@ def test_knocking_out_the_budget_skips_the_market_instead_of_retrying(tmp_path) 
             (MARKET.slug,),
         ).fetchone()["details_json"])
         assert details["submission_attempts"] == 9600
+
+
+def test_a_fleet_waits_for_the_preview_only_when_told_to(tmp_path) -> None:
+    """--knock-on-preview hands the fleet the market's record to watch, and
+    what the watch saw lands in the event; without the flag the knock starts
+    at once, as it always did."""
+    from polymarket_bot.exchange import preview_plan
+    from polymarket_bot.fleet import FleetPlacement
+
+    seen = {"start_date_ms": 1_999_999_999_655.4, "asks": 12}
+    calls = []
+
+    class StubFleet:
+        def place(self, market, **kwargs):
+            calls.append(kwargs)
+            # nobody registered and nobody is left to try: the market is skipped
+            return FleetPlacement((), None, (), preview=seen if kwargs["preview"] else None)
+
+    for flag in (True, False):
+        service, database = _service_with_a_market(tmp_path / str(flag))
+        service.fleet = StubFleet()
+        service.placement_interval_ms = Decimal("27")
+        service._placement_retries = {}
+        service.knock_on_preview = flag
+        service._place_with_fleet(
+            MARKET, trigger="test", trigger_details=None, placement_retry=None,
+            knock_until_ts=2_000_000_000.0,
+        )
+        details = [
+            json.loads(row["details_json"])
+            for row in database.connection.execute(
+                "SELECT details_json FROM events WHERE event_type='market_skipped'"
+            )
+        ]
+        assert len(details) == 1
+        if flag:
+            assert calls[-1]["preview"] == preview_plan(MARKET)
+            assert details[0]["fleet"]["preview"] == seen
+        else:
+            assert calls[-1]["preview"] is None
+            assert "preview" not in details[0]["fleet"]

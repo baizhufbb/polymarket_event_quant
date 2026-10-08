@@ -49,3 +49,13 @@ def test_the_noise_filter_covers_both_chatty_loggers() -> None:
 
     # unrelated loggers: untouched
     assert noise_filter.filter(record("polymarket_bot", "market not found"))
+
+
+def test_knocking_on_the_preview_is_refused_without_a_fleet(monkeypatch) -> None:
+    """Only the fleet's placement records what the watch on the record saw."""
+    monkeypatch.setattr(
+        "sys.argv",
+        ["bot.py", "run", "--buy-price", "0.01", "--usd-per-side", "1.037", "--knock-on-preview"],
+    )
+    with pytest.raises(SystemExit, match="--knock-on-preview needs --fleet-env"):
+        cli.main()

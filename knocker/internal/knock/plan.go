@@ -13,6 +13,35 @@ type Plan struct {
 	BaseURL string   `json:"base_url,omitempty"`
 	CAFile  string   `json:"ca_file,omitempty"`
 	Members []Member `json:"members"`
+	// Preview, when set, holds every send until the market's record on
+	// Gamma turns active, then times the sends from the startDate written
+	// into it. Without it the knock starts at once on the cadence.
+	Preview *Preview `json:"preview,omitempty"`
+}
+
+// Preview is where to watch for a market about to open, and how to send
+// once it shows.
+//
+// Gamma's record of a market turns active, with a startDate to the
+// microsecond, about a third of a second before the venue opens the book;
+// before that the venue answers every order "not ready".
+type Preview struct {
+	// The market's record: gamma-api .../markets/slug/<slug>.
+	URL string `json:"url"`
+	// How often the record is asked for. Gamma's edge allows each IP 300
+	// asks of its markets per 10 s and delays the ones over.
+	PollMs float64 `json:"poll_ms"`
+	// The bursts, timed from startDate; after the last one the members go
+	// on at the plan's cadence.
+	Bursts []Burst `json:"bursts"`
+}
+
+// Burst has every member send once per IntervalMs from FromMs to UntilMs
+// after startDate, the members spread evenly across each interval.
+type Burst struct {
+	FromMs     float64 `json:"from_ms"`
+	UntilMs    float64 `json:"until_ms"`
+	IntervalMs float64 `json:"interval_ms"`
 }
 
 // Member is one account's part: its phase on the shared timetable, its
@@ -37,6 +66,28 @@ type Leg struct {
 // Result is every member's outcome, in plan order.
 type Result struct {
 	Members []MemberResult `json:"members"`
+	// What the watch for the preview saw; absent without a Preview.
+	Preview *PreviewSeen `json:"preview,omitempty"`
+}
+
+// PreviewSeen is the watch on the market's record, for the log.
+type PreviewSeen struct {
+	// The record's startDate, wall-clock ms with its microseconds; 0 if it
+	// never turned active (SeenMs 0 too) or turned without a startDate it
+	// could read (SeenMs set; the bursts were timed from SeenMs).
+	StartDateMs float64 `json:"start_date_ms"`
+	// When the ask that first found it active was sent, and when its answer
+	// came back.
+	AskedMs int64 `json:"asked_ms"`
+	SeenMs  int64 `json:"seen_ms"`
+	// When the bursts were timed from: startDate, or the moment it was seen
+	// if the record put startDate later than that.
+	AnchorMs float64 `json:"anchor_ms"`
+	Asks     int     `json:"asks"`
+	// Asks that failed or came back other than 200.
+	Failed int `json:"failed"`
+	// Asks not sent because previewAsksInFlight were still out.
+	Skipped int `json:"skipped"`
 }
 
 // MemberResult is what one account's knocking came to.

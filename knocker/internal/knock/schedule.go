@@ -17,6 +17,35 @@ func SlotAtOrAfter(moment, origin, phase, interval int64) int64 {
 	return origin + phase + ceilDiv(offset, interval)*interval
 }
 
+// stretch is a run of slots: from + phase + k*interval, before until.
+type stretch struct{ from, until, phase, interval int64 }
+
+// timetable is one member's slots, in nanoseconds of the monotonic clock:
+// the bursts after a preview, if any, then the cadence for good.
+type timetable struct {
+	bursts []stretch
+	// The cadence: origin + phase + k*interval.
+	origin, phase, interval int64
+}
+
+// at is the member's first slot at or after moment.
+func (t timetable) at(moment int64) int64 {
+	for _, b := range t.bursts {
+		if moment >= b.until {
+			continue
+		}
+		if slot := SlotAtOrAfter(max(moment, b.from), b.from, b.phase, b.interval); slot < b.until {
+			return slot
+		}
+	}
+	return SlotAtOrAfter(max(moment, t.origin), t.origin, t.phase, t.interval)
+}
+
+// after is the slot that follows the one at slot.
+func (t timetable) after(slot int64) int64 {
+	return t.at(slot + gridTolerance + 1)
+}
+
 func ceilDiv(a, b int64) int64 {
 	q := a / b
 	if a%b != 0 && a > 0 {

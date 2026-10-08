@@ -77,17 +77,9 @@ func For(base, caFile string) (*Venue, error) {
 	if v, ok := venues[key]; ok {
 		return v, nil
 	}
-	config := &tls.Config{MinVersion: tls.VersionTLS12}
-	if caFile != "" {
-		pem, err := os.ReadFile(caFile)
-		if err != nil {
-			return nil, err
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			return nil, fmt.Errorf("no certificate in %s", caFile)
-		}
-		config.RootCAs = pool
+	config, err := tlsConfig(caFile)
+	if err != nil {
+		return nil, err
 	}
 	v := &Venue{base: base}
 	for range Lanes {
@@ -117,6 +109,24 @@ func For(base, caFile string) (*Venue, error) {
 	}
 	venues[key] = v
 	return v, nil
+}
+
+// tlsConfig trusts caFile's certificate authorities only, or the system's
+// when caFile is empty.
+func tlsConfig(caFile string) (*tls.Config, error) {
+	config := &tls.Config{MinVersion: tls.VersionTLS12}
+	if caFile != "" {
+		pem, err := os.ReadFile(caFile)
+		if err != nil {
+			return nil, err
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("no certificate in %s", caFile)
+		}
+		config.RootCAs = pool
+	}
+	return config, nil
 }
 
 // Pick takes a stream on the first connection that has one to spare, or
@@ -190,6 +200,21 @@ func (v *Venue) Warm() {
 	}
 	v.lastWarm = time.Now()
 	v.warmMu.Unlock()
+	v.warmLanes()
+}
+
+// WarmNow is Warm without the minute's grace, for a burst due in a few
+// hundred milliseconds after the connections sat idle: a connection the
+// edge dropped meanwhile is dialled again now rather than by the burst's
+// first send.
+func (v *Venue) WarmNow() {
+	v.warmMu.Lock()
+	v.lastWarm = time.Now()
+	v.warmMu.Unlock()
+	v.warmLanes()
+}
+
+func (v *Venue) warmLanes() {
 	for _, lane := range v.lanes {
 		go func() {
 			defer func() { _ = recover() }()

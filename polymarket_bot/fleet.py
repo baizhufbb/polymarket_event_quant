@@ -58,6 +58,8 @@ class FleetPlacement:
     # each acceptance reply reached us, because a venue time was missing.
     kept_by: str | None = None
     venue_registered_ts_ms: dict[str, int] | None = None
+    # What the knock's watch on the market record saw, when it had one.
+    preview: dict | None = None
 
     @property
     def attempts(self) -> int:
@@ -117,13 +119,16 @@ class FleetPlacement:
                 "order_ids": [order.order_id for order in result.orders] if result else [],
                 "error": placement.error or (result.error if result else None),
             }
-        return {
+        details = {
             "kept": self.kept,
             "kept_by": self.kept_by,
             "cancelled_order_ids": list(self.cancelled_order_ids),
             "cancel_errors": list(self.cancel_errors),
             "members": members,
         }
+        if self.preview is not None:
+            details["preview"] = self.preview
+        return details
 
 
 def _cancel_outcome(result: object) -> tuple[list[str], list[str]]:
@@ -221,7 +226,13 @@ class Fleet:
         price: Decimal,
         submission_interval_ms: Decimal,
         knock_until_ts: float | None = None,
+        preview: dict | None = None,
     ) -> FleetPlacement:
+        """Sign every member's entry and knock them all on one timetable.
+
+        With preview (exchange.preview_plan) the knock sends nothing until
+        the market's record turns active, then bursts from its startDate.
+        """
         outcomes: dict[str, MemberPlacement] = {}
         # One knocking budget, so the members give up together.
         if knock_until_ts is None:
@@ -248,6 +259,7 @@ class Fleet:
 
         knocking = []
         parts = []
+        seen = None
         for member in self.members:
             if member.name not in entries:
                 continue
@@ -271,6 +283,7 @@ class Fleet:
                 parts,
                 interval_ms=submission_interval_ms,
                 knock_until_ts=knock_until_ts,
+                preview=preview,
             )
             hooks = {member.name: member.exchange.knock_hooks() for member in knocking}
             try:
@@ -281,6 +294,7 @@ class Fleet:
                         member.name, None, f"{type(exc).__name__}: {exc}"
                     )
             else:
+                seen = knocked.get("preview")
                 for member, outcome in zip(knocking, knocked["members"], strict=True):
                     try:
                         result = member.exchange.settle_entry(
@@ -304,6 +318,7 @@ class Fleet:
             tuple(errors),
             kept_by=kept_by,
             venue_registered_ts_ms=stamps,
+            preview=seen,
         )
 
     def _choose(

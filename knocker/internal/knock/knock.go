@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -112,6 +113,11 @@ type run struct {
 	stopping chan struct{}
 	stopOnce sync.Once
 	done     chan struct{}
+	// With a preview: the watch hands the timing thread the moment the
+	// bursts are timed from, and keeps what it saw for the result.
+	anchor chan int64
+	seenMu sync.Mutex
+	seen   *PreviewSeen
 }
 
 // Run knocks one market for every member and returns once each has stopped
@@ -125,6 +131,11 @@ func Run(plan Plan, emit func(Attempt)) (Result, error) {
 	}
 	if len(plan.Members) == 0 {
 		return Result{}, errors.New("a knock needs at least one member")
+	}
+	if plan.Preview != nil {
+		if err := plan.Preview.check(); err != nil {
+			return Result{}, err
+		}
 	}
 	v, err := venue.For(plan.BaseURL, plan.CAFile)
 	if err != nil {
@@ -141,6 +152,10 @@ func Run(plan Plan, emit func(Attempt)) (Result, error) {
 		failed:   make(chan error, 1),
 		stopping: make(chan struct{}),
 		done:     make(chan struct{}),
+		anchor:   make(chan int64, 1),
+	}
+	if plan.Preview != nil {
+		r.seen = &PreviewSeen{}
 	}
 	for _, m := range plan.Members {
 		if len(m.Legs) == 0 {
@@ -173,6 +188,9 @@ func Run(plan Plan, emit func(Attempt)) (Result, error) {
 	defer close(r.done)
 
 	v.Warm()
+	if plan.Preview != nil {
+		go r.watch()
+	}
 	go r.tick()
 	// The coordinator gets a goroutine of its own: the caller's is tied to
 	// the Python thread that made the call, and every wake-up would first
@@ -204,18 +222,31 @@ func Run(plan Plan, emit func(Attempt)) (Result, error) {
 }
 
 // tick is the timing thread: it wakes on each member's next slot and hands
-// it to the coordinator, members interleaved in time order.
+// it to the coordinator, members interleaved in time order. With a preview
+// it first waits for the record to turn, and the members' timetables start
+// with the bursts timed from it.
 func (r *run) tick() {
 	defer func() {
 		if p := recover(); p != nil {
-			select {
-			case r.failed <- fmt.Errorf("timing thread: %v", p):
-			case <-r.done:
-			}
+			r.fail(fmt.Errorf("timing thread: %v", p))
 		}
 	}()
 	pinTimingThread()
 	origin := now()
+	tables := make([]timetable, len(r.members))
+	for i, m := range r.members {
+		tables[i] = timetable{origin: origin, phase: m.phase, interval: r.interval}
+	}
+	start := origin
+	if r.plan.Preview != nil {
+		select {
+		case anchor := <-r.anchor:
+			r.timeBursts(tables, anchor)
+			start = now()
+		case <-r.done:
+			return
+		}
+	}
 	earliest := make([]int64, len(r.members))
 	nextMu.Lock()
 	for i, m := range r.members {
@@ -223,8 +254,8 @@ func (r *run) tick() {
 	}
 	nextMu.Unlock()
 	next := make([]int64, len(r.members))
-	for i, m := range r.members {
-		next[i] = SlotAtOrAfter(max(origin, earliest[i]), origin, m.phase, r.interval)
+	for i := range r.members {
+		next[i] = tables[i].at(max(start, earliest[i]))
 	}
 	coarse := time.NewTimer(time.Hour)
 	coarse.Stop()
@@ -265,12 +296,33 @@ func (r *run) tick() {
 		// The slot after this one, never one already gone: a stall skips
 		// the slots it ate instead of re-basing the timetable, so the
 		// offsets between members survive it.
-		after := SlotAtOrAfter(max(next[due]+r.interval, now()), origin, r.members[due].phase, r.interval)
+		after := tables[due].at(max(next[due]+gridTolerance+1, now()))
 		next[due] = after
 		nextMu.Lock()
 		nextSlot[r.members[due].plan.Account] = after
 		nextMu.Unlock()
+		// In a burst the next slot is closer than preciseStretch, so this
+		// thread would go straight back to sleeping on the precise clock,
+		// holding the server's one processor: the coordinator would reach
+		// the slot just handed over only when the runtime's monitor took the
+		// processor back, and after a quiet spell the monitor sleeps up to
+		// 10 ms. The processor is given up first. On the cadence the next
+		// slot is further off and the wait below hands it over anyway.
+		if r.dueWithin(next, preciseStretch) {
+			runtime.Gosched()
+		}
 	}
+}
+
+// dueWithin says whether a member still sending has a slot due within d.
+func (r *run) dueWithin(next []int64, d time.Duration) bool {
+	limit := now() + int64(d)
+	for i, m := range r.members {
+		if m.sending.Load() && next[i] < limit {
+			return true
+		}
+	}
+	return false
 }
 
 // coordinate owns every member's state; slots and replies come to it.
@@ -533,6 +585,12 @@ func (r *run) result() Result {
 			result.RegisteredMs = &registered
 		}
 		out.Members = append(out.Members, result)
+	}
+	if r.seen != nil {
+		r.seenMu.Lock()
+		seen := *r.seen
+		r.seenMu.Unlock()
+		out.Preview = &seen
 	}
 	return out
 }

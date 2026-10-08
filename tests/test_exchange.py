@@ -707,3 +707,31 @@ def test_ambiguous_exit_adopts_one_exact_open_sell() -> None:
     assert order is not None
     assert order.order_id == "existing-exit"
     assert order.side == "sell"
+
+
+def test_the_preview_watches_the_markets_own_record() -> None:
+    from polymarket_bot.exchange import PREVIEW_BURSTS, PREVIEW_POLL_MS, knock_plan, preview_plan
+
+    preview = preview_plan(MARKET)
+    assert preview["url"] == f"https://gamma-api.polymarket.com/markets/slug/{MARKET.slug}"
+    assert preview["poll_ms"] == PREVIEW_POLL_MS
+    assert [tuple(b.values()) for b in preview["bursts"]] == [
+        (float(a), float(b), float(c)) for a, b, c in PREVIEW_BURSTS
+    ]
+    plan = knock_plan(MARKET, [], interval_ms=Decimal("27"), knock_until_ts=1.0, preview=preview)
+    assert plan["preview"] is preview
+    assert "preview" not in knock_plan(MARKET, [], interval_ms=Decimal("27"), knock_until_ts=1.0)
+
+
+def test_the_bursts_fit_one_accounts_token_bucket_and_gammas_limit() -> None:
+    """Each signer's bucket holds 60 order requests and refills 40 a second;
+    the bursts must not spend it, or the sends that matter come back 429.
+    Gamma's edge allows an IP 300 asks of its markets per 10 s."""
+    from polymarket_bot.exchange import PREVIEW_BURSTS, PREVIEW_POLL_MS
+
+    sends = sum((end - start) / every for start, end, every in PREVIEW_BURSTS)
+    assert sends <= 55
+    starts = [start for start, _, _ in PREVIEW_BURSTS]
+    ends = [end for _, end, _ in PREVIEW_BURSTS]
+    assert starts == sorted(starts) and all(a <= b for a, b in zip(ends, starts[1:]))
+    assert 1000 / PREVIEW_POLL_MS * 10 + 2 * 10 <= 300

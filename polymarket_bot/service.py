@@ -18,6 +18,7 @@ from .exchange import (
     AmbiguousPlacementError,
     Exchange,
     normalize_order,
+    preview_plan,
 )
 from .geoblock import GeoblockWorker
 from .market_activation import (
@@ -76,6 +77,9 @@ class BotService:
     placement_interval_ms = DEFAULT_PLACEMENT_INTERVAL_MS
     entry_submission = "single"
     fleet: Fleet | None = None
+    # Hold each knock until the market's record on Gamma turns active, then
+    # burst from its startDate (exchange.PREVIEW_BURSTS). Fleet runs only.
+    knock_on_preview = False
 
     def __init__(
         self,
@@ -90,11 +94,13 @@ class BotService:
         placement_interval_ms: Decimal,
         entry_submission: str = "single",
         fleet: Fleet | None = None,
+        knock_on_preview: bool = False,
         cancel_before_end_seconds: int,
         live: bool,
         logger: logging.Logger,
     ):
         self.config = config
+        self.knock_on_preview = knock_on_preview
         self.database = database
         self.plan = plan
         self.max_reserved_usd = max_reserved_usd
@@ -227,6 +233,7 @@ class BotService:
             "placement_order": self.placement_order,
             "placement_interval_ms": str(self.placement_interval_ms),
             "entry_submission": self.entry_submission,
+            "knock_on_preview": self.knock_on_preview,
             "cancel_before_end_seconds": self.cancel_before_end_seconds,
             "early_activation_probe": self.market_activation_worker is not None,
         }
@@ -1124,6 +1131,7 @@ class BotService:
                 price=self.plan.buy_price,
                 submission_interval_ms=self.placement_interval_ms,
                 knock_until_ts=knock_until_ts,
+                preview=preview_plan(market) if self.knock_on_preview else None,
             )
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"

@@ -149,6 +149,14 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     run.add_argument(
+        "--knock-on-preview",
+        action="store_true",
+        help=(
+            "send nothing until the market's record on Gamma turns active, "
+            "then burst from its startDate before the cadence; fleet runs only"
+        ),
+    )
+    run.add_argument(
         "--fleet-size-step",
         type=_decimal_arg,
         default=Decimal("0.024"),
@@ -214,6 +222,9 @@ def _rotating_logger(name: str, path: Path) -> logging.Logger:
 
 def main() -> None:
     args = _parser().parse_args()
+    if args.command == "run" and args.knock_on_preview and not args.fleet_env:
+        # Only the fleet's placement records what the watch saw.
+        raise SystemExit("--knock-on-preview needs --fleet-env")
     if args.command == "setup":
         result = setup_wallet(SetupConfig.load(apply=args.apply), apply=args.apply)
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
@@ -322,6 +333,7 @@ def main() -> None:
                 placement_interval_ms=args.placement_interval_ms,
                 entry_submission=args.entry_submission,
                 fleet=fleet,
+                knock_on_preview=args.knock_on_preview,
                 cancel_before_end_seconds=args.cancel_before_end_seconds,
                 live=args.live,
                 logger=_logger(config),

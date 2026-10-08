@@ -450,3 +450,27 @@ def test_a_venue_time_that_lands_during_the_wait_is_used():
 
     assert placement.kept == "m1"
     assert placement.details()["kept_by"] == "venue"
+
+
+def test_the_preview_goes_into_the_plan_and_what_it_saw_into_the_details(monkeypatch):
+    from polymarket_bot.exchange import preview_plan
+
+    knocks = Knocks()
+    seen = {"start_date_ms": 1_999_999_999_655.4, "seen_ms": 1_999_999_999_801}
+
+    def knock(plan, hooks):
+        result = knocks(plan, hooks)
+        return {**result, "preview": seen}
+
+    monkeypatch.setattr(knocker, "knock", knock)
+    fleet = Fleet([member("primary"), member("m1", 12.5)])
+    placement = fleet.place(
+        MARKET, price=Decimal("0.01"), submission_interval_ms=Decimal("25"),
+        preview=preview_plan(MARKET),
+    )
+
+    assert knocks.plans[0]["preview"] == preview_plan(MARKET)
+    assert placement.details()["preview"] == seen
+    # without one the plan carries none, and the knock starts at once
+    fleet.place(MARKET, price=Decimal("0.01"), submission_interval_ms=Decimal("25"))
+    assert "preview" not in knocks.plans[1]
