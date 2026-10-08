@@ -2,6 +2,7 @@ package knock_test
 
 import (
 	"math"
+	"runtime/metrics"
 	"sort"
 	"strings"
 	"sync"
@@ -324,6 +325,80 @@ func TestEverySendCarriesWhereItsTimeWent(t *testing.T) {
 		}
 		if a.SentUs/1000 != a.SentMs || a.SlotLateUs < 0 || a.SlotLateUs > 50_000 || a.OsWaitUs < 0 || a.YieldUs < 0 {
 			t.Errorf("stamps disagree: %+v", a)
+		}
+	}
+}
+
+// gcPercent is GOGC as the runtime reports it, -1 while collection is off.
+func gcPercent() int64 {
+	s := []metrics.Sample{{Name: "/gc/gogc:percent"}}
+	metrics.Read(s)
+	return int64(s[0].Value.Uint64())
+}
+
+// Collection is held off only while a burst runs and comes back however
+// the knock ends: left off, a ten-hour session would never free memory.
+func TestCollectionIsHeldOnlyForABurstAndAlwaysComesBack(t *testing.T) {
+	before := gcPercent()
+	for _, c := range []struct {
+		name         string
+		turns, opens bool
+		openAfter    time.Duration
+		stopAfter    time.Duration
+		wantHeld     bool
+	}{
+		{name: "door shut", turns: true, wantHeld: true},
+		{name: "door opens mid-burst", turns: true, opens: true, openAfter: 120 * time.Millisecond, wantHeld: true},
+		{name: "stopped mid-burst", turns: true, stopAfter: 150 * time.Millisecond, wantHeld: true},
+		{name: "record never turns"},
+	} {
+		fake := start(t)
+		startDate := time.Now()
+		if c.turns {
+			fake.ActivateAt(startDate, startDate)
+		}
+		if c.opens {
+			fake.OpenAt(startDate.Add(c.openAfter))
+		}
+		m := member(t, strings.ReplaceAll(c.name, " ", "-"), 0, "up")
+		bursts := []knock.Burst{{FromMs: 100, UntilMs: 200, IntervalMs: 5}}
+		var mu sync.Mutex
+		held := false
+		stop, sampled := make(chan struct{}), make(chan struct{})
+		go func() {
+			defer close(sampled)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if gcPercent() < 0 {
+					mu.Lock()
+					held = true
+					mu.Unlock()
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}()
+		if c.stopAfter > 0 {
+			go func() {
+				time.Sleep(c.stopAfter)
+				knock.StopAll()
+			}()
+		}
+		run(t, previewPlan(fake, 25*time.Millisecond, 600*time.Millisecond, bursts, m), &trace{})
+		deadline := time.Now().Add(300 * time.Millisecond)
+		for gcPercent() != before && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		close(stop)
+		<-sampled
+		if held != c.wantHeld {
+			t.Errorf("%s: collection held %v, want %v", c.name, held, c.wantHeld)
+		}
+		if got := gcPercent(); got != before {
+			t.Errorf("%s: GOGC is %d after the knock, was %d", c.name, got, before)
 		}
 	}
 }

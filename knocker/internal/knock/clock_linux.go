@@ -3,10 +3,7 @@
 package knock
 
 import (
-	"os"
 	"runtime"
-	"strconv"
-	"strings"
 	"syscall"
 	"unsafe"
 )
@@ -56,33 +53,48 @@ func pinTimingThread() {
 // run queue for a processor (/proc/thread-self/schedstat, second field),
 // so the trace can tell a slot the processor was busy for from one the Go
 // scheduler kept waiting. Opened on the timing thread itself.
-type threadWait struct{ f *os.File }
+//
+// It is read on every slot, so it allocates nothing: once a held-off
+// collection resumes, any allocation on the timing thread would be made to
+// do marking work first.
+type threadWait struct{ fd int }
 
 func openThreadWait() threadWait {
-	f, err := os.Open("/proc/thread-self/schedstat")
+	fd, err := syscall.Open("/proc/thread-self/schedstat", syscall.O_RDONLY|syscall.O_CLOEXEC, 0)
 	if err != nil {
-		return threadWait{}
+		return threadWait{fd: -1}
 	}
-	return threadWait{f}
+	return threadWait{fd: fd}
 }
 
-// ns is the thread's total run-queue wait so far, or 0 when unknown.
-func (w threadWait) ns() int64 {
-	if w.f == nil {
-		return 0
+// ns is the thread's total run-queue wait so far; ok is false when it
+// could not be read.
+func (w threadWait) ns() (waited int64, ok bool) {
+	if w.fd < 0 {
+		return 0, false
 	}
 	var buf [96]byte
-	n, _ := w.f.ReadAt(buf[:], 0)
-	fields := strings.Fields(string(buf[:n]))
-	if len(fields) < 2 {
-		return 0
+	n, err := syscall.Pread(w.fd, buf[:], 0)
+	if err != nil || n <= 0 {
+		return 0, false
 	}
-	v, _ := strconv.ParseInt(fields[1], 10, 64)
-	return v
+	i := 0
+	for i < n && buf[i] != ' ' {
+		i++
+	}
+	for i < n && buf[i] == ' ' {
+		i++
+	}
+	digits := i
+	for i < n && buf[i] >= '0' && buf[i] <= '9' {
+		waited = waited*10 + int64(buf[i]-'0')
+		i++
+	}
+	return waited, i > digits
 }
 
 func (w threadWait) close() {
-	if w.f != nil {
-		w.f.Close()
+	if w.fd >= 0 {
+		syscall.Close(w.fd)
 	}
 }

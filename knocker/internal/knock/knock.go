@@ -255,7 +255,7 @@ func (r *run) tick() {
 	defer waits.close()
 	// For the trace: the thread's run-queue wait at its last wake, and how
 	// long it last waited to get the processor back after giving it up.
-	lastWaited, yielded := waits.ns(), int64(0)
+	lastWaited, yielded := int64(0), int64(0)
 	origin := now()
 	tables := make([]timetable, len(r.members))
 	for i, m := range r.members {
@@ -298,6 +298,9 @@ func (r *run) tick() {
 	for i := range r.members {
 		next[i] = tables[i].at(max(start, earliest[i]))
 	}
+	if waited, ok := waits.ns(); ok {
+		lastWaited = waited
+	}
 	coarse := time.NewTimer(time.Hour)
 	coarse.Stop()
 	for {
@@ -327,10 +330,12 @@ func (r *run) tick() {
 			}
 		}
 		sleepUntil(next[due])
-		waited := waits.ns()
-		woke := slot{member: due, late: now() - next[due], wokeUs: time.Now().UnixMicro(),
-			osWait: waited - lastWaited, yield: yielded}
-		lastWaited, yielded = waited, 0
+		woke := slot{member: due, late: now() - next[due], wokeUs: time.Now().UnixMicro(), yield: yielded}
+		if waited, ok := waits.ns(); ok {
+			woke.osWait = waited - lastWaited
+			lastWaited = waited
+		}
+		yielded = 0
 		// A knock that finished while this thread slept must not move the
 		// account's next slot any more: the next market may already use it.
 		select {

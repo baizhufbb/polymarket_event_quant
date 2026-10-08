@@ -12,11 +12,15 @@ func TestTheTimingThreadCanReadItsOwnRunQueueWait(t *testing.T) {
 	defer runtime.UnlockOSThread()
 	w := openThreadWait()
 	defer w.close()
-	first := w.ns()
+	first, ok := w.ns()
 	for range 1000 {
 		runtime.Gosched()
 	}
-	if first <= 0 || w.ns() < first {
-		t.Fatalf("run-queue wait %d then %d", first, w.ns())
+	then, ok2 := w.ns()
+	if !ok || !ok2 || first <= 0 || then < first {
+		t.Fatalf("run-queue wait %d (%v) then %d (%v)", first, ok, then, ok2)
+	}
+	if allocs := testing.AllocsPerRun(100, func() { w.ns() }); allocs != 0 {
+		t.Errorf("reading the wait allocates %.0f times", allocs)
 	}
 }
