@@ -274,6 +274,41 @@ func TestATransientReplyIsNoVerdict(t *testing.T) {
 	}
 }
 
+func TestRepliesWithoutAVerdictAreKeptOncePerStatusAndTracedShort(t *testing.T) {
+	fake := start(t)
+	fake.OpenAt(time.Now())
+	// The edge's 429 page runs to 8 KB and carries an id of its own each time.
+	page := strings.Repeat("<p>access denied</p>", 400)
+	fake.Respond = func(n int, _ fakevenue.Request) (fakevenue.Response, bool) {
+		if n < 6 {
+			return fakevenue.Response{Status: 429, Body: fmt.Sprintf("<html>ray %d", n) + page}, true
+		}
+		return fakevenue.Response{}, false
+	}
+	m := member(t, "a", 0, "up")
+	sink := &trace{}
+	got := run(t, plan(fake, 25*time.Millisecond, 5*time.Second, m), sink).Members[0]
+	if len(got.Accepted) != 1 {
+		t.Fatalf("%+v", got)
+	}
+	if len(got.Ambiguous) != 1 || *got.Ambiguous[0].Status != 429 || !strings.HasPrefix(*got.Ambiguous[0].Body, "<html>ray 0<p>") {
+		t.Errorf("ambiguous %d items, first %.20q", len(got.Ambiguous), texts(got.Ambiguous))
+	}
+	list := sink.waitFor(func(l []knock.Attempt) bool { return len(l) >= got.Attempts })
+	limited := 0
+	for _, a := range list {
+		if a.Status == 429 {
+			limited++
+			if len(a.Body) != knock.TraceBodyBytes || !strings.HasPrefix(a.Body, "<html>ray ") {
+				t.Errorf("traced a %d-byte body %.20q", len(a.Body), a.Body)
+			}
+		}
+	}
+	if limited != 6 {
+		t.Errorf("%d replies of 429 traced, 6 came back", limited)
+	}
+}
+
 func TestAnAccountAtItsCeilingGivesUpSlotsInsteadOfQueueing(t *testing.T) {
 	fake := start(t)
 	release := make(chan struct{})

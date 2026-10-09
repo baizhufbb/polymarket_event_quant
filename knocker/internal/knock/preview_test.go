@@ -15,7 +15,7 @@ import (
 
 func previewPlan(fake *fakevenue.Venue, interval, knockFor time.Duration, bursts []knock.Burst, members ...knock.Member) knock.Plan {
 	p := plan(fake, interval, knockFor, members...)
-	p.Preview = &knock.Preview{URL: fake.URL + fakevenue.RecordPath, PollMs: 10, Bursts: bursts}
+	p.Preview = &knock.Preview{URL: fake.URL + fakevenue.RecordPath, PollMs: 10, Bursts: bursts, GiveUpMs: 60_000}
 	return p
 }
 
@@ -128,6 +128,33 @@ func TestARecordThatNeverTurnsSendsNothingAndGivesUp(t *testing.T) {
 	}
 }
 
+func TestADoorStillShutAtTheGiveUpTimeEndsTheKnock(t *testing.T) {
+	fake := start(t)
+	startDate := time.Now().Add(50 * time.Millisecond)
+	fake.ActivateAt(startDate, startDate)
+	fake.OpenAt(startDate.Add(time.Hour))
+	m := member(t, "a", 0, "up")
+	bursts := []knock.Burst{{FromMs: 100, UntilMs: 200, IntervalMs: 5}}
+	p := previewPlan(fake, 25*time.Millisecond, 10*time.Second, bursts, m)
+	p.Preview.GiveUpMs = 500
+	began := time.Now()
+	got := run(t, p, &trace{}).Members[0]
+	if took := time.Since(began); took > 2*time.Second {
+		t.Errorf("returned %v after the start; the knock gives up 550 ms in, its budget is 10 s", took)
+	}
+	if !got.GaveUp || len(got.Accepted) != 0 || got.Attempts == 0 {
+		t.Fatalf("%+v", got)
+	}
+	if errors := texts(got.Errors); errors[len(errors)-1] != knock.KnockBudgetError {
+		t.Errorf("errors %v", errors)
+	}
+	// The cadence runs up to the give-up time and nothing goes out after it.
+	sent := sinceMs(fake.Requests(), startDate)
+	if last := sent[len(sent)-1]; last < 440 || last > 530 {
+		t.Errorf("last send %.0f ms after startDate, the knock gives up at 500", last)
+	}
+}
+
 func TestAsksSkipTheCacheAndFailuresAreCountedNotFatal(t *testing.T) {
 	fake := start(t)
 	startDate := time.Now()
@@ -223,6 +250,11 @@ func TestAPreviewItCannotFollowIsRefused(t *testing.T) {
 	p.Preview.PollMs = 0
 	if _, err := knock.Run(p, func(knock.Attempt) {}); err == nil {
 		t.Error("a preview asked for every 0 ms was taken")
+	}
+	p = previewPlan(fake, 25*time.Millisecond, time.Second, nil, m)
+	p.Preview.GiveUpMs = 0
+	if _, err := knock.Run(p, func(knock.Attempt) {}); err == nil {
+		t.Error("a preview that gives up at once was taken")
 	}
 	if len(fake.Requests())+len(fake.Asks()) != 0 {
 		t.Error("a refused plan reached the venue")

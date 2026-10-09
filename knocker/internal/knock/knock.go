@@ -37,6 +37,9 @@ const (
 	// The replies to a burst's last sends are back within this long (30..80
 	// ms in run57); the trace is held until then.
 	replyMargin = 100 * time.Millisecond
+	// TraceBodyBytes is as much of a reply's body as the trace carries: the
+	// venue's own errors are a line of JSON, the edge's pages run to 8 KB.
+	TraceBodyBytes = 300
 
 	KnockBudgetError = "no acceptance within the knocking budget"
 	MarketEndedError = "market ended before both orders were accepted"
@@ -107,18 +110,22 @@ type run struct {
 	plan     Plan
 	venue    *venue.Venue
 	interval int64
-	deadline time.Time
-	members  []*member
-	emit     func(Attempt)
-	slots    chan slot
-	replies  chan reply
-	failed   chan error
-	stopping chan struct{}
-	stopOnce sync.Once
-	done     chan struct{}
+	// The coordinator's: wall-clock ms when the members still sending give
+	// up, KnockUntilMs unless the preview's give-up time comes first.
+	knockUntil int64
+	members    []*member
+	emit       func(Attempt)
+	slots      chan slot
+	replies    chan reply
+	failed     chan error
+	stopping   chan struct{}
+	stopOnce   sync.Once
+	done       chan struct{}
 	// With a preview: the watch hands the timing thread the moment the
-	// bursts are timed from, and keeps what it saw for the result.
+	// bursts are timed from, and the coordinator the give-up time, and
+	// keeps what it saw for the result.
 	anchor chan int64
+	giveUp chan int64
 	seenMu sync.Mutex
 	seen   *PreviewSeen
 }
@@ -145,17 +152,18 @@ func Run(plan Plan, emit func(Attempt)) (Result, error) {
 		return Result{}, err
 	}
 	r := &run{
-		plan:     plan,
-		venue:    v,
-		interval: interval,
-		deadline: time.UnixMilli(min(plan.KnockUntilMs, plan.MarketEndMs)),
-		emit:     emit,
-		slots:    make(chan slot, 1024),
-		replies:  make(chan reply, 4096),
-		failed:   make(chan error, 1),
-		stopping: make(chan struct{}),
-		done:     make(chan struct{}),
-		anchor:   make(chan int64, 1),
+		plan:       plan,
+		venue:      v,
+		interval:   interval,
+		knockUntil: plan.KnockUntilMs,
+		emit:       emit,
+		slots:      make(chan slot, 1024),
+		replies:    make(chan reply, 4096),
+		failed:     make(chan error, 1),
+		stopping:   make(chan struct{}),
+		done:       make(chan struct{}),
+		anchor:     make(chan int64, 1),
+		giveUp:     make(chan int64, 1),
 	}
 	if plan.Preview != nil {
 		r.seen = &PreviewSeen{}
@@ -366,6 +374,8 @@ func (r *run) coordinate() {
 			r.onSlot(s.member)
 		case rep := <-r.replies:
 			r.onReply(rep)
+		case until := <-r.giveUp:
+			r.knockUntil = min(r.knockUntil, until)
 		case err := <-r.failed:
 			for _, m := range r.members {
 				if !m.stopped {
@@ -403,7 +413,7 @@ func (r *run) pending() (wake time.Time, finished bool) {
 		var due time.Time
 		switch {
 		case !m.stopped:
-			due = r.deadline
+			due = time.UnixMilli(min(r.knockUntil, r.plan.MarketEndMs))
 		case m.inFlight > 0 && current.Before(m.drainUntil):
 			due = m.drainUntil
 		default:
@@ -426,7 +436,7 @@ func (r *run) pastDeadline(m *member) bool {
 		r.stop(m)
 		return true
 	}
-	if wall >= r.plan.KnockUntilMs {
+	if wall >= r.knockUntil {
 		// The door did not open inside the knocking budget; the caller
 		// skips the market. Since 2026-09-05 the venue sometimes opens a
 		// book minutes to hours after the listing.
@@ -500,7 +510,7 @@ func (r *run) send(index int, creds venue.Creds, account string, leg Leg, attemp
 			VersionMismatch: rep.class.VersionMismatch,
 		}
 		if rep.status != 200 && rep.status != 0 {
-			record.Body = string(rep.body)
+			record.Body = string(rep.body[:min(len(rep.body), TraceBodyBytes)])
 		}
 		switch {
 		case rep.local != nil:
@@ -544,7 +554,7 @@ func (r *run) onReply(rep reply) {
 		return
 	case class.Transient:
 		// No verdict; the same signed order goes out again on the next slot.
-		m.ambiguous.reply(rep.status, rep.body)
+		m.ambiguous.firstOf(rep.status, rep.body)
 		return
 	}
 	if class.Accepted {
@@ -630,6 +640,19 @@ func newItems() items { return items{seen: map[string]bool{}, list: []Item{}} }
 
 func (l *items) reply(status int, body []byte) {
 	key := strconv.Itoa(status) + "\x00" + string(body)
+	if l.seen[key] {
+		return
+	}
+	l.seen[key] = true
+	text := string(body)
+	l.list = append(l.list, Item{Status: &status, Body: &text})
+}
+
+// firstOf keeps only the first reply of each status: a reply without a
+// verdict is an example, and the edge's 429 page carries an id of its own
+// on every send.
+func (l *items) firstOf(status int, body []byte) {
+	key := "\x02" + strconv.Itoa(status)
 	if l.seen[key] {
 		return
 	}

@@ -22,6 +22,9 @@ func (p *Preview) check() error {
 	if !(p.PollMs > 0) {
 		return errors.New("preview poll_ms must be above 0")
 	}
+	if !(p.GiveUpMs > 0) {
+		return errors.New("preview give_up_ms must be above 0")
+	}
 	until := math.Inf(-1)
 	for _, b := range p.Bursts {
 		if !(b.IntervalMs > 0) || !(b.FromMs < b.UntilMs) || b.FromMs < until {
@@ -46,9 +49,10 @@ type answer struct {
 }
 
 // watch asks for the market's record every PollMs until it turns active,
-// then hands the timing thread the moment the bursts are timed from. A
-// failed ask or an answer it cannot read is counted and the asking goes
-// on; the knock's deadline is what ends a record that never turns.
+// then hands the timing thread the moment the bursts are timed from and
+// the coordinator the moment the knock gives up. A failed ask or an answer
+// it cannot read is counted and the asking goes on; the knock's deadline
+// is what ends a record that never turns.
 func (r *run) watch() {
 	defer func() {
 		if p := recover(); p != nil {
@@ -103,20 +107,21 @@ func (r *run) watch() {
 			if !rec.Active {
 				continue
 			}
-			anchor := r.turned(a, rec)
+			anchor, wallMs := r.turned(a, rec)
 			r.venue.WarmNow()
 			r.anchor <- anchor
+			r.giveUp <- int64(math.Round(wallMs + r.plan.Preview.GiveUpMs))
 			return
 		}
 	}
 }
 
 // turned notes the answer that found the record active and returns the
-// moment on the monotonic clock that the bursts are timed from: the
-// record's startDate, or the moment the answer came back when startDate is
-// missing or later than that - the bursts never wait for a date this
-// machine's clock has not reached.
-func (r *run) turned(a answer, rec record) int64 {
+// moment the bursts are timed from, on the monotonic clock and in
+// wall-clock ms: the record's startDate, or the moment the answer came back
+// when startDate is missing or later than that - the bursts never wait for
+// a date this machine's clock has not reached.
+func (r *run) turned(a answer, rec record) (int64, float64) {
 	seen := a.returned.UnixNano()
 	anchor := seen
 	startMs := 0.0
@@ -124,13 +129,14 @@ func (r *run) turned(a answer, rec record) int64 {
 		startMs = float64(start.UnixNano()) / 1e6
 		anchor = min(start.UnixNano(), seen)
 	}
+	anchorMs := float64(anchor) / 1e6
 	r.notePreview(func(s *PreviewSeen) {
 		s.StartDateMs = startMs
 		s.AskedMs = a.asked.UnixMilli()
 		s.SeenMs = a.returned.UnixMilli()
-		s.AnchorMs = float64(anchor) / 1e6
+		s.AnchorMs = anchorMs
 	})
-	return now() + (anchor - time.Now().UnixNano())
+	return now() + (anchor - time.Now().UnixNano()), anchorMs
 }
 
 // timeBursts lays each member's bursts out from anchor, a moment on the

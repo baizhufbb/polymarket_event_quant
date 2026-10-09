@@ -15,6 +15,7 @@ from .discovery import MarketDiscovery, is_eligible
 from .exchange import (
     KNOCK_SECONDS,
     DEFAULT_PLACEMENT_INTERVAL_MS,
+    PREVIEW_GIVE_UP_MS,
     AmbiguousPlacementError,
     Exchange,
     normalize_order,
@@ -54,6 +55,19 @@ class _PlacementRetryState:
     attempts: int
     first_started_ts_ms: int
     last_finished_ts_ms: int
+
+
+def _gave_up_reason(seen: dict | None, knock_until_ts: float | None) -> str:
+    """Which budget a fleet knock with nothing accepted ran out of: the
+    preview's give-up time after the record turned, or the knocking budget
+    when that came first."""
+    if seen and seen.get("seen_ms") and knock_until_ts is not None:
+        if seen["anchor_ms"] + PREVIEW_GIVE_UP_MS < knock_until_ts * 1000:
+            return (
+                f"no acceptance within {PREVIEW_GIVE_UP_MS / 1000:g} s "
+                "of the record turning active"
+            )
+    return f"no acceptance within {KNOCK_SECONDS:g} s of knocking"
 
 
 def _classify_cancel_result(result: object) -> tuple[list[str], list[str]]:
@@ -1184,7 +1198,7 @@ class BotService:
         if placement.gave_up:
             self._skip_market(
                 market,
-                f"no acceptance within {KNOCK_SECONDS:g} s of knocking",
+                _gave_up_reason(placement.preview, knock_until_ts),
                 details=placement_details,
             )
             return

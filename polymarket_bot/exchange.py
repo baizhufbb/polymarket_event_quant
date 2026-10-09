@@ -79,6 +79,14 @@ PREVIEW_POLL_MS = 40
 # on after. Each account sends 51 in the bursts, inside the 60 its token
 # bucket holds when the knock begins.
 PREVIEW_BURSTS = ((262, 330, 3), (330, 450, 8), (450, 650, 16))
+# How long after startDate the knock goes on before it gives up. Of the
+# 4,796 doors every one that opened within a minute of startDate opened
+# within 43 s, the rest 255 s to hours late; on 2026-10-09 four came 302..304
+# s late. Knocking toward a door that late takes the fleet's 444 sends a
+# second for minutes, and two in a row took the server's IP past the
+# venue's 120,000 orders per 10 minutes: its edge then refused every order
+# (run61). A minute is about 27,000 sends.
+PREVIEW_GIVE_UP_MS = 60_000
 
 
 class _SigningNotReady(RuntimeError):
@@ -169,7 +177,8 @@ def knock_plan(
 
 def preview_plan(market: Market) -> dict:
     """Hold the knock until the market's record on Gamma turns active, then
-    send in PREVIEW_BURSTS timed from its startDate."""
+    send in PREVIEW_BURSTS timed from its startDate, and give up
+    PREVIEW_GIVE_UP_MS after it."""
     return {
         "url": f"{GAMMA_MARKETS_BY_SLUG}/{market.slug}",
         "poll_ms": float(PREVIEW_POLL_MS),
@@ -177,6 +186,7 @@ def preview_plan(market: Market) -> dict:
             {"from_ms": float(start), "until_ms": float(end), "interval_ms": float(every)}
             for start, end, every in PREVIEW_BURSTS
         ],
+        "give_up_ms": float(PREVIEW_GIVE_UP_MS),
     }
 
 

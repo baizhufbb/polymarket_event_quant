@@ -337,6 +337,7 @@ def test_a_knock_on_the_preview_runs_through_the_real_library(previewed_venue):
             "url": venue["record_url"],
             "poll_ms": 10.0,
             "bursts": [{"from_ms": 500.0, "until_ms": 700.0, "interval_ms": 5.0}],
+            "give_up_ms": 5_000.0,
         },
     }
 

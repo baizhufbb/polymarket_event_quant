@@ -710,7 +710,13 @@ def test_ambiguous_exit_adopts_one_exact_open_sell() -> None:
 
 
 def test_the_preview_watches_the_markets_own_record() -> None:
-    from polymarket_bot.exchange import PREVIEW_BURSTS, PREVIEW_POLL_MS, knock_plan, preview_plan
+    from polymarket_bot.exchange import (
+        PREVIEW_BURSTS,
+        PREVIEW_GIVE_UP_MS,
+        PREVIEW_POLL_MS,
+        knock_plan,
+        preview_plan,
+    )
 
     preview = preview_plan(MARKET)
     assert preview["url"] == f"https://gamma-api.polymarket.com/markets/slug/{MARKET.slug}"
@@ -718,6 +724,7 @@ def test_the_preview_watches_the_markets_own_record() -> None:
     assert [tuple(b.values()) for b in preview["bursts"]] == [
         (float(a), float(b), float(c)) for a, b, c in PREVIEW_BURSTS
     ]
+    assert preview["give_up_ms"] == PREVIEW_GIVE_UP_MS == 60_000
     plan = knock_plan(MARKET, [], interval_ms=Decimal("27"), knock_until_ts=1.0, preview=preview)
     assert plan["preview"] is preview
     assert "preview" not in knock_plan(MARKET, [], interval_ms=Decimal("27"), knock_until_ts=1.0)

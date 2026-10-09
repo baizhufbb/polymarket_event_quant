@@ -1724,3 +1724,37 @@ def test_a_fleet_waits_for_the_preview_only_when_told_to(tmp_path) -> None:
         else:
             assert calls[-1]["preview"] is None
             assert "preview" not in details[0]["fleet"]
+
+
+def test_a_skip_names_the_budget_the_knock_ran_out_of(tmp_path) -> None:
+    """A minute after the record turned, or the knocking budget when that
+    came first, or when the record never turned."""
+    from polymarket_bot.fleet import FleetPlacement
+
+    knock_until_ts = 2_000_000_000.0
+    turned_early = {"seen_ms": 1_999_999_800_100, "anchor_ms": 1_999_999_800_000.5}
+    turned_late = {"seen_ms": 1_999_999_970_100, "anchor_ms": 1_999_999_970_000.5}
+    never_turned = {"seen_ms": 0, "anchor_ms": 0, "asks": 6000}
+    for name, seen, want in (
+        ("early", turned_early, "no acceptance within 60 s of the record turning active"),
+        ("late", turned_late, "no acceptance within 240 s of knocking"),
+        ("never", never_turned, "no acceptance within 240 s of knocking"),
+    ):
+        service, database = _service_with_a_market(tmp_path / name)
+        service.fleet = SimpleNamespace(
+            place=lambda market, seen=seen, **kwargs: FleetPlacement((), None, (), preview=seen)
+        )
+        service.placement_interval_ms = Decimal("27")
+        service._placement_retries = {}
+        service.knock_on_preview = True
+        service._place_with_fleet(
+            MARKET, trigger="test", trigger_details=None, placement_retry=None,
+            knock_until_ts=knock_until_ts,
+        )
+        (reason,) = [
+            json.loads(row["details_json"])["reason"]
+            for row in database.connection.execute(
+                "SELECT details_json FROM events WHERE event_type='market_skipped'"
+            )
+        ]
+        assert reason == want, name

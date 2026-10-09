@@ -34,6 +34,9 @@ type Preview struct {
 	// The bursts, timed from startDate; after the last one the members go
 	// on at the plan's cadence.
 	Bursts []Burst `json:"bursts"`
+	// How long after startDate the knock goes on before it gives up, as at
+	// KnockUntilMs when that comes first.
+	GiveUpMs float64 `json:"give_up_ms"`
 }
 
 // Burst has every member send once per IntervalMs from FromMs to UntilMs
@@ -134,8 +137,8 @@ type Attempt struct {
 	SentMs     int64    `json:"sent_ts_ms"`
 	ReturnedMs int64    `json:"returned_ts_ms"`
 	Results    []string `json:"results"`
-	// The raw reply, for the log: status 0 means the send failed and
-	// Error says why.
+	// The reply, its body cut to TraceBodyBytes, for the log: status 0
+	// means the send failed and Error says why.
 	Status          int    `json:"status"`
 	Body            string `json:"body,omitempty"`
 	Error           string `json:"error,omitempty"`
