@@ -88,23 +88,7 @@ type member struct {
 	sending atomic.Bool
 }
 
-// slot is one member's turn, with when the timing thread woke for it, for
-// the trace: how late against the timetable (ns) and the wall clock (us).
-type slot struct {
-	member int
-	late   int64
-	wokeUs int64
-	// Since the thread's previous wake: how long it waited in the kernel's
-	// run queue, and how long it waited for the processor after giving it
-	// up (ns).
-	osWait, yield int64
-}
-
-// stamps are the moments one send passed through the knock, wall-clock
-// microseconds, for the trace.
-type stamps struct {
-	lateUs, wokeUs, handedUs, osWaitUs, yieldUs int64
-}
+type slot struct{ member int }
 
 type reply struct {
 	member   int
@@ -251,19 +235,14 @@ func (r *run) tick() {
 		}
 	}()
 	pinTimingThread()
-	waits := openThreadWait()
-	defer waits.close()
-	// For the trace: the thread's run-queue wait at its last wake, and how
-	// long it last waited to get the processor back after giving it up.
-	lastWaited, yielded := int64(0), int64(0)
 	origin := now()
 	tables := make([]timetable, len(r.members))
 	for i, m := range r.members {
 		tables[i] = timetable{origin: origin, phase: m.phase, interval: r.interval}
 	}
 	start := origin
-	// The trace is held from the preview until the replies to the last
-	// burst are in (quiet.go).
+	// The trace, and Go's garbage collection, are held from the preview
+	// until the replies to the last burst are in (quiet.go).
 	quietAt, held := int64(0), false
 	defer func() {
 		if held {
@@ -298,9 +277,6 @@ func (r *run) tick() {
 	for i := range r.members {
 		next[i] = tables[i].at(max(start, earliest[i]))
 	}
-	if waited, ok := waits.ns(); ok {
-		lastWaited = waited
-	}
 	coarse := time.NewTimer(time.Hour)
 	coarse.Stop()
 	for {
@@ -330,12 +306,6 @@ func (r *run) tick() {
 			}
 		}
 		sleepUntil(next[due])
-		woke := slot{member: due, late: now() - next[due], wokeUs: time.Now().UnixMicro(), yield: yielded}
-		if waited, ok := waits.ns(); ok {
-			woke.osWait = waited - lastWaited
-			lastWaited = waited
-		}
-		yielded = 0
 		// A knock that finished while this thread slept must not move the
 		// account's next slot any more: the next market may already use it.
 		select {
@@ -344,7 +314,7 @@ func (r *run) tick() {
 		default:
 		}
 		select {
-		case r.slots <- woke:
+		case r.slots <- slot{due}:
 		case <-r.done:
 			return
 		}
@@ -364,9 +334,7 @@ func (r *run) tick() {
 		// 10 ms. The processor is given up first. On the cadence the next
 		// slot is further off and the wait below hands it over anyway.
 		if r.dueWithin(next, preciseStretch) {
-			gave := now()
 			runtime.Gosched()
-			yielded = now() - gave
 		}
 	}
 }
@@ -395,7 +363,7 @@ func (r *run) coordinate() {
 		timer.Reset(time.Until(wake))
 		select {
 		case s := <-r.slots:
-			r.onSlot(s)
+			r.onSlot(s.member)
 		case rep := <-r.replies:
 			r.onReply(rep)
 		case err := <-r.failed:
@@ -470,9 +438,7 @@ func (r *run) pastDeadline(m *member) bool {
 	return false
 }
 
-func (r *run) onSlot(s slot) {
-	handed := time.Now().UnixMicro()
-	index := s.member
+func (r *run) onSlot(index int) {
 	m := r.members[index]
 	if m.stopped || r.pastDeadline(m) {
 		return
@@ -498,17 +464,14 @@ func (r *run) onSlot(s slot) {
 	leg := remaining[m.attempts%len(remaining)]
 	m.attempts++
 	m.inFlight++
-	go r.send(index, m.creds, m.plan.Account, leg, m.attempts, r.venue.Pick(),
-		stamps{lateUs: s.late / 1000, wokeUs: s.wokeUs, handedUs: handed, osWaitUs: s.osWait / 1000, yieldUs: s.yield / 1000})
+	go r.send(index, m.creds, m.plan.Account, leg, m.attempts, r.venue.Pick())
 }
 
 // send posts one order and hands the reply to the coordinator if the knock
 // is still running, then to the trace.
-func (r *run) send(index int, creds venue.Creds, account string, leg Leg, attempt int, lane *venue.Lane, at stamps) {
+func (r *run) send(index int, creds venue.Creds, account string, leg Leg, attempt int, lane *venue.Lane) {
 	rep := reply{member: index, outcome: leg.Outcome}
-	sentAt := time.Now()
-	sent := sentAt.UnixMilli()
-	var returnedUs int64
+	sent := time.Now().UnixMilli()
 	defer func() {
 		if p := recover(); p != nil {
 			rep.local = fmt.Errorf("send failed: %v", p)
@@ -519,9 +482,6 @@ func (r *run) send(index int, creds venue.Creds, account string, leg Leg, attemp
 		}
 		if rep.returned == 0 {
 			rep.returned = time.Now().UnixMilli()
-		}
-		if returnedUs == 0 {
-			returnedUs = time.Now().UnixMicro()
 		}
 		// The verdict first: a trace reader that falls behind must not hold
 		// up the knock.
@@ -538,13 +498,6 @@ func (r *run) send(index int, creds venue.Creds, account string, leg Leg, attemp
 			Results:         []string{rep.class.Trace},
 			Status:          rep.status,
 			VersionMismatch: rep.class.VersionMismatch,
-			SlotLateUs:      at.lateUs,
-			WokeUs:          at.wokeUs,
-			HandedUs:        at.handedUs,
-			SentUs:          sentAt.UnixMicro(),
-			ReturnedUs:      returnedUs,
-			OsWaitUs:        at.osWaitUs,
-			YieldUs:         at.yieldUs,
 		}
 		if rep.status != 200 && rep.status != 0 {
 			record.Body = string(rep.body)
@@ -558,8 +511,7 @@ func (r *run) send(index int, creds venue.Creds, account string, leg Leg, attemp
 		r.emit(record)
 	}()
 	status, body, err := r.venue.SendOrder(lane, creds, []byte(leg.Body))
-	returnedAt := time.Now()
-	rep.returned, returnedUs = returnedAt.UnixMilli(), returnedAt.UnixMicro()
+	rep.returned = time.Now().UnixMilli()
 	switch {
 	case err != nil && venue.IsSecretError(err):
 		rep.local = err

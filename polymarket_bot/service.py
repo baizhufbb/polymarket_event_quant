@@ -117,10 +117,9 @@ class BotService:
             # exits and reconciliation read replies through it too.
             library = knocker.version()
             logger.info(
-                "knock library built from sources %s (%s), Go runtime started at %s us",
+                "knock library built from sources %s (%s)",
                 library["source_hash"][:12],
                 library["go"],
-                library.get("loaded_us"),
             )
         self.entry_submission = entry_submission
         self.wake_event = Event()

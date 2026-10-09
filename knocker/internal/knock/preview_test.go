@@ -309,26 +309,6 @@ func TestTheTraceIsReleasedWhenTheDoorOpensInABurst(t *testing.T) {
 	}
 }
 
-func TestEverySendCarriesWhereItsTimeWent(t *testing.T) {
-	fake := start(t)
-	fake.OpenAt(time.Now().Add(100 * time.Millisecond))
-	m := member(t, "a", 0, "up")
-	sink := &trace{}
-	got := run(t, plan(fake, 25*time.Millisecond, 5*time.Second, m), sink).Members[0]
-	list := sink.waitFor(func(l []knock.Attempt) bool { return len(l) >= got.Attempts })
-	if len(list) == 0 {
-		t.Fatal("no attempts traced")
-	}
-	for _, a := range list {
-		if a.WokeUs == 0 || !(a.WokeUs <= a.HandedUs && a.HandedUs <= a.SentUs && a.SentUs <= a.ReturnedUs) {
-			t.Errorf("stamps out of order: %+v", a)
-		}
-		if a.SentUs/1000 != a.SentMs || a.SlotLateUs < 0 || a.SlotLateUs > 50_000 || a.OsWaitUs < 0 || a.YieldUs < 0 {
-			t.Errorf("stamps disagree: %+v", a)
-		}
-	}
-}
-
 // gcPercent is GOGC as the runtime reports it, -1 while collection is off.
 func gcPercent() int64 {
 	s := []metrics.Sample{{Name: "/gc/gogc:percent"}}

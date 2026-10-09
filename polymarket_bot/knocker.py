@@ -36,9 +36,6 @@ WINDOWS_LIBRARY = KNOCKER_DIR / "build" / "knocker.dll"
 ORDER_URL = "https://clob.polymarket.com/order"
 # How long one collection of replies for the trace waits for the first.
 _TRACE_WAIT_MS = 200
-_TIMING_KEYS = (
-    "slot_late_us", "woke_us", "handed_us", "sent_us", "returned_us", "os_wait_us", "yield_us",
-)
 
 
 class KnockerError(RuntimeError):
@@ -254,18 +251,15 @@ def _record(attempt: dict) -> None:
     if hooks is None:
         return
     if hooks.trace is not None:
-        row = {
-            "attempt": attempt["attempt"],
-            "legs": attempt["legs"],
-            "sent_ts_ms": attempt["sent_ts_ms"],
-            "returned_ts_ms": attempt["returned_ts_ms"],
-            "results": attempt["results"],
-        }
-        # Where the time went, in microseconds (knock.Attempt).
-        for key in _TIMING_KEYS:
-            if key in attempt:
-                row[key] = attempt[key]
-        hooks.trace(row)
+        hooks.trace(
+            {
+                "attempt": attempt["attempt"],
+                "legs": attempt["legs"],
+                "sent_ts_ms": attempt["sent_ts_ms"],
+                "returned_ts_ms": attempt["returned_ts_ms"],
+                "results": attempt["results"],
+            }
+        )
     if attempt.get("version_mismatch") and hooks.version_mismatch is not None:
         hooks.version_mismatch()
 
